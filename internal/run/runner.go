@@ -8,10 +8,10 @@ package run
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 
 	"golang.org/x/sys/unix"
 
+	"dustkeeper/internal/clocktrust"
 	"dustkeeper/internal/config"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
@@ -23,13 +23,6 @@ import (
 	"dustkeeper/internal/scan"
 	"dustkeeper/internal/scope"
 	"dustkeeper/internal/store"
-)
-
-// Clock thresholds from section 11.2.
-const (
-	clockBackwardsTolerance = int64(5 * 60 * 1e9)
-	clockJumpThreshold      = int64(48 * 60 * 60 * 1e9)
-	clockDriftTolerance     = int64(5 * 60 * 1e9)
 )
 
 // Runner performs one bounded run.
@@ -48,26 +41,34 @@ type ScopeRun struct {
 	Skipped          string         `json:"skipped,omitempty"`
 	Scanned          int            `json:"scanned_files"`
 	ScanComplete     bool           `json:"scan_epoch_complete"`
+	ScanInterrupted  bool           `json:"scan_interrupted"`
+	DeepScanRequired bool           `json:"deep_scan_required"`
 	Quarantined      int            `json:"quarantined"`
 	QuarantinedBytes int64          `json:"quarantined_logical_bytes"`
 	Purged           int            `json:"purged"`
 	PurgedBytes      int64          `json:"purged_logical_bytes"`
 	DueNotAuthorised int            `json:"due_but_not_authorised"`
+	IdentityWeak     string         `json:"root_identity_weak,omitempty"`
+	Control          string         `json:"control,omitempty"`
 	Message          string         `json:"message,omitempty"`
 }
 
 // Report is the machine-readable result of `run`.
 type Report struct {
-	RunID          string          `json:"run_id"`
-	ClockTrusted   bool            `json:"clock_trusted"`
-	ClockNote      string          `json:"clock_note,omitempty"`
-	Reconciliation recovery.Report `json:"reconciliation"`
-	Scopes         []ScopeRun      `json:"scopes"`
-	Quarantined    int             `json:"quarantined_total"`
-	Purged         int             `json:"purged_total"`
-	ReadBytes      int64           `json:"read_bytes"`
-	DiskFreeBefore uint64          `json:"disk_free_bytes_before"`
-	DiskFreeAfter  uint64          `json:"disk_free_bytes_after"`
+	RunID           string          `json:"run_id"`
+	ClockTrusted    bool            `json:"clock_trusted"`
+	ClockNote       string          `json:"clock_note,omitempty"`
+	Reconciliation  recovery.Report `json:"reconciliation"`
+	Scopes          []ScopeRun      `json:"scopes"`
+	Quarantined     int             `json:"quarantined_total"`
+	Purged          int             `json:"purged_total"`
+	ReadBytes       int64           `json:"read_bytes"`
+	DiskFreeBefore  uint64          `json:"disk_free_bytes_before"`
+	DiskFreeAfter   uint64          `json:"disk_free_bytes_after"`
+	DiskPressure    bool            `json:"disk_pressure"`
+	PressureNote    string          `json:"disk_pressure_note,omitempty"`
+	Control         string          `json:"control"`
+	UntouchedScopes int             `json:"scopes_not_reached"`
 }
 
 // Run executes one pass.
@@ -75,14 +76,23 @@ type Report struct {
 // Order: reconcile, then purge what is due and authorised, then scan, then
 // quarantine. Purging first prevents a scope that keeps producing garbage from
 // starving objects that are already due.
+//
+// Resource accounting is three ledgers, not one: a monotonic run ledger for time
+// and reads, and one action ledger per action class shared by every scope and
+// rule. That is what makes "several rules must not each use the full limit"
+// true, and what makes a zero limit mean "forbidden" rather than "unlimited".
 func (r *Runner) Run(ctx context.Context) (Report, error) {
-	rep := Report{RunID: domain.NewID("run")}
-	nowNS := r.Clock.Wall().UnixNano()
+	rep := Report{RunID: domain.NewID("run"), Control: domain.ControlContinue}
+	cfg := r.Config.Runtime
 	rep.DiskFreeBefore = r.diskFree()
 
-	trusted, note := r.clockTrust(ctx, nowNS)
-	rep.ClockTrusted = trusted
-	rep.ClockNote = note
+	guard := clocktrust.Start(r.Store, r.Clock)
+	verdict, err := guard.Assess(ctx)
+	if err != nil {
+		return rep, err
+	}
+	rep.ClockTrusted = verdict.Trusted
+	rep.ClockNote = verdict.Reason
 
 	rec, err := r.Reconciler.Run(ctx)
 	rep.Reconciliation = rec
@@ -96,45 +106,63 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	}
 	ordered := r.rotate(scopes)
 
-	budget := domain.NewBudget(r.Config.Runtime.RunSoftSeconds,
-		r.Config.Runtime.RunReadBudgetBytes, 0, 0, r.Config.Runtime.ReadRateBytesPerSecond)
+	runLedger := domain.NewRunLedger(cfg.RunSoftSeconds, cfg.RunReadBudgetBytes, cfg.ReadRateBytesPerSecond)
+	qLedger := domain.NewActionLedger(cfg.MaxAutoQuarantineFiles, cfg.MaxAutoQuarantineBytes)
+	pLedger := domain.NewActionLedger(cfg.MaxAutoPurgeFiles, cfg.MaxAutoPurgeBytes)
 
 	for _, sc := range ordered {
 		if ctx.Err() != nil {
+			rep.Control = domain.ControlStopRun
 			break
 		}
 		if sc.Kind == domain.KindReference {
 			continue
 		}
-		sr := ScopeRun{Scope: sc.ID}
+		sr := ScopeRun{Scope: sc.ID, Control: domain.ControlContinue}
 		if sc.Status != domain.ScopeActive {
 			sr.Skipped = "scope is " + sc.Status
 			rep.Scopes = append(rep.Scopes, sr)
 			continue
 		}
-		if budget.TimeUp(r.Clock) || budget.ReadUp() {
+		if runLedger.TimeUp(r.Clock.Mono()) || runLedger.ReadUp() {
 			sr.Skipped = "run budget reached"
+			rep.UntouchedScopes++
 			rep.Scopes = append(rep.Scopes, sr)
 			continue
 		}
-		result, runErr := r.runScope(ctx, sc, budget, trusted)
+
+		result, runErr := r.runScope(ctx, sc, runLedger, qLedger, pLedger, guard, verdict)
 		if runErr != nil {
 			result.Message = runErr.Error()
 		}
 		rep.Scopes = append(rep.Scopes, result)
 		rep.Quarantined += result.Quarantined
 		rep.Purged += result.Purged
+		rep.Control = strongerControl(rep.Control, result.Control)
+		if rep.Control == domain.ControlStopRun {
+			break
+		}
 	}
 
-	rep.ReadBytes = budget.Read
+	rep.ReadBytes = runLedger.Read
 	rep.DiskFreeAfter = r.diskFree()
-	_ = r.Store.MetaSet(ctx, "last_run_ns", strconv.FormatInt(nowNS, 10))
+	if pressure, note := r.diskPressure(); pressure {
+		rep.DiskPressure = true
+		rep.PressureNote = note
+	}
+	// Recording the run is deliberately last: a run that could not finish its
+	// bookkeeping must not advance the trusted clock baseline.
+	if err := guard.RecordRun(ctx, verdict); err != nil {
+		return rep, err
+	}
 	_ = r.advanceCursor(ordered)
 	return rep, nil
 }
 
-func (r *Runner) runScope(ctx context.Context, sc store.Scope, budget *domain.Budget, clockTrusted bool) (ScopeRun, error) {
-	sr := ScopeRun{Scope: sc.ID}
+func (r *Runner) runScope(ctx context.Context, sc store.Scope, runLedger *domain.RunLedger,
+	qLedger, pLedger *domain.ActionLedger, guard *clocktrust.Guard, verdict clocktrust.Verdict) (ScopeRun, error) {
+
+	sr := ScopeRun{Scope: sc.ID, Control: domain.ControlContinue}
 
 	sctx, err := execute.OpenScopeCtx(ctx, r.Registrar, sc.ID)
 	if err != nil {
@@ -142,123 +170,221 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, budget *domain.Bu
 	}
 	defer sctx.Close()
 
-	guard, err := BuildGuard(ctx, r.Store, sctx)
+	guardSet, err := BuildGuard(ctx, r.Store, sctx)
 	if err != nil {
 		return sr, err
 	}
 
-	if clockTrusted {
-		purged, bytes, due, perr := r.purgeDue(ctx, sctx, budget)
+	// Purging a due object is a new permanent action and needs four things at
+	// once: a coherent clock, room on the volume, an unspent action ledger, and
+	// root evidence strong enough to prove this is still the authorised tree.
+	if !verdict.Trusted {
+		sr.Skipped = "clock is not trustworthy: " + verdict.Reason
+	} else if sctx.IdentityWeak != "" {
+		// R02: thin root evidence is enough to keep observing but not enough to
+		// delete permanently. Nothing is lost by waiting; re-registering restores
+		// the automatic path.
+		sr.Skipped = "root identity evidence is too thin for automatic deletion: " + sctx.IdentityWeak
+		sr.IdentityWeak = sctx.IdentityWeak
+	} else if pressure, note := r.diskPressure(); pressure {
+		sr.Skipped = "disk pressure: " + note
+	} else {
+		purged, bytes, due, control, perr := r.purgeDue(ctx, sctx, runLedger, pLedger, guard)
 		sr.Purged, sr.PurgedBytes, sr.DueNotAuthorised = purged, bytes, due
+		sr.Control = strongerControl(sr.Control, control)
 		if perr != nil {
 			return sr, perr
 		}
+		if control == domain.ControlStopScope || control == domain.ControlStopRun {
+			return sr, nil
+		}
 	}
 
-	stats, complete, err := ScanScope(ctx, r.Store, r.Clock, r.Config.Runtime.ScanBatchSize, sctx, guard, budget)
+	stats, scanState, err := ScanScope(ctx, r.Store, r.Clock, r.Config.Runtime.ScanBatchSize,
+		sctx, guardSet, runLedger)
 	if err != nil {
 		return sr, err
 	}
-	sr.Scanned, sr.ScanComplete = stats.Files, complete
+	sr.Scanned = stats.Files
+	sr.ScanComplete = scanState.Complete
+	sr.ScanInterrupted = scanState.Interrupted
+	sr.DeepScanRequired = scanState.DeepScanRequired
 
-	q, qb, err := r.quarantineGrants(ctx, sctx, guard, budget)
+	// No new mutation while the wall clock is suspect. Scanning is read-only and
+	// keeps its observations fresh, but moving files would create objects whose
+	// retention start time cannot be proven later.
+	if !verdict.Trusted {
+		sr.Message = "no file was moved: the wall clock is not trustworthy"
+		return sr, nil
+	}
+
+	q, qb, control, err := r.quarantineGrants(ctx, sctx, guardSet, runLedger, qLedger)
 	sr.Quarantined, sr.QuarantinedBytes = q, qb
-	if err != nil {
-		return sr, err
-	}
-	return sr, nil
+	sr.Control = strongerControl(sr.Control, control)
+	return sr, err
 }
 
 // purgeDue creates one scheduled purge plan for the objects that are due.
-// Objects without an active auto-purge grant are counted and left alone.
-func (r *Runner) purgeDue(ctx context.Context, sc *execute.ScopeCtx, budget *domain.Budget) (int, int64, int, error) {
+//
+// The queue is read with a keyset cursor and a bounded page size. Objects that
+// cannot be processed automatically are counted and skipped, and the scan
+// continues: a first page full of un-authorised objects used to hide every
+// authorised object behind it, every run, for ever.
+func (r *Runner) purgeDue(ctx context.Context, sc *execute.ScopeCtx, runLedger *domain.RunLedger,
+	ledger *domain.ActionLedger, guard *clocktrust.Guard) (int, int64, int, string, error) {
+
+	cfg := r.Config.Runtime
+	if cfg.MaxAutoPurgeFiles <= 0 || cfg.MaxAutoPurgeBytes <= 0 {
+		return 0, 0, 0, domain.ControlContinue, nil
+	}
+
 	nowNS := r.Clock.Wall().UnixNano()
-	maxItems := r.Config.Runtime.MaxAutoPurgeFiles
-	if maxItems == 0 || r.Config.Runtime.MaxAutoPurgeBytes == 0 {
-		return 0, 0, 0, nil
-	}
-	due, err := r.Store.ItemsDueForPurge(ctx, sc.Scope.ID, nowNS, maxItems)
-	if err != nil {
-		return 0, 0, 0, err
+	pageSize := cfg.MaxAutoPurgeFiles
+	if pageSize > 200 {
+		pageSize = 200
 	}
 
-	authorised := make([]store.Item, 0, len(due))
-	refused := 0
-	var totalBytes int64
-	for _, it := range due {
-		if it.AutoPurgeGrantID == nil || it.SourceKind != domain.SourceScheduledRule {
-			refused++
-			continue
+	var (
+		authorised []store.Item
+		refused    int
+		totalBytes int64
+		afterDue   int64
+		afterItem  string
+	)
+
+collect:
+	for len(authorised) < cfg.MaxAutoPurgeFiles {
+		page, err := r.Store.PurgeQueuePage(ctx, sc.Scope.ID, nowNS, afterDue, afterItem, pageSize)
+		if err != nil {
+			return 0, 0, refused, domain.ControlStopRun, err
 		}
-		g, err := r.Store.GetGrant(ctx, *it.AutoPurgeGrantID)
-		if err != nil || g.Status != domain.GrantActive {
-			refused++
-			continue
+		if len(page) == 0 {
+			break
 		}
-		size := itemSize(it)
-		if totalBytes+size > r.Config.Runtime.MaxAutoPurgeBytes {
-			continue
+		for _, it := range page {
+			afterDue = purgeDueKey(it)
+			afterItem = string(it.ID)
+			if !r.mayPurgeAutomatically(ctx, it) {
+				refused++
+				continue
+			}
+			size := itemSize(it)
+			if totalBytes+size > cfg.MaxAutoPurgeBytes {
+				refused++
+				continue
+			}
+			if !ledger.CanReserve(size) {
+				// The run's purge allowance is spent. Stop looking: the ledger
+				// cannot grow again in this run.
+				break collect
+			}
+			totalBytes += size
+			authorised = append(authorised, it)
+			if len(authorised) >= cfg.MaxAutoPurgeFiles {
+				break collect
+			}
 		}
-		totalBytes += size
-		authorised = append(authorised, it)
 	}
+
 	if len(authorised) == 0 {
-		return 0, 0, refused, nil
+		return 0, 0, refused, domain.ControlContinue, nil
 	}
 
-	purgeBudget := budget.SplitFor(1, 2)
 	p, err := plan.CreatePurgePlan(ctx, r.Store, sc.Scope, authorised,
 		domain.PlanScheduledPurge, nowNS, int64(plan.DefaultTTL))
 	if err != nil {
-		return 0, 0, refused, err
+		return 0, 0, refused, domain.ControlStopScope, err
 	}
-	res, err := r.Exec.ApplyPurgePlan(ctx, sc, p.ID, p.Digest, purgeBudget, true)
+
+	// The purge phase may spend at most what is left in the shared purge ledger,
+	// and its reads land in the same run ledger as everything else.
+	phase := domain.NewPhaseBudget(runLedger, ledger, ledger.RemainingFiles(), ledger.RemainingBytes())
+	res, err := r.Exec.ApplyPurgePlan(ctx, sc, p.ID, p.Digest, phase, guard.Assert)
 	if err != nil {
-		return res.Completed, 0, refused, err
+		return res.Completed, 0, refused, controlOfError(err), err
 	}
 
 	var bytes int64
-	for i, out := range res.Results {
-		if out.Code == string(errs.CodeOK) && i < len(authorised) {
-			bytes += itemSize(authorised[i])
+	for _, out := range res.Results {
+		if out.Code != string(errs.CodeOK) {
+			continue
+		}
+		for _, it := range authorised {
+			if it.ID == out.Item {
+				bytes += itemSize(it)
+				break
+			}
 		}
 	}
-	return res.Completed, bytes, refused, nil
+	return res.Completed, bytes, refused, res.Control, nil
+}
+
+// mayPurgeAutomatically re-checks the standing authority for one object.
+func (r *Runner) mayPurgeAutomatically(ctx context.Context, it store.Item) bool {
+	if it.AutoPurgeGrantID == nil || it.SourceKind != domain.SourceScheduledRule {
+		return false
+	}
+	g, err := r.Store.GetGrant(ctx, *it.AutoPurgeGrantID)
+	if err != nil || g.Status != domain.GrantActive {
+		return false
+	}
+	if g.Capability != domain.CapAutoPurge {
+		return false
+	}
+	return true
+}
+
+// ScanState reports how complete one scanning batch was.
+type ScanState struct {
+	Complete         bool
+	Interrupted      bool
+	DeepScanRequired bool
 }
 
 // ScanScope runs one scanning batch and reports whether the epoch completed.
 //
 // Retiring unseen entries happens only after a complete epoch: a partial pass
-// cannot tell "not scanned yet" from "deleted".
+// cannot tell "not scanned yet" from "deleted". Interrupted is a first-class
+// outcome, not a silent success: the previous code returned nil from a budget
+// stop and then declared the epoch complete.
 func ScanScope(ctx context.Context, st *store.Store, clock domain.Clock, batch int,
-	sc *execute.ScopeCtx, guard *policy.Guard, budget *domain.Budget) (scan.Stats, bool, error) {
+	sc *execute.ScopeCtx, guard *policy.Guard, runLedger *domain.RunLedger) (scan.Stats, ScanState, error) {
 
 	epoch, err := CurrentEpoch(ctx, st, sc.Scope.ID)
 	if err != nil {
-		return scan.Stats{}, false, err
+		return scan.Stats{}, ScanState{}, err
 	}
 	scanner := scan.New(st, clock, guard, batch)
 	stats, err := scanner.Run(ctx, scope.VerifiedScope{
 		Scope:  sc.Scope,
 		Root:   sc.Root,
 		RootID: domain.RootIdentity{Runtime: domain.RuntimeMountIdentity{Device: sc.RootDev}},
-	}, epoch, budget)
+	}, epoch, runLedger)
 	if err != nil {
-		return stats, false, err
+		return stats, ScanState{}, err
 	}
 
 	state, err := st.ScanQueueStateOf(ctx, sc.Scope.ID, epoch)
 	if err != nil {
-		return stats, false, err
+		return stats, ScanState{}, err
+	}
+	if stats.Interrupted || stats.Incomplete {
+		// Keep the dirs that were not finished in the queue. The next run
+		// resumes the same epoch instead of starting a new one that would never
+		// reach the tail of a large directory.
+		if _, err := st.RequeueActive(ctx, sc.Scope.ID, epoch); err != nil {
+			return stats, ScanState{}, err
+		}
+		return stats, ScanState{Interrupted: true, DeepScanRequired: state.Pending > 0}, nil
 	}
 	if state.Pending > 0 {
-		return stats, false, nil
+		return stats, ScanState{}, nil
 	}
 	// Only a completed epoch may retire unseen entries.
 	if _, err := st.MarkStaleObservations(ctx, sc.Scope.ID, epoch); err != nil {
-		return stats, false, err
+		return stats, ScanState{}, err
 	}
-	return stats, true, nil
+	return stats, ScanState{Complete: true}, nil
 }
 
 // CurrentEpoch resumes an unfinished scan epoch, or starts a new one.
@@ -285,16 +411,24 @@ func CurrentEpoch(ctx context.Context, st *store.Store, id domain.ScopeID) (int6
 // quarantineGrants applies every active rule that holds an auto-quarantine
 // grant, one plan per rule.
 func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, guard *policy.Guard,
-	budget *domain.Budget) (int, int64, error) {
+	runLedger *domain.RunLedger, ledger *domain.ActionLedger) (int, int64, string, error) {
 
 	allRules, err := r.Store.ListRules(ctx, sc.Scope.ID)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, domain.ControlStopScope, err
 	}
 	planner := plan.Planner{Store: r.Store, Clock: r.Clock}
 
 	total, bytes := 0, int64(0)
+	control := domain.ControlContinue
+
 	for _, rule := range allRules {
+		if ctx.Err() != nil {
+			return total, bytes, domain.ControlStopRun, nil
+		}
+		if control == domain.ControlStopScope || control == domain.ControlStopRun {
+			return total, bytes, control, nil
+		}
 		if rule.Status != domain.RuleActive {
 			continue
 		}
@@ -304,14 +438,16 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 		}
 		pg, pgErr := r.Store.ActiveGrant(ctx, sc.Scope.ID, rule.ID, rule.Revision, domain.CapAutoPurge)
 
-		parsed, err := rules.Parse([]byte(rule.DSLJSON), map[string]bool{string(sc.Scope.ID): true})
-		if err != nil {
+		// The rule's own grant and the run's shared ledger both apply. Taking
+		// only the grant let two rules each spend the configured maximum.
+		maxFiles := minInt(ledger.RemainingFiles(), minInt(grantFiles(qg), r.Config.Runtime.MaxAutoQuarantineFiles))
+		maxBytes := minI64(ledger.RemainingBytes(), minI64(grantBytes(qg), r.Config.Runtime.MaxAutoQuarantineBytes))
+		if maxFiles <= 0 || maxBytes <= 0 {
 			continue
 		}
 
-		maxFiles := minInt(r.Config.Runtime.MaxAutoQuarantineFiles, grantFiles(qg))
-		maxBytes := minI64(r.Config.Runtime.MaxAutoQuarantineBytes, grantBytes(qg))
-		if maxFiles <= 0 || maxBytes <= 0 {
+		parsed, err := rules.Parse([]byte(rule.DSLJSON), map[string]bool{string(sc.Scope.ID): true})
+		if err != nil {
 			continue
 		}
 
@@ -332,21 +468,29 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 			if errs.CodeOf(err) == errs.CodeNoCandidates {
 				continue
 			}
-			return total, bytes, err
+			return total, bytes, domain.ControlStopScope, err
 		}
 
-		applied, err := r.Exec.ApplyQuarantinePlan(ctx, sc, res.Plan.ID, res.Plan.Digest, budget)
+		phase := domain.NewPhaseBudget(runLedger, ledger, maxFiles, maxBytes)
+		applied, err := r.Exec.ApplyQuarantinePlan(ctx, sc, res.Plan.ID, res.Plan.Digest, phase)
 		total += applied.Completed
-		for i, out := range applied.Results {
-			if out.Code == string(errs.CodeOK) && i < len(res.Items) {
-				bytes += itemSize(res.Items[i])
+		control = strongerControl(control, applied.Control)
+		for _, out := range applied.Results {
+			if out.Code != string(errs.CodeOK) {
+				continue
+			}
+			for _, it := range res.Items {
+				if it.ID == out.Item {
+					bytes += itemSize(it)
+					break
+				}
 			}
 		}
 		if err != nil {
-			return total, bytes, err
+			return total, bytes, strongerControl(control, controlOfError(err)), err
 		}
 	}
-	return total, bytes, nil
+	return total, bytes, control, nil
 }
 
 // BuildGuard resolves protection identities with the kernel.
@@ -373,41 +517,14 @@ func BuildGuard(ctx context.Context, st *store.Store, sc *execute.ScopeCtx) (*po
 	return policy.NewGuard(resolved), nil
 }
 
-// clockTrust compares this run with the last good run and with its own
-// monotonic clock. Suspicion only ever narrows what the run may do.
-func (r *Runner) clockTrust(ctx context.Context, nowNS int64) (bool, string) {
-	lastStr, err := r.Store.MetaGet(ctx, "last_run_ns")
-	if err == nil && lastStr != "" {
-		if last, perr := strconv.ParseInt(lastStr, 10, 64); perr == nil {
-			if nowNS < last-clockBackwardsTolerance {
-				return false, "the wall clock moved backwards since the last run; purging is suspended"
-			}
-			if nowNS-last > clockJumpThreshold {
-				ackStr, _ := r.Store.MetaGet(ctx, "clock_ack_ns")
-				ack, _ := strconv.ParseInt(ackStr, 10, 64)
-				if ack <= last {
-					return false, "more than 48 hours passed between runs; run doctor clock acknowledge before purging"
-				}
-			}
-		}
-	}
-	if drift := (nowNS - r.startWallNS()) - int64(r.Clock.Mono()); drift > clockDriftTolerance {
-		return false, "the wall clock advanced far more than the monotonic clock during this run"
-	}
-	return true, ""
-}
-
-func (r *Runner) startWallNS() int64 { return r.Clock.Wall().UnixNano() - int64(r.Clock.Mono()) }
-
-// ClockTrust reports whether the wall clock is trustworthy enough to purge.
-//
-// It is exported because a manual `purge apply` has the same clock requirement
-// as the background pass (section 10.4 lists "time is trustworthy" among the
-// conditions re-checked for every purge). Only the automatic path used to apply
-// it, which meant a manual purge could run on a clock that had just jumped.
+// ClockTrust is kept for callers that only need the verdict, such as `doctor`.
 func ClockTrust(ctx context.Context, st *store.Store, clock domain.Clock) (bool, string) {
-	r := &Runner{Store: st, Clock: clock}
-	return r.clockTrust(ctx, clock.Wall().UnixNano())
+	guard := clocktrust.Start(st, clock)
+	v, err := guard.Assess(ctx)
+	if err != nil {
+		return false, err.Error()
+	}
+	return v.Trusted, v.Reason
 }
 
 func (r *Runner) rotate(scopes []store.Scope) []store.Scope {
@@ -445,6 +562,16 @@ func (r *Runner) advanceCursor(scopes []store.Scope) error {
 	return r.Store.MetaSet(context.Background(), "rotation_cursor", string(next))
 }
 
+// diskStatus reports free and total bytes for the volume holding a path.
+func diskStatus(path string) (free, total uint64, err error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return 0, 0, err
+	}
+	bs := uint64(st.Bsize)
+	return uint64(st.Bavail) * bs, uint64(st.Blocks) * bs, nil
+}
+
 func (r *Runner) diskFree() uint64 {
 	scopes, err := r.Store.ListScopes(context.Background())
 	if err != nil {
@@ -452,16 +579,46 @@ func (r *Runner) diskFree() uint64 {
 	}
 	var best uint64
 	for _, sc := range scopes {
-		var st unix.Statfs_t
-		if err := unix.Statfs(string(sc.RawRoot), &st); err != nil {
-			continue
-		}
-		free := uint64(st.Bavail) * uint64(st.Bsize)
-		if free > best {
+		if free, _, err := diskStatus(string(sc.RawRoot)); err == nil && free > best {
 			best = free
 		}
 	}
 	return best
+}
+
+// diskPressure reports whether the configured free-space floor has been reached.
+//
+// The thresholds were in the configuration, in the plan digest and in the
+// executor's view struct, and no code read them. A setting that looks present and
+// does nothing is worse than an absent one: it invites an operator to believe the
+// volume is protected.
+func (r *Runner) diskPressure() (bool, string) {
+	cfg := r.Config.Runtime
+	if cfg.MinFreeBytes <= 0 && cfg.MinFreePercent <= 0 {
+		return false, ""
+	}
+	scopes, err := r.Store.ListScopes(context.Background())
+	if err != nil {
+		return true, "the volume could not be inspected: " + err.Error()
+	}
+	for _, sc := range scopes {
+		if !domain.MutableKind(sc.Kind) {
+			continue
+		}
+		free, total, err := diskStatus(string(sc.RawRoot))
+		if err != nil {
+			return true, "scope " + string(sc.ID) + " could not be inspected: " + err.Error()
+		}
+		if cfg.MinFreeBytes > 0 && free < uint64(cfg.MinFreeBytes) {
+			return true, "free space is below min_free_bytes on the volume holding " + string(sc.ID)
+		}
+		if cfg.MinFreePercent > 0 && total > 0 {
+			if free*100/total < uint64(cfg.MinFreePercent) {
+				return true, "free space is below min_free_percent on the volume holding " + string(sc.ID)
+			}
+		}
+	}
+	return false, ""
 }
 
 func itemSize(it store.Item) int64 {
@@ -470,6 +627,14 @@ func itemSize(it store.Item) int64 {
 		return 0
 	}
 	return tok.Size
+}
+
+// purgeDueKey is the cursor value for the due queue.
+func purgeDueKey(it store.Item) int64 {
+	if it.PurgeNotBeforeNS == nil {
+		return 0
+	}
+	return *it.PurgeNotBeforeNS
 }
 
 func grantFiles(g store.Grant) int {
@@ -507,4 +672,35 @@ func minI64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func strongerControl(a, b string) string {
+	rank := func(s string) int {
+		switch s {
+		case domain.ControlStopRun:
+			return 3
+		case domain.ControlStopScope:
+			return 2
+		case domain.ControlStopPlan:
+			return 1
+		}
+		return 0
+	}
+	if rank(b) > rank(a) {
+		return b
+	}
+	return a
+}
+
+func controlOfError(err error) string {
+	switch errs.CodeOf(err) {
+	case errs.CodePaused, errs.CodeHeld, errs.CodeScopeChanged, errs.CodeProtectionAliasUnresolved:
+		return domain.ControlStopScope
+	case errs.CodePlanStale, errs.CodePlanExpired:
+		return domain.ControlStopPlan
+	case errs.CodeDurabilityFailed, errs.CodeIOError, errs.CodeStateWriteFailed,
+		errs.CodeDBError, errs.CodeClockUntrusted:
+		return domain.ControlStopRun
+	}
+	return domain.ControlContinue
 }

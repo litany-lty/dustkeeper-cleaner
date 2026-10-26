@@ -155,9 +155,72 @@ func tokenOf(st *unix.Stat_t, metadataHash domain.Digest) domain.ChangeToken {
 	}
 }
 
-// birthTimeNS is unavailable on the Linux stat contract used here. Returning
-// false keeps the identity honest instead of inventing a zero birth time.
+// fileFlags reads the inode flags (immutable, append-only, no-copy-on-write, ...)
+// with FS_IOC_GETFLAGS.
+//
+// R09 C records that this was assumed to be zero on Linux. Two files with
+// different inode flags are not interchangeable: an immutable copy is not a
+// replaceable duplicate. Every filesystem that mutation is allowed on
+// (ext4, XFS) answers this ioctl, so a failure here is reported as unsupported
+// evidence rather than as "no flags".
+func fileFlags(fd int) (uint64, string) {
+	flags, err := unix.IoctlGetInt(fd, unix.FS_IOC_GETFLAGS)
+	if err != nil {
+		return 0, "flags_unreadable"
+	}
+	return uint64(uint32(flags)), ""
+}
+
+// tokenFlags is the flags half of a change token for an open regular file.
+func tokenFlags(fd int, _ *unix.Stat_t) uint64 {
+	flags, unsupported := fileFlags(fd)
+	if unsupported != "" {
+		return 0
+	}
+	return flags
+}
+
+// birthTimeNS is the birth time carried by a plain stat, which the Linux stat
+// contract does not provide. birthTimeOfFD uses statx and is what the root
+// identity actually uses.
 func birthTimeNS(*unix.Stat_t) (int64, bool) { return 0, false }
+
+// birthTimeOfFD reads the creation time of an open descriptor with statx.
+//
+// R02 records that the birthtime was collected and then never used, and on
+// Linux it was not collected at all because the old code only looked at stat.
+// statx exposes STATX_BTIME on ext4, XFS and btrfs, so the strongest persistent
+// fact available here is now part of the root identity instead of being assumed
+// absent. A filesystem that does not fill the field reports "unavailable", which
+// the caller treats as thin evidence rather than as a match.
+func birthTimeOfFD(fd int) (int64, bool) {
+	var stx unix.Statx_t
+	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH, unix.STATX_BTIME, &stx); err != nil {
+		return 0, false
+	}
+	if stx.Mask&unix.STATX_BTIME == 0 {
+		return 0, false
+	}
+	return stx.Btime.Sec*int64(1e9) + int64(stx.Btime.Nsec), true
+}
+
+// mountIDOfFD reads the mount ID that the descriptor was resolved through.
+// statx reports it directly, which is exact; the mountinfo scan is a fallback for
+// kernels older than 5.8 that do not fill statx.Mnt_id.
+func mountIDOfFD(fd int, path string) *uint64 {
+	var stx unix.Statx_t
+	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH, unix.STATX_MNT_ID, &stx); err == nil {
+		if stx.Mask&unix.STATX_MNT_ID != 0 {
+			id := stx.Mnt_id
+			return &id
+		}
+	}
+	id, err := mountIDFor(path)
+	if err != nil {
+		return nil
+	}
+	return id
+}
 
 // generationOf is unavailable on Linux.
 func generationOf(*unix.Stat_t) (uint64, bool) { return 0, false }

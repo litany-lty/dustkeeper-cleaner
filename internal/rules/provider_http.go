@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,8 +17,10 @@ import (
 	"dustkeeper/internal/errs"
 )
 
-// ProviderOpenAICompatible is the only adapter shape phase one implements.
-const ProviderOpenAICompatible = "openai-compatible"
+// ProviderOpenAICompatible is the only adapter shape phase one implements. The
+// name is the loader's constant, so a configuration the loader approved is
+// always one the adapter accepts.
+const ProviderOpenAICompatible = config.ProviderChatCompletionsJSON
 
 // connectTimeout is fixed at 3 seconds; the total timeout comes from the
 // configuration.
@@ -90,6 +93,11 @@ func NewHTTPProvider(m config.Model) (*HTTPProvider, error) {
 	}, nil
 }
 
+// maxScopesInPrompt is the ceiling for the allowed-scope list. Above it the
+// request is refused rather than truncated: a list with "- ... and 40 more" in it
+// asks the model to choose from a set it cannot see.
+const maxScopesInPrompt = 64
+
 // chatRequest is the documented request body.
 type chatRequest struct {
 	Model       string        `json:"model"`
@@ -113,12 +121,38 @@ type chatResponse struct {
 	} `json:"choices"`
 }
 
+// systemWithScopes appends the allowed scope IDs to the system prompt.
+//
+// The prompt already says "one of the allowed scope IDs"; without the list that
+// sentence names a set the model was never given, and a guess that happens to
+// match a registered scope looks exactly like a reading of the user's words.
+// The list is logical IDs only: no paths, no file names, no counts.
+func systemWithScopes(system string, scopes []string) string {
+	ids := append([]string(nil), scopes...)
+	sort.Strings(ids)
+
+	var b strings.Builder
+	b.WriteString(system)
+	b.WriteString("\n\nAllowed scope IDs (choose exactly one, spelled exactly as written):\n")
+	for _, id := range ids {
+		b.WriteString("- ")
+		b.WriteString(id)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // Draft performs one request and returns the raw content string.
 func (p *HTTPProvider) Draft(ctx context.Context, req DraftRequest) ([]byte, error) {
+	if len(req.Scopes) > maxScopesInPrompt {
+		return nil, errs.Newf(errs.CodeInvalidArgument,
+			"%d scopes are registered; the draft request carries at most %d so the model can actually see them",
+			len(req.Scopes), maxScopesInPrompt)
+	}
 	body := chatRequest{
 		Model: p.model.Model,
 		Messages: []chatMessage{
-			{Role: "system", Content: req.System},
+			{Role: "system", Content: systemWithScopes(req.System, req.Scopes)},
 			{Role: "user", Content: req.Text},
 		},
 		Temperature: 0,

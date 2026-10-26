@@ -184,6 +184,25 @@ func checkNoWriterChange(f *fsops.File, wantID domain.FileIdentity, wantTok doma
 	return nil
 }
 
+// SyncAfterUnlink makes a removal durable: the directory the entry was removed
+// from, then a full-device barrier.
+//
+// It exists next to SyncAfterMove so that reconciliation issues the same steps as
+// the normal path. R08 found the purge reconciler syncing only the objects
+// directory and then writing a completion record, which claimed a durability it
+// never asked for.
+func SyncAfterUnlink(dir fsops.DirFD, anchorFD int, marker string) error {
+	if err := fsops.DurableDir(dir); err != nil {
+		return errs.Wrap(errs.CodeDurabilityFailed, err)
+	}
+	if anchorFD >= 0 {
+		if err := fsops.Barrier(anchorFD, []byte(marker)); err != nil {
+			return errs.Wrap(errs.CodeDurabilityFailed, err)
+		}
+	}
+	return nil
+}
+
 // SyncAfterMove makes the namespace change durable: the object's data, then both
 // parent directories, then a full-device barrier on macOS.
 func SyncAfterMove(filefd int, srcDir, dstDir fsops.DirFD, anchorFD int, marker string) error {

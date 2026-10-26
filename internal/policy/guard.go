@@ -249,3 +249,55 @@ func (g *Guard) SubtreePaths() []string {
 	}
 	return out
 }
+
+// CheckFile is the single question every entry point must ask.
+//
+// Planning, quarantining, restoring and purging all decide "may this object be
+// touched", and they used to ask it differently: the planner and the executor
+// called CheckExact only, so a subtree protection added after a scan had no
+// effect on a plan that was created afterwards. A plan is not stale in that
+// case — it is new — so the protection-revision check could not catch it either.
+//
+// Exact match is answered by identity first; subtree match is answered by path
+// containment, because the protection was recorded as a path and the directory it
+// named may since have been renamed or replaced. Path containment is the
+// conservative answer: it keeps files.
+func (g *Guard) CheckFile(rel string, id domain.FileIdentity) (bool, string) {
+	if g == nil {
+		return false, ""
+	}
+	if ok, why := g.CheckExact(rel, id); ok {
+		return true, why
+	}
+	for _, p := range g.subtree {
+		root := strings.TrimSuffix(string(p.RawRelative), "/")
+		if root == "" {
+			continue
+		}
+		if HasDirPrefix(rel, root) {
+			return true, "subtree protected by " + p.Source
+		}
+	}
+	return false, ""
+}
+
+// CheckNameOnly answers the same question without an identity, for callers that
+// have not opened the object (a purge whose original file is already gone).
+func (g *Guard) CheckNameOnly(rel string) (bool, string) {
+	if g == nil {
+		return false, ""
+	}
+	if src, ok := g.exactPath[rel]; ok {
+		return true, "protected by " + src
+	}
+	for _, p := range g.subtree {
+		root := strings.TrimSuffix(string(p.RawRelative), "/")
+		if root == "" {
+			continue
+		}
+		if HasDirPrefix(rel, root) {
+			return true, "subtree protected by " + p.Source
+		}
+	}
+	return false, ""
+}

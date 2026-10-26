@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"dustkeeper/internal/config"
@@ -305,20 +306,11 @@ func cmdDoctor(ctx context.Context, a *app, args []string) (output, error) {
 }
 
 func describeCaps(c fsops.Capabilities) string {
-	missing := ""
-	if !c.NoReplaceRename {
-		missing += " no-replace rename;"
+	missing := c.Missing()
+	if len(missing) == 0 {
+		return "exclusive rename, directory sync, no-follow traversal and full device barrier verified"
 	}
-	if !c.DirSync {
-		missing += " directory fsync;"
-	}
-	if !c.NoFollow {
-		missing += " no-follow traversal;"
-	}
-	if missing == "" {
-		return "exclusive rename, directory sync and no-follow traversal verified"
-	}
-	return "missing:" + missing
+	return "missing: " + strings.Join(missing, "; ")
 }
 
 func humanDuration(d time.Duration) string {
@@ -617,24 +609,38 @@ func cmdScan(ctx context.Context, a *app, args []string) (output, error) {
 		if err != nil {
 			return output{}, err
 		}
-		budget := domain.NewBudget(a.cfg.Runtime.RunSoftSeconds, a.cfg.Runtime.RunReadBudgetBytes,
-			0, 0, a.cfg.Runtime.ReadRateBytesPerSecond)
-		st, done, err := run.ScanScope(ctx, a.store, a.clock, a.cfg.Runtime.ScanBatchSize, sctx, guard, budget)
+		runLedger := domain.NewRunLedger(a.cfg.Runtime.RunSoftSeconds,
+			a.cfg.Runtime.RunReadBudgetBytes, a.cfg.Runtime.ReadRateBytesPerSecond)
+		st, scanState, err := run.ScanScope(ctx, a.store, a.clock, a.cfg.Runtime.ScanBatchSize, sctx, guard, runLedger)
 		if err != nil {
 			return output{}, err
 		}
 		res := ok()
 		res.ScopeID = string(sc.ID)
-		res.Data = map[string]any{"scan": st, "epoch_complete": done}
+		res.Data = map[string]any{"scan": st, "scan_state": scanState}
 		res.Human = []string{
 			fmt.Sprintf("scanned %d directories, %d files (%d bytes)", st.Dirs, st.Files, st.Bytes),
 			fmt.Sprintf("  protected directories skipped: %d, entries skipped: %d, unreadable: %d",
 				st.ProtectedDirs, st.SkippedEntries, st.Unreadable),
 		}
-		if done {
+		switch {
+		case scanState.Complete:
 			res.Human = append(res.Human, "  scan epoch complete; entries not seen were retired")
-		} else {
-			res.Human = append(res.Human, "  budget reached before the queue drained; nothing was retired")
+		case scanState.Interrupted:
+			res.Human = append(res.Human,
+				"  the batch stopped at a safe boundary; the epoch is NOT complete and the queue will resume")
+			if scanState.DeepScanRequired {
+				res.Human = append(res.Human, "  the queue is still not drained: this scope needs further batches")
+			}
+			res.Code = errs.CodePartial
+		default:
+			res.Human = append(res.Human,
+				"  the queue drained but some directories could not be read; nothing was retired")
+			if st.FailedDirs > 0 {
+				res.Human = append(res.Human,
+					fmt.Sprintf("  unreadable directories: %d (the next epoch will try them again)", st.FailedDirs))
+			}
+			res.Code = errs.CodePartial
 		}
 		res.Next = []string{"dustkeeper rule preview --id <rule> --revision 1"}
 		return res, nil

@@ -24,7 +24,7 @@ const (
 	maxXattrTotalBytes = 4 << 20
 )
 
-func readMetadata(fd int) (MetadataEvidence, error) {
+func readXattrEvidence(fd int) (MetadataEvidence, error) {
 	var ev MetadataEvidence
 
 	sz, err := unix.Flistxattr(fd, nil)

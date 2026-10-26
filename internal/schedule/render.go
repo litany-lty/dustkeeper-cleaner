@@ -33,6 +33,11 @@ type Options struct {
 	ConfigFile string
 	Hour       int // local time, 0-23
 	Minute     int // 0-59
+	// TimeSet says the caller supplied an explicit time. Without it, 00:00 means
+	// "not configured" and the documented default applies. With it, midnight is a
+	// legitimate schedule: R15 records that an explicit 00:00 used to be silently
+	// rewritten to 03:30.
+	TimeSet bool
 	// Label is the launchd label and systemd unit prefix.
 	Label string
 }
@@ -49,8 +54,9 @@ func Render(opt Options) ([]File, error) {
 	if err := opt.validate(); err != nil {
 		return nil, err
 	}
-	if opt.Hour == 0 && opt.Minute == 0 {
-		// The documented default is 03:30 local time.
+	if !opt.TimeSet && opt.Hour == 0 && opt.Minute == 0 {
+		// The documented default is 03:30 local time, applied only when the caller
+		// did not ask for a specific time.
 		opt.Hour, opt.Minute = 3, 30
 	}
 	switch opt.Platform {

@@ -1,0 +1,16 @@
+{
+  "max_tokens": 1500,
+  "messages": [
+    {
+      "content": "You convert one user description into exactly one Dustkeeper rule draft.\nReturn a single JSON object and nothing else. No markdown, no prose.\n\nAllowed shapes:\n\n1. A complete draft:\n{\"kind\":\"draft\",\"dsl\":{\u003crule\u003e}}\n\n2. A clarification request, when a required field is genuinely ambiguous:\n{\"kind\":\"needs_input\",\"questions\":[\"...\"]}   (1 to 3 questions)\n\n3. A refusal, when the request cannot be expressed safely:\n{\"kind\":\"unsupported\",\"reason\":\"...\"}\n\nThe \u003crule\u003e object has exactly these fields:\n  dsl_version            integer, always 1\n  scope_id               one of the allowed scope IDs\n  action                 \"quarantine\" only\n  match                  {min_mtime_age_seconds, min_size_bytes, max_size_bytes,\n                          relative_dir_prefixes, basename_patterns}\n  except                 {relative_dir_prefixes, basename_patterns}\n  retention_seconds      integer\n\nRules:\n- min_mtime_age_seconds is required and must come from an explicit \"not modified\n  for N days\" statement. Do not invent an age.\n- relative_dir_prefixes end with \"/\" and are relative to the scope root.\n- basename_patterns support only \"*\" and \"?\"; no \"**\", no character classes,\n  no path separators.\n- Do not invent a retention period. If the user did not state one, use\n  \"needs_input\".\n- Never mention absolute paths, and never propose deleting anything: a rule can\n  only request quarantine.\n- Nothing you output grants permission. It is a draft a human must review.\n\nAllowed scope IDs (choose exactly one, spelled exactly as written):\n- exports\n- logs\n",
+      "role": "system"
+    },
+    {
+      "content": "keep everything older than 30 days",
+      "role": "user"
+    }
+  ],
+  "model": "test-model",
+  "stream": false,
+  "temperature": 0
+}

@@ -2,9 +2,8 @@ package scope
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -19,10 +18,6 @@ import (
 	"dustkeeper/internal/fsops"
 	"dustkeeper/internal/store"
 )
-
-// vaultDirName is the private management directory created inside a mutable
-// scope. observe and reference scopes never get one.
-const vaultDirName = ".dustkeeper"
 
 // scopeIDPattern is the only shape a scope ID may take, because it is also used
 // in file names and in the DSL.
@@ -145,19 +140,11 @@ func (r *Registrar) Add(ctx context.Context, opt AddOptions) (store.Scope, error
 	}
 
 	if domain.MutableKind(opt.Kind) {
-		vaultID, err := r.createVault(root, resolved, sc, identity)
+		vaultID, err := r.createVault(root, sc, identity)
 		if err != nil {
 			return store.Scope{}, err
 		}
 		sc.VaultIdentityJSON = &vaultID
-
-		// The capability probe runs before the scope is usable. A host that
-		// cannot refuse an overwriting rename must stay read-only.
-		caps := fsops.Probe(filepath.Join(resolved, vaultDirName, "tmp"))
-		if !caps.Capable() {
-			return store.Scope{}, errs.Newf(errs.CodeUnsupportedFS,
-				"this filesystem cannot support safe file changes: %s", strings.Join(caps.Notes, "; "))
-		}
 	}
 
 	if err := r.Store.InsertScope(ctx, sc); err != nil {
@@ -302,7 +289,7 @@ func checkOwnerMarkers(resolved, instanceID string) error {
 	// Ancestors.
 	dir := filepath.Dir(resolved)
 	for {
-		marker := filepath.Join(dir, vaultDirName, "owner.json")
+		marker := filepath.Join(dir, domain.VaultDirName, "owner.json")
 		if data, err := os.ReadFile(marker); err == nil {
 			var m OwnerMarker
 			if json.Unmarshal(data, &m) == nil && m.InstanceID != instanceID {
@@ -335,10 +322,10 @@ func checkOwnerMarkers(resolved, instanceID string) error {
 			probeErr = fmt.Errorf("more than %d directories; register a narrower scope", maxEntries)
 			return fs.SkipAll
 		}
-		if filepath.Base(p) == vaultDirName {
+		if filepath.Base(p) == domain.VaultDirName {
 			return fs.SkipDir
 		}
-		marker := filepath.Join(p, vaultDirName, "owner.json")
+		marker := filepath.Join(p, domain.VaultDirName, "owner.json")
 		if data, err := os.ReadFile(marker); err == nil {
 			var m OwnerMarker
 			if json.Unmarshal(data, &m) == nil {
@@ -356,15 +343,54 @@ func checkOwnerMarkers(resolved, instanceID string) error {
 	return nil
 }
 
-// createVault builds the private directory, owner marker and durability anchor,
-// then returns the vault identity digest.
-func (r *Registrar) createVault(root *fsops.Root, resolved string, sc store.Scope, identity domain.RootIdentity) (string, error) {
-	if err := root.MkdirAll([]byte(vaultDirName), 0o700); err != nil {
+// createVault builds the private directory, owner marker and durability anchor.
+//
+// Order matters and is the R01 fix: the capability probe runs before anything is
+// created, every object is created or opened through the verified root
+// descriptor, an existing object is verified rather than trusted, and the whole
+// directory is re-opened through OpenVault at the end so that what registration
+// just wrote is checked by exactly the code that will check it on every later
+// run.
+func (r *Registrar) createVault(root *fsops.Root, sc store.Scope, identity domain.RootIdentity) (string, error) {
+	// The probe runs against the business root, which is the volume the anchor
+	// and the objects will live on, and it runs before the private directory
+	// exists. A host that cannot finish a barrier must stay read-only instead of
+	// moving a file and discovering afterwards that it cannot close the action.
+	caps := fsops.Probe(root.Path())
+	if !caps.Capable() {
+		return "", errs.Newf(errs.CodeUnsupportedFS,
+			"this filesystem cannot support safe file changes: missing %s",
+			strings.Join(caps.Missing(), "; "))
+	}
+
+	if err := root.MkdirAll([]byte(domain.VaultDirName), 0o700); err != nil {
 		return "", errs.Wrap(errs.CodeAccessDenied, err)
 	}
-	for _, sub := range []string{"objects", "manifests", "tmp"} {
-		if err := root.MkdirAll([]byte(vaultDirName+"/"+sub), 0o700); err != nil {
+	for _, sub := range []string{domain.VaultObjects, domain.VaultManifests, domain.VaultTmp} {
+		if err := root.MkdirAll([]byte(sub), 0o700); err != nil {
 			return "", errs.Wrap(errs.CodeAccessDenied, err)
+		}
+	}
+
+	vault, err := root.OpenDir([]byte(domain.VaultDirName))
+	if err != nil {
+		return "", errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	defer vault.Close()
+
+	tmp, err := root.OpenDir([]byte(domain.VaultTmp))
+	if err != nil {
+		return "", errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	defer tmp.Close()
+
+	expect := VaultExpect{OwnerUID: CurrentOwnerUID(), RootDev: root.Dev()}
+	for _, d := range []struct {
+		dir  *fsops.Dir
+		name string
+	}{{vault, "management directory"}, {tmp, "temporary directory"}} {
+		if err := d.dir.VerifyPrivate(expect.For(true)); err != nil {
+			return "", refuse(d.name, err)
 		}
 	}
 
@@ -381,65 +407,56 @@ func (r *Registrar) createVault(root *fsops.Root, resolved string, sc store.Scop
 	if err != nil {
 		return "", errs.Wrap(errs.CodeStateWriteFailed, err)
 	}
-	markerPath := filepath.Join(resolved, vaultDirName, "owner.json")
-	if existing, err := os.ReadFile(markerPath); err == nil {
-		var prior OwnerMarker
-		if json.Unmarshal(existing, &prior) == nil && prior.InstanceID != r.InstanceID {
-			return "", errs.Newf(errs.CodeScopeOverlap,
-				"%q is already managed by another Dustkeeper instance", resolved)
-		}
-		// Same instance: keep the original marker.
-	} else if err := writeFileDurable(markerPath, body, 0o600); err != nil {
-		return "", err
-	}
 
-	anchorPath := filepath.Join(resolved, vaultDirName, "durability.anchor")
-	if _, err := os.Stat(anchorPath); os.IsNotExist(err) {
-		if err := writeFileDurable(anchorPath, nil, 0o600); err != nil {
+	// InstallPrivate never truncates and never replaces. The review's first
+	// scenario is a directory that already holds owner.json.tmp as a symlink to
+	// a file outside the scope: a fixed temporary name plus O_CREAT|O_TRUNC would
+	// truncate that file before any check could run.
+	created, installErr := fsops.InstallPrivate(tmp, vault, "owner.json", body, 0o600)
+	switch {
+	case installErr == nil && created:
+		// Fresh marker written and synced.
+	case errors.Is(installErr, fsops.ErrExists):
+		// A marker is already present. It is verified, not trusted: a stale or
+		// tampered marker is exactly the case R01 refuses to act on.
+		if err := verifyMarker(vault, VaultExpect{
+			OwnerUID:   expect.OwnerUID,
+			RootDev:    expect.RootDev,
+			InstanceID: r.InstanceID,
+		}); err != nil {
 			return "", err
 		}
+	case installErr != nil && created:
+		// The entry is in place but the directory sync failed, so its durability
+		// is unknown. Continuing would build intents on top of an unsynced marker.
+		return "", errs.Wrap(errs.CodeDurabilityFailed, installErr)
+	default:
+		return "", errs.Wrap(errs.CodeStateWriteFailed, installErr)
 	}
 
-	vault, err := root.OpenDir([]byte(vaultDirName + "/objects"))
-	if err != nil {
-		return "", errs.Wrap(errs.CodeAccessDenied, err)
-	}
-	defer vault.Close()
-	vaultIdentity, _, err := vault.Stat()
-	if err != nil {
-		return "", errs.Wrap(errs.CodeAccessDenied, err)
-	}
-	digest := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d", vaultIdentity.VolumeID, vaultIdentity.Device, vaultIdentity.Inode)))
-	return "vault:" + hex.EncodeToString(digest[:]), nil
-}
-
-func writeFileDurable(path string, body []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return errs.Wrap(errs.CodeAccessDenied, err)
-	}
-	if len(body) > 0 {
-		if _, err := f.Write(body); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return errs.Wrap(errs.CodeStateWriteFailed, err)
+	// The anchor gets the same treatment: exclusive create, no link, private
+	// mode. A pre-placed hard link to a business file would turn every later
+	// barrier into a write into that file.
+	anchorCreated, anchorErr := fsops.InstallPrivate(tmp, vault, "durability.anchor", nil, 0o600)
+	if anchorErr != nil && !errors.Is(anchorErr, fsops.ErrExists) {
+		if anchorCreated {
+			return "", errs.Wrap(errs.CodeDurabilityFailed, anchorErr)
 		}
+		return "", errs.Wrap(errs.CodeStateWriteFailed, anchorErr)
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return errs.Wrap(errs.CodeDurabilityFailed, err)
+
+	handles, err := OpenVault(root, VaultExpect{
+		OwnerUID:   expect.OwnerUID,
+		RootDev:    expect.RootDev,
+		InstanceID: r.InstanceID,
+		Creating:   true,
+		Lock:       true,
+	})
+	if err != nil {
+		return "", err
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return errs.Wrap(errs.CodeDurabilityFailed, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return errs.Wrap(errs.CodeStateWriteFailed, err)
-	}
-	return syncDir(filepath.Dir(path))
+	defer handles.Close()
+	return handles.Identity, nil
 }
 
 // VerifiedScope is a scope whose root was just proven to be the same object
@@ -448,13 +465,23 @@ type VerifiedScope struct {
 	Scope  store.Scope
 	Root   *fsops.Root
 	RootID domain.RootIdentity
+	// Weak is non-empty when nothing proved a change but the surviving evidence
+	// cannot rule one out. Callers keep the scope usable for observing and
+	// planning and refuse automatic permanent deletion on it.
+	Weak string
 }
 
 // OpenVerified opens the scope root and compares identity facts.
 //
-// Normal restarts compare the persistent half only; a mount ID that happens to
-// match proves nothing across a reboot. When the persistent identity cannot be
-// matched, the scope is paused rather than silently refreshed.
+// The comparison uses every persistent field the platform can supply, including
+// the birth time and generation, and it compares the owner exactly instead of
+// treating a stored uid 0 as "unset". When the persistent evidence cannot
+// distinguish the object, the scope is marked weak instead of being silently
+// trusted: thin evidence is reported, not ignored.
+//
+// The runtime half is re-established on every open, because mount IDs only mean
+// something within one boot. A different mount inside the same boot is treated as
+// a change; a new boot is not.
 func (r *Registrar) OpenVerified(ctx context.Context, id domain.ScopeID) (VerifiedScope, error) {
 	sc, err := r.Store.GetScope(ctx, id)
 	if err != nil {
@@ -477,16 +504,74 @@ func (r *Registrar) OpenVerified(ctx context.Context, id domain.ScopeID) (Verifi
 			"scope %s has an unreadable stored identity: %v", id, err)
 	}
 
-	if stored.Persistent.Inode != current.Persistent.Inode ||
-		stored.Persistent.VolumeID != current.Persistent.VolumeID ||
-		(stored.Persistent.OwnerUID != 0 && stored.Persistent.OwnerUID != current.Persistent.OwnerUID) {
+	verdict := CompareRootIdentity(stored, current)
+	if verdict.Changed == "" {
+		if storedBinding, berr := r.storedMountBinding(ctx, id); berr != nil {
+			root.Close()
+			return VerifiedScope{}, berr
+		} else {
+			verdict = mergeVerdicts(verdict, CompareMountBinding(storedBinding, current.Runtime))
+		}
+	}
+	if verdict.Changed != "" {
 		root.Close()
 		_ = r.Store.SetScopeStatus(ctx, id, domain.ScopeHeld)
 		return VerifiedScope{}, errs.Newf(errs.CodeScopeChanged,
-			"scope %s root identity changed (inode %d -> %d); re-register after checking the path",
-			id, stored.Persistent.Inode, current.Persistent.Inode)
+			"scope %s no longer matches its registration: %s; re-register after checking the path",
+			id, verdict.Changed)
 	}
-	return VerifiedScope{Scope: sc, Root: root, RootID: current}, nil
+
+	// Record the binding this run will compare against, so a remount later in the
+	// same boot is still detected. A failure here is reported: acting on a scope
+	// whose binding could not be written would leave the next run without the
+	// evidence this one claims to have established.
+	if err := r.recordMountBinding(ctx, id, current.Runtime); err != nil {
+		root.Close()
+		return VerifiedScope{}, err
+	}
+	return VerifiedScope{Scope: sc, Root: root, RootID: current, Weak: verdict.Weak}, nil
+}
+
+func mergeVerdicts(a, b IdentityVerdict) IdentityVerdict {
+	if a.Changed == "" {
+		a.Changed = b.Changed
+	}
+	if a.Weak == "" {
+		a.Weak = b.Weak
+	}
+	return a
+}
+
+// mountBindingKey is the meta key holding one scope's recorded runtime binding.
+func mountBindingKey(id domain.ScopeID) string { return "scope_mount_binding:" + string(id) }
+
+func (r *Registrar) storedMountBinding(ctx context.Context, id domain.ScopeID) (domain.RuntimeMountIdentity, error) {
+	raw, err := r.Store.MetaGet(ctx, mountBindingKey(id))
+	if err != nil {
+		return domain.RuntimeMountIdentity{}, err
+	}
+	if raw == "" {
+		return domain.RuntimeMountIdentity{}, nil
+	}
+	var b domain.RuntimeMountIdentity
+	if err := json.Unmarshal([]byte(raw), &b); err != nil {
+		// An unreadable binding is missing evidence, not a match. Reporting it
+		// keeps the caller from believing a comparison that never happened.
+		return domain.RuntimeMountIdentity{}, errs.Newf(errs.CodeStateWriteFailed,
+			"the recorded mount binding for scope %s is unreadable: %v", id, err)
+	}
+	return b, nil
+}
+
+func (r *Registrar) recordMountBinding(ctx context.Context, id domain.ScopeID, b domain.RuntimeMountIdentity) error {
+	body, err := json.Marshal(b)
+	if err != nil {
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	if err := r.Store.MetaSet(ctx, mountBindingKey(id), string(body)); err != nil {
+		return err
+	}
+	return nil
 }
 
 // isAncestor reports whether parent contains child (strictly).

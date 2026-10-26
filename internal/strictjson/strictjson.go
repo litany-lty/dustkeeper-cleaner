@@ -29,6 +29,8 @@ const (
 	KindNotInteger = Kind("NOT_INTEGER")
 	KindTrailing   = Kind("TRAILING_DATA")
 	KindUnknown    = Kind("UNKNOWN_FIELD")
+	KindMissing    = Kind("MISSING_FIELD")
+	KindShape      = Kind("WRONG_SHAPE")
 	KindSyntax     = Kind("SYNTAX")
 )
 

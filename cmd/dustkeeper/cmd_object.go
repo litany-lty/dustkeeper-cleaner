@@ -7,11 +7,13 @@ import (
 	"io"
 	"time"
 
+	"dustkeeper/internal/clocktrust"
 	"dustkeeper/internal/dedup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
 	"dustkeeper/internal/plan"
+	"dustkeeper/internal/rescue"
 	"dustkeeper/internal/store"
 )
 
@@ -541,10 +543,12 @@ func purgeApply(ctx context.Context, a *app, args []string) (output, error) {
 		budget := domain.NewBudget(a.cfg.Runtime.RunSoftSeconds, a.cfg.Runtime.RunReadBudgetBytes,
 			len(items), planBytes(items), a.cfg.Runtime.ReadRateBytesPerSecond)
 
-		// A manual purge is an interactive decision, so the wall clock is the
-		// user's clock. Retention is still recomputed from the recorded
-		// quarantine instant; nothing is shortened.
-		res, err := exec.ApplyPurgePlan(ctx, sctx, p.ID, domain.Digest(*digest), budget, true)
+		// A manual purge is an interactive decision, but "the user is present"
+		// is not evidence that the wall clock is coherent. Retention is proven
+		// from the recorded quarantine instant, so the same clock assertion the
+		// background path uses applies here too.
+		trust := clocktrust.Start(a.store, a.clock)
+		res, err := exec.ApplyPurgePlan(ctx, sctx, p.ID, domain.Digest(*digest), budget, trust.Assert)
 		if err != nil {
 			return output{}, err
 		}
@@ -588,6 +592,51 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	switch args[0] {
 	case "inspect":
+		fs := flagset("recover inspect", a.stderr)
+		root := fs.String("root", "", "inventory this scope root without opening the database")
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return output{}, err
+		}
+		// The manifest-only path deliberately runs before openStore. R13 records
+		// that a damaged database made the independent record unreadable, which is
+		// the one situation an operator needs it in.
+		if *root != "" {
+			clean, err := rescue.ParseRootArg(*root)
+			if err != nil {
+				return output{}, err
+			}
+			rep, err := rescue.Inspect(clean)
+			if err != nil {
+				return output{}, err
+			}
+			out := ok()
+			out.Data = rep
+			out.Human = []string{
+				fmt.Sprintf("inventory of %s (no database was opened)", rep.Root),
+				fmt.Sprintf("  %d object(s): %d complete, %d manifest without object, %d orphan, %d conflict, %d unknown",
+					rep.Objects, rep.Complete, rep.Missing, rep.Orphans, rep.Conflicts, rep.Unknown),
+			}
+			if rep.InstanceID != "" {
+				out.Human = append(out.Human, "  owner instance: "+rep.InstanceID)
+			}
+			for _, e := range rep.Entries {
+				line := fmt.Sprintf("  %-28s %-22s %s", e.Object, e.Status, e.RawRelative)
+				out.Human = append(out.Human, line)
+				for _, n := range e.Notes {
+					out.Human = append(out.Human, "      "+n)
+				}
+			}
+			for _, n := range rep.Notes {
+				out.Human = append(out.Human, "  note: "+n)
+			}
+			if rep.Orphans > 0 || rep.Conflicts > 0 || rep.Missing > 0 {
+				out.Code = errs.CodeRecoveryRequired
+				out.Status = string(errs.StatusOf(out.Code))
+				out.Message = "the directory holds objects this inventory cannot explain; nothing was changed"
+			}
+			return out, nil
+		}
+
 		if err := a.openStore(); err != nil {
 			return output{}, err
 		}

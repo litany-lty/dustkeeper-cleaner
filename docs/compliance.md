@@ -179,3 +179,59 @@ ContractJSON: `{"purpose":"miscapture_compensation"}`,
 ## 6. 一句话判断
 
 实现的主干——排他 rename、先记账后动手、不覆盖恢复、对账矩阵、预算取最小值、摘要绑定——是**按文档写的**，不是"看起来像"。差距集中在两类：**资源与时间这两条全局约束还没有落到执行器**（P0），以及**故障注入类的证据链几乎为空**（A02/A03/A04/A09/A10）。在这两项补齐之前，§16 的验收清单不能勾完。
+
+---
+
+# 第二轮复核（`dustkeeper-code-review-and-next-plan-20261026.md`）整改对照
+
+> 核对方式：先写能在旧版证明问题的失败测试，再修；结论只跟测试和实跑走。
+> 全量结果（2026-10-26，darwin/arm64, APFS）：
+>
+> ```
+> go build ./...                干净
+> go vet ./...                  干净
+> go test ./... -count=1        全部通过（含 test/release、test/eval）
+> ./build/build.sh              dev：darwin-arm64 产出 + SHA256SUMS
+> ./build/build.sh --release    缺三个交叉目标 → 退出 1
+> ```
+
+## 7.1 逐项状态
+
+图例：**关闭**＝有失败测试复现问题、修复后通过；**实现待补测**＝代码已改、全量测试通过，但还没有能独立复现原问题的用例；**未做**。
+
+| 编号 | 主题 | 状态 | 证据（代码 / 用例） |
+|---|---|---|---|
+| R01 | 私有管理目录可信边界 | 关闭 | `fsops/private.go`（`PrivateExpect`、`InstallPrivate`、`VerifyPrivate`、`ReadFileAt`）、`scope/vault.go`；`TestRegistrationNeverFollowsAPlacedTempSymlink`、`TestRegistrationRefusesAnAnchorHardLink`、`TestCorruptOwnerMarkerIsRefused`、`TestWidenedVaultPermissionsAreRefused`、`TestReplacedObjectsDirectoryIsRefused`、`TestVaultWithoutRecordedIdentityIsRefused`、`TestProbeReportsRequiredCapabilities` |
+| R02 | scope 锁与根身份 | 关闭 | `scope/locks.go`（in-tree `scope.lock` + 进程内引用计数）、`scope/identity.go`（`CompareRootIdentity` / `CompareMountBinding`）、`run/runner.go` 对 `IdentityWeak` 禁用自动清空；`TestHeldScopeLockBlocksTheNextTask`（真子进程）、`TestSameProcessReopensShareTheLock`、`TestEveryStrongFieldCanRefuseTheObject`、`TestStoredRootOwnerZeroIsCompared`、`TestNewBootIsNotAChange`、`TestRemountWithinOneBootIsAChange` |
+| R03 | 保护在所有入口一致执行 | 实现待补测 | `policy.Guard` 被 `scan`、`plan`、`execute/quarantine`、`run` 共同引用（`CheckExact/CheckSubtree/CheckFile`）；`TestGlobalProtectionWinsOverTheRule`、`TestProtectionUsesIdentityNotSpelling`、`TestPurgeFreezesWhenAliasCannotBeResolved`。**缺**：scan 后新增 subtree、scope 根是 Git 仓库、`.git` 为 worktree 文件这三类入口场景 |
+| R04 | 命令入口分叉与统一控制 | 实现待补测 | `domain.Control{StopScope,StopRun}` + `execute/apply.go` 的 `strongerControl`，两条 apply 路由读同一成员；`TestPauseStopsNewIntents`、`TestResumeNeedsTheExecutionLock`。**缺**：plan 后 pause、第一规则失败后第二规则无 intent 的断言 |
+| R05 | 清空时钟边界 | 实现待补测 | `internal/clocktrust`（`last_trusted_run_ns` 与当前壁钟分离、`Acknowledge` 重写受影响对象的 `purge_not_before`）、`cmd_plan.go` 与 runner 共用同一判定；`TestClockGoingBackwardsSuspendsPurge`。**缺**：跳钟后连续两轮仍不可信、确认后必须保留完整新窗口 |
+| R06 | ParkIntent 与终结事件冲突 | 实现待补测 | `domain.PhasePark` 明确定义为非终结观察，`store.NoteParked` 保留 pending 与原合同，终结只走合法状态转移；`TestCompleteQuarantineIsIdempotent`。**缺**：Q/R/P 各自「系统调用成功后注入同步失败 → 对账两轮」的矩阵 |
+| R07 | 错误捕获对象的可恢复性 | 实现待补测 | `captured_identity_json` / `captured_token_json` 与 hold 一致提交（`execute/quarantine.go`、`store/items.go`），`restore.go`/`purge.go` 读捕获证据，miscapture 复用 `PurposeMiscaptureFixup` 合同并停在 held；`TestReconcileCompletesACrashedQuarantine`。**缺**：原路径被新文件占用、补偿 intent 后崩溃 |
+| R08 | 崩溃对账的证据与持久化 | 关闭 | `plan/contract.go`（严格合同 + 必填字段）、`recovery/reconcile.go`（manifest 缺失/损坏/身份不一致一律拒绝，`ReadStable` 复核，`SyncAfterMove`/`SyncAfterUnlink`）；`TestReconcileRefusesAMissingManifest`、`TestReconcileRefusesACorruptManifest`、`TestReconcileRefusesDisagreeingEvidence`、`TestReconcileRefusesAContractWithoutEvidence`、`TestReconciledQuarantineStillReachesPurge` |
+| R09 | 精确重复与清空的证据链 | 关闭 | `dedup/dedup.go`：元数据摘要真实计算并写入计划、`VerifyKeeper` 核 nlink/权限/归属/mtime/元数据/逐字节、reference keeper 替换同样核验、一对一同范围/跨范围重复都能成组；`TestDuplicateIsHeldWhenTheKeeperPermissionsChange`（及 Metadata/Link/Bytes 三个变体）、`TestDuplicateIsPurgedWhenTheKeeperIsIntact`、`TestOneToOneCrossScopeDuplicateIsFound` |
+| R10 | 后台自动清空被零额度拦住 | 实现待补测 | `domain.ActionLedger` 分为 Q/P 两个独立账本，`runner.go` 用 `MaxAutoPurgeFiles/Bytes` 建 P 账本；`TestZeroBudgetForbidsTheAction`、`TestBudgetExhaustionLeavesTheRestAlone`。**缺**：双授权 → 到期 → 后台确实清空的端到端断言 |
+| R11 | 扫描中断被当成完成 | 实现待补测 | `scan.Report.Interrupted` 与 `Incomplete` 分开，`runner.go` 两者都影响后续判定。**缺**：`internal/scan` 至今没有包内测试 |
+| R12 | 自然语言能力与安全落地 | 关闭（5 项里 4 项） | 见 §7.2；`TestEveryDocumentedFieldIsRequired`、`TestRequiredFieldsRejectNull`、`TestEmptyCollectionsAreNotMissingFields`、`TestFieldsMustHaveTheDocumentedShape`、`TestModelDraftsGoThroughTheSameFieldContract`、`TestDraftVariantsAreJudgedByFieldPresence`、`TestDraftRequestCarriesTheAllowedScopes`、`TestDraftRequestBodyMatchesTheSnapshot`、`TestNormalCommandsNeverCallTheModel`、`test/eval` |
+| R13 | 脱离数据库的救援入口 | P1 关闭 / P2 未做 | `internal/rescue`（只读盘点，先于 `openStore`）、`cmd_object.go` 的 `recover inspect --root`；`TestManifestInventoryWorksWithoutTheDatabase`、`TestManifestInventoryNeedsNoStateDirectory`、`TestManifestInventoryListsUnexplainedEntries`、`TestManifestInventoryRefusesAnUnmanagedDirectory`。**未做**：run_id/op_id 结构化诊断、日志大小上限与轮转（全仓仍无 `log/slog`） |
+| R14 | 性能证据 | 未做 | 见 §7.3 |
+| R15 | 发布脚本与平台声明 | 关闭 | `build/build.sh` 区分 dev/release、声明四个必须产出的目标、签名与校验失败即退出、固定 musl 静态策略、`release-manifest.txt`；`TestReleaseFailsWhenACrossTargetHasNoCompiler`、`TestReleaseFailsWhenSigningFails`、`TestReleaseFailsWhenTheChecksumToolFails`、`TestReleaseFailsWhenATargetProducesNoArtifact`、`TestChecksumsCoverOnlyThisBuild`、`TestReleaseSucceedsWhenEverythingIsPresent`、`TestDevelopmentBuildMaySkipTargets`；`--label` 贯通与显式 00:00 由 `TestScheduleRenderHonoursMidnightAndLabel`、`TestScheduleRenderKeepsTheDocumentedDefault`、`TestLabelDrivesTheFileNames`、`TestExplicitMidnightIsHonoured` 覆盖 |
+
+## 7.2 R12 的五项整改
+
+1. **必填字段与 absent/null/空集区分**：`strictjson.Inspect` 在 token 层记录每个对象成员的路径与形状（`presence.go`），`rules.ruleFields` 声明 12 个必填字段及其允许形状；`max_size_bytes` 是唯一的可空字段，absent 与 null 都表示"无上界"。绑定到 struct 之后再校验的老路被放弃，因为它把三者压成同一个零值。
+2. **draft/needs_input/unsupported 按字段存在性判别**：`forbidFields` 让三种变体互斥到"字段出现即违规"，`questions: []`、`reason: ""`、`dsl: null` 都不再被当成没写。模型草稿的 `dsl` 以 `json.RawMessage` 交给 `rules.Parse`，与 `rule import` 走同一个校验器——测试 `TestModelDraftsGoThroughTheSameFieldContract` 用"删掉 except"这一条证明两条路径同源。
+3. **把允许的 scope 列表传给 provider**：`systemWithScopes` 把排序后的逻辑 scope ID 追加到系统提示；超过 64 个时拒绝请求而不是截断（截断等于让模型从看不见的集合里选）。
+4. **HTTP 请求体快照**：`internal/rules/testdata/draft_request.golden`，测试对请求体做规范化 JSON 比对，并单独断言"只有两段消息、用户消息等于原文、不含 `/srv/`、文件名、哈希"。
+5. **语料解析测试与真实模型评测分离**：`internal/rules/corpus_test.go` 只验证"这些答案能被 DSL 表达、解析器接受"；`test/eval` 才调用真实模型，并把 provider、model、prompt digest、输入、原始输出、宿主决定（含"被宿主拒绝"）逐条写成 JSONL。没有 `DUSTKEEPER_EVAL_BASE_URL` 时它 `t.Skip`，网络调用不是单测前提。
+
+另外发现并修掉一个文档没列、但让 R12 整体无法触达的缺陷：`config` 校验的 provider 名是 `chat_completions_json`，而适配器要求 `openai-compatible`，两个字符串不可能同时满足——**任何通过校验的配置都构造不出 provider**，`rule draft` 在真实二进制上直接 `INVALID_ARGUMENT: provider ... is not supported`。现在两处共用一个常量 `config.ProviderChatCompletionsJSON`，`TestTheDefaultConfigCanConstructAProvider` 用默认配置构造适配器。
+
+**R12 最低验收里还没做到的一条**：「两个年龄阈值」「不是所有」这类语义误解不得直接形成已激活规则。宿主能保证的是"缺字段即拒绝"，不能保证模型没有把双阈值悄悄写成单阈值；这一条只能靠 `test/eval` 的人工判定，报告里的 `reviewed` 字段就是留给它的，目前没有真实模型跑过的记录。
+
+## 7.3 仍未关闭
+
+- **R14 性能证据**：`test/bench` 只有 `TestScanMemoryIsBounded` 一条，尚未"先记完整 epoch 与有效记录数，再记 RSS/耗时"，10 万门槛仍是 256 MiB，`dedup` 的 bySize/byHash 仍是一次性分组。这一项没有任何新证据，按 §6.4-10 不能算关闭。
+- **R13 P2 运行可观测性**：结构化诊断（run_id/op_id）、最终汇总、日志上限与轮转都没做，全仓仍没有一行日志写入。
+- **R03/R04/R05/R06/R07/R10/R11 的专门失败测试**：代码已改、全量测试通过，但缺"能在旧版复现问题"的独立用例。按 §6.4-1 的标准，它们只能算"实现待补测"，不能算关闭。
+- **真实平台闭环**：只有 darwin/arm64 跑过"注册 → 计划 → 隔离 → 不覆盖恢复 → 到期清空 → 重启对账"。linux-amd64、linux-arm64、darwin-amd64 只做过交叉编译，没有在目标机器上执行过，文档与 README 已按"实验性"标注。

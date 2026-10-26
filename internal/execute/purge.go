@@ -22,14 +22,23 @@ type KeeperVerifier interface {
 	VerifyKeeper(ctx context.Context, it store.Item) error
 }
 
+// TrustFunc asserts that the wall clock may be used to prove that a retention
+// period elapsed. It returns nil only when it may.
+//
+// A boolean was the wrong shape for this: `purge apply` passed `true` and
+// thereby skipped the check that the background path performed. A function
+// cannot be hardcoded to "safe" without someone writing that intent into the
+// call site, where a reviewer can see it.
+type TrustFunc func(ctx context.Context) error
+
 // PurgeOptions describes one purge request.
 type PurgeOptions struct {
 	Automatic bool
 	Plan      *store.Plan
 	Budget    *domain.Budget
-	// ClockTrusted is false when the run detected a wall-clock anomaly. Purge
-	// then refuses: retention cannot be proven, so it is not served.
-	ClockTrusted bool
+	// Trust is mandatory. A nil Trust refuses the purge: "no assertion was made"
+	// is not the same as "the clock is fine".
+	Trust TrustFunc
 }
 
 // Purge permanently removes one quarantined object.
@@ -43,9 +52,15 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 	if it.State != domain.StateQuarantined {
 		return res, errs.Newf(errs.CodePlanStale, "item %s is %s, not quarantined", it.ID, it.State)
 	}
-	if !opt.ClockTrusted {
+	if opt.Trust == nil {
 		return res, errs.New(errs.CodeClockUntrusted,
-			"the wall clock is not trustworthy in this run; automatic purging is suspended")
+			"no clock assertion was supplied; a permanent deletion requires one on every entry point")
+	}
+	if err := opt.Trust(ctx); err != nil {
+		return res, err
+	}
+	if err := e.scopeGate(ctx, sc); err != nil {
+		return res, err
 	}
 	nowNS := e.Clock.Wall().UnixNano()
 	if it.PurgeNotBeforeNS == nil || nowNS < *it.PurgeNotBeforeNS {
@@ -113,31 +128,36 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		return res, errs.New(errs.CodeHeld, "the quarantined object changed after it was isolated")
 	}
 
-	ev, err := MetadataOf(obj)
-	if err != nil {
-		return res, err
-	}
-	if ev.Unsupported != "" {
-		return res, errs.Newf(errs.CodeUnsupportedMetadata,
-			"metadata cannot be re-verified: %s", ev.Unsupported)
-	}
-	if it.MetadataHash != nil {
-		if got := MetadataDigest(ev, obj.Token); string(got) != *it.MetadataHash {
-			return res, errs.New(errs.CodeHeld, "the quarantined object's metadata changed")
-		}
-	}
+	// Metadata is re-established inside ReadStable, together with the trailing
+	// identity check; doing it here as well would read the same evidence twice.
 
+	if opt.Budget != nil && !opt.Budget.CanReserve(obj.Token.Size) {
+		return res, errs.New(errs.CodeBudgetExhausted,
+			"the purge allowance for this run does not permit another action; nothing was read")
+	}
 	if opt.Budget != nil && opt.Budget.RemainingRead() < obj.Token.Size {
 		return res, errs.New(errs.CodeBudgetExhausted, "not enough read budget to re-verify this object")
 	}
+
+	// One stable-evidence read: identity and metadata before, hash, then identity
+	// and metadata again. A writer that changes an already-consumed block makes
+	// the streamed hash match the old content while the file no longer does; the
+	// trailing comparison is what notices, and the purge path used to lack it.
 	vopt := e.VerifyOpt(obj.Token.Size)
 	vopt.Budget = opt.Budget
-	hash, _, err := HashFile(obj, vopt)
+	ev, err := ReadStable(obj, vopt)
 	if err != nil {
+		if errors.Is(err, ErrUnstableObject) {
+			return res, errs.Newf(errs.CodeHeld,
+				"the quarantined object changed while it was being verified: %v", err)
+		}
 		return res, err
 	}
-	if string(hash) != *it.ContentHash {
+	if string(ev.Content) != *it.ContentHash {
 		return res, errs.New(errs.CodeHeld, "the quarantined object's content changed")
+	}
+	if it.MetadataHash != nil && string(ev.Metadata) != *it.MetadataHash {
+		return res, errs.New(errs.CodeHeld, "the quarantined object's metadata changed")
 	}
 
 	// Exact duplicates must still have a living keeper.
@@ -152,6 +172,13 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 
 	if opt.Budget != nil && !opt.Budget.CanReserve(obj.Token.Size) {
 		return res, errs.New(errs.CodeBudgetExhausted, "the action budget for this run is exhausted")
+	}
+
+	// Last look before the unlink. It narrows the window between verification and
+	// deletion; it cannot close it, and the design says so rather than implying
+	// an atomicity the syscall does not offer.
+	if err := ConfirmUnchanged(obj, ev); err != nil {
+		return res, err
 	}
 
 	opID := domain.OperationID(domain.NewID("op"))
@@ -330,6 +357,11 @@ func (e *Executor) purgeBlockedByProtection(ctx context.Context, sc *ScopeCtx, i
 				return true, "subtree protection held by " + p.Source, nil
 			}
 		}
+	}
+	// A project tree protects everything inside it, including for a slot that
+	// currently holds nothing.
+	if inside, why, perr := e.projectProtected(sc, it.RawRelative); perr == nil && inside {
+		return true, why, nil
 	}
 	if len(ps) == 0 {
 		return false, "", nil

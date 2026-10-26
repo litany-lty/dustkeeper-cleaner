@@ -47,6 +47,14 @@ type Runtime struct {
 	MinFreePercent         int   `json:"min_free_percent"`
 }
 
+// ProviderChatCompletionsJSON is the only model wire format phase one speaks:
+// one OpenAI-shaped POST per draft, no streaming, no tools.
+//
+// It lives here, not in the adapter, because the loader validates the name and
+// the adapter consumes it. Two literals drifted apart once already, which made
+// every configuration the loader approved unusable.
+const ProviderChatCompletionsJSON = "chat_completions_json"
+
 // Model configures the single rule-draft HTTP adapter.
 type Model struct {
 	Enabled               bool   `json:"enabled"`
@@ -85,7 +93,7 @@ func Default() Config {
 		},
 		Model: &Model{
 			Enabled:               false,
-			Provider:              "chat_completions_json",
+			Provider:              ProviderChatCompletionsJSON,
 			BaseURL:               "https://api.example.invalid/v1",
 			Model:                 "explicitly-configured-model",
 			APIKeyEnv:             "DUSTKEEPER_MODEL_API_KEY",
@@ -185,8 +193,8 @@ func (c Config) Validate() error {
 }
 
 func (m *Model) validate() error {
-	if m.Provider != "chat_completions_json" {
-		return errs.Newf(errs.CodeInvalidArgument, "model.provider must be chat_completions_json, got %q", m.Provider)
+	if m.Provider != ProviderChatCompletionsJSON {
+		return errs.Newf(errs.CodeInvalidArgument, "model.provider must be %s, got %q", ProviderChatCompletionsJSON, m.Provider)
 	}
 	if m.RequestTimeoutSeconds < 1 || m.RequestTimeoutSeconds > 120 {
 		return errs.Newf(errs.CodeInvalidArgument, "model.request_timeout_seconds must be in 1..120, got %d", m.RequestTimeoutSeconds)

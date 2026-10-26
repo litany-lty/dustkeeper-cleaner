@@ -206,9 +206,12 @@ func (r *Root) Identity() (domain.RootIdentity, error) {
 	if err != nil {
 		boot = "unavailable"
 	}
-	mountID, _ := mountIDFor(r.path)
+	mountID := mountIDOfFD(r.fd, r.path)
+	// The birth time comes from the descriptor rather than from the stat buffer
+	// so that Linux can supply it through statx, where the plain stat structure
+	// has no field for it.
 	var birth *int64
-	if b, ok := birthTimeNS(&st); ok {
+	if b, ok := birthTimeOfFD(r.fd); ok {
 		birth = &b
 	}
 	var gen *uint64
@@ -380,7 +383,12 @@ func (f *File) Stat() (domain.FileIdentity, domain.ChangeToken, error) {
 	if err := unix.Fstat(f.fd, &st); err != nil {
 		return domain.FileIdentity{}, domain.ChangeToken{}, fmt.Errorf("fsops: stat file: %w", err)
 	}
-	return identityOf(&st), tokenOf(&st, ""), nil
+	tok := tokenOf(&st, "")
+	// The native inode flags are not in the portable stat contract, so they are
+	// filled in here rather than by tokenOf. Leaving them out would make every
+	// metadata digest claim "no flags" on a platform that has them.
+	tok.Flags = tokenFlags(f.fd, &st)
+	return identityOf(&st), tok, nil
 }
 
 // Read reads from the descriptor.
@@ -429,11 +437,13 @@ func OpenRegularAt(p *Parent, rootDev uint64) (*File, error) {
 		unix.Close(fd)
 		return nil, fmt.Errorf("%w: %q is %s", ErrNotRegular, p.name, kindOf(&st))
 	}
+	tok := tokenOf(&st, "")
+	tok.Flags = tokenFlags(fd, &st)
 	return &File{
 		f:        os.NewFile(uintptr(fd), p.name),
 		fd:       fd,
 		Identity: identityOf(&st),
-		Token:    tokenOf(&st, ""),
+		Token:    tok,
 	}, nil
 }
 
@@ -571,6 +581,27 @@ type MetadataEvidence struct {
 // section 9.4 are enforced: one value at most 1 MiB, 4 MiB in total.
 func ReadMetadata(fd int) (MetadataEvidence, error) {
 	return readMetadata(fd)
+}
+
+// readMetadata is the single definition of "extended metadata" for this build:
+// the extended attributes plus the native inode flags.
+//
+// R09 C records that the two were collected separately and inconsistently - the
+// flags field was never assigned at all, so every platform reported "no flags".
+// A field that is always zero is not evidence of absence, it is absence of
+// evidence, and the caller cannot tell the difference.
+func readMetadata(fd int) (MetadataEvidence, error) {
+	ev, err := readXattrEvidence(fd)
+	if err != nil || ev.Unsupported != "" {
+		return ev, err
+	}
+	flags, unsupported := fileFlags(fd)
+	if unsupported != "" {
+		ev.Unsupported = unsupported
+		return ev, nil
+	}
+	ev.Flags = flags
+	return ev, nil
 }
 
 // DurableFile flushes file data. Renaming an entry does not make its data

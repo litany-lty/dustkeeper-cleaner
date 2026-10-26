@@ -20,14 +20,14 @@ import (
 	"dustkeeper/internal/store"
 )
 
-// Vault locations inside a mutable scope.
+// Vault locations inside a mutable scope. The names come from internal/domain
+// so that registration and execution cannot disagree about them.
 const (
-	vaultPrefix     = ".dustkeeper"
-	objectsDir      = vaultPrefix + "/objects"
-	manifestsDir    = vaultPrefix + "/manifests"
-	tmpDir          = vaultPrefix + "/tmp"
-	anchorFile      = vaultPrefix + "/durability.anchor"
-	ownerMarkerFile = vaultPrefix + "/owner.json"
+	objectsDir      = domain.VaultObjects
+	manifestsDir    = domain.VaultManifests
+	tmpDir          = domain.VaultTmp
+	anchorFile      = domain.VaultAnchor
+	ownerMarkerFile = domain.VaultMarker
 )
 
 // ScopeCtx is one verified scope with its private directories open.
@@ -37,33 +37,27 @@ type ScopeCtx struct {
 	Objects   *fsops.Dir
 	Manifests *fsops.Dir
 	Tmp       *fsops.Dir
-	anchor    *fsops.File
+	vault     *scope.VaultHandles
 	RootDev   uint64
+	// IdentityWeak is non-empty when the root could not be told apart from a
+	// different object that reuses the same inode and device. The scope stays
+	// usable for observing and planning; automatic permanent deletion is refused.
+	IdentityWeak string
 }
 
 // OpenScopeCtx verifies the root and opens the private directories.
+//
+// R01 is about what happens here. Previously the vault was opened "by name" and
+// nothing checked that the directory being used was the one that had been
+// registered: a restored backup, a swapped objects inode or a widened permission
+// all passed. Now the whole directory is validated once, by the same code that
+// registration runs, and the vault identity is compared against the scope row.
 func OpenScopeCtx(ctx context.Context, reg *scope.Registrar, id domain.ScopeID) (*ScopeCtx, error) {
 	vs, err := reg.OpenVerified(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	c := &ScopeCtx{Scope: vs.Scope, Root: vs.Root, RootDev: vs.RootID.Runtime.Device}
-
-	closeAll := func() {
-		if c.Objects != nil {
-			c.Objects.Close()
-		}
-		if c.Manifests != nil {
-			c.Manifests.Close()
-		}
-		if c.Tmp != nil {
-			c.Tmp.Close()
-		}
-		if c.anchor != nil {
-			c.anchor.Close()
-		}
-		c.Root.Close()
-	}
+	c := &ScopeCtx{Scope: vs.Scope, Root: vs.Root, RootDev: vs.RootID.Runtime.Device, IdentityWeak: vs.Weak}
 
 	if !domain.MutableKind(c.Scope.Kind) {
 		// observe and reference scopes have no vault and never will; opening one
@@ -71,38 +65,49 @@ func OpenScopeCtx(ctx context.Context, reg *scope.Registrar, id domain.ScopeID) 
 		return c, nil
 	}
 
-	if c.Objects, err = c.Root.OpenDir([]byte(objectsDir)); err != nil {
-		closeAll()
-		return nil, errs.Newf(errs.CodeScopeChanged, "vault is missing: %v", err)
+	want := ""
+	if c.Scope.VaultIdentityJSON != nil {
+		want = *c.Scope.VaultIdentityJSON
 	}
-	if c.Manifests, err = c.Root.OpenDir([]byte(manifestsDir)); err != nil {
-		closeAll()
-		return nil, errs.Newf(errs.CodeScopeChanged, "manifest directory is missing: %v", err)
+	if want == "" {
+		c.Root.Close()
+		return nil, errs.Newf(errs.CodeScopeChanged,
+			"scope %s has no recorded object directory identity; re-register it before any file change", id)
 	}
-	if c.Tmp, err = c.Root.OpenDir([]byte(tmpDir)); err != nil {
-		closeAll()
-		return nil, errs.Newf(errs.CodeScopeChanged, "temporary directory is missing: %v", err)
-	}
-	anchor, err := c.Root.OpenFileRW([]byte(anchorFile))
+
+	handles, err := scope.OpenVault(c.Root, scope.VaultExpect{
+		OwnerUID:   scope.CurrentOwnerUID(),
+		RootDev:    c.RootDev,
+		InstanceID: reg.InstanceID,
+		Identity:   want,
+		Lock:       true,
+	})
 	if err != nil {
-		closeAll()
-		return nil, errs.Newf(errs.CodeScopeChanged, "durability anchor is missing: %v", err)
+		c.Root.Close()
+		return nil, err
 	}
-	// The scope keeps the fsops handle itself. Wrapping the descriptor in a
-	// second *os.File would mean two owners of one descriptor: when the
-	// original became unreachable its finalizer closed the number, and the
-	// next barrier failed with EBADF.
-	c.anchor = anchor
+	c.vault = handles
+	c.Objects = handles.Objects
+	c.Manifests = handles.Manifests
+	c.Tmp = handles.Tmp
 	return c, nil
 }
 
 // AnchorFD returns the durability anchor descriptor, or -1 when the scope has
 // no vault.
 func (c *ScopeCtx) AnchorFD() int {
-	if c == nil || c.anchor == nil {
+	if c == nil || c.vault == nil || c.vault.Anchor == nil {
 		return -1
 	}
-	return c.anchor.FD()
+	return c.vault.Anchor.FD()
+}
+
+// VaultIdentity returns the digest of the object directory in use, for reports.
+func (c *ScopeCtx) VaultIdentity() string {
+	if c == nil || c.vault == nil {
+		return ""
+	}
+	return c.vault.Identity
 }
 
 // Close releases every handle.
@@ -110,17 +115,10 @@ func (c *ScopeCtx) Close() {
 	if c == nil {
 		return
 	}
-	if c.Objects != nil {
-		c.Objects.Close()
-	}
-	if c.Manifests != nil {
-		c.Manifests.Close()
-	}
-	if c.Tmp != nil {
-		c.Tmp.Close()
-	}
-	if c.anchor != nil {
-		c.anchor.Close()
+	if c.vault != nil {
+		c.vault.Close()
+		c.vault = nil
+		c.Objects, c.Manifests, c.Tmp = nil, nil, nil
 	}
 	if c.Root != nil {
 		c.Root.Close()
@@ -185,7 +183,7 @@ func (c *ScopeCtx) WriteManifest(m ManifestV1) error {
 
 // manifestPath is used by reporting; it never drives an action.
 func manifestPath(root string, objectID string) string {
-	return filepath.Join(root, vaultPrefix, "manifests", objectID+".json")
+	return filepath.Join(root, domain.VaultManifests, objectID+".json")
 }
 
 // PlanBindingOf decodes the stored item binding.

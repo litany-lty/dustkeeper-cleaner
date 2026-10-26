@@ -28,7 +28,7 @@ const (
 // readMetadata digests every extended attribute name and value, and reports
 // ACL / resource-fork presence. Any condition that prevents a complete reading
 // sets Unsupported, which makes the caller keep the file.
-func readMetadata(fd int) (MetadataEvidence, error) {
+func readXattrEvidence(fd int) (MetadataEvidence, error) {
 	var ev MetadataEvidence
 
 	sz, err := unix.Flistxattr(fd, nil)

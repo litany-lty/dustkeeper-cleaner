@@ -93,7 +93,7 @@ note ""
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-run "$BIN" schedule render --platform "$PLATFORM" --output "$TMP" --hour "$HOUR" --minute "$MINUTE"
+run "$BIN" schedule render --platform "$PLATFORM" --output "$TMP" --hour "$HOUR" --minute "$MINUTE" --label "$LABEL"
 
 case "$PLATFORM" in
 linux)

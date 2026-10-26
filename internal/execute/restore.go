@@ -175,17 +175,26 @@ func (e *Executor) Restore(ctx context.Context, sc *ScopeCtx, itemID domain.Item
 		return res, errs.Newf(errs.CodeIOError, "restore did not move the object: %v", err)
 	}
 
+	// Re-open what actually landed. A failure here used to be ignored, which
+	// meant a restore could be recorded as complete without ever proving that
+	// the object at the destination is the object that moved.
 	back, err := fsops.OpenRegularAt(destParent, sc.RootDev)
-	if err == nil {
-		if !back.Identity.Equal(capturedID) {
-			_ = e.Store.HoldIntent(ctx, intent, "RESTORE_IDENTITY_MISMATCH",
-				`{"source":"observed","result":"restored object identity differs from the record"}`)
-			back.Close()
-			return res, errs.New(errs.CodeHeld,
-				"the restored object is not the recorded object; the scope is held")
-		}
-		_ = back.Sync()
-		back.Close()
+	if err != nil {
+		return res, e.park(ctx, intent, "RESTORE_VERIFY_FAILED", err)
+	}
+	if !back.Identity.Equal(capturedID) {
+		_ = back.Close()
+		_ = e.Store.HoldIntent(ctx, intent, "RESTORE_IDENTITY_MISMATCH",
+			`{"source":"observed","result":"restored object identity differs from the record"}`)
+		return res, errs.New(errs.CodeHeld,
+			"the restored object is not the recorded object; the scope is held")
+	}
+	if err := back.Sync(); err != nil {
+		_ = back.Close()
+		return res, e.park(ctx, intent, "DURABILITY_FAILED", err)
+	}
+	if err := back.Close(); err != nil {
+		return res, e.park(ctx, intent, "DURABILITY_FAILED", err)
 	}
 	if err := fsops.DurableDir(destParent); err != nil {
 		return res, e.park(ctx, intent, "DURABILITY_FAILED", err)

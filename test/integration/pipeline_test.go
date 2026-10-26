@@ -244,7 +244,7 @@ func TestAutoPurgeIsNotRetroactive(t *testing.T) {
 	out2, err := e.exec.Purge(context.Background(), sctx, it, execute.PurgeOptions{
 		Automatic:    true,
 		Budget:       domain.NewBudget(300, 1<<30, 10, 1<<30, 0),
-		ClockTrusted: true,
+		Trust:        trustOK,
 	})
 	if err == nil {
 		t.Fatalf("purge accepted an object with no bound grant: %+v", out2)
@@ -277,7 +277,7 @@ func TestManualPurgeRemovesOnlyListedObjects(t *testing.T) {
 	}
 	if _, err := e.exec.Purge(context.Background(), sctx, res.Items[0], execute.PurgeOptions{
 		Budget:       domain.NewBudget(300, 1<<30, 10, 1<<30, 0),
-		ClockTrusted: true,
+		Trust:        trustOK,
 	}); err == nil {
 		t.Fatal("purge ran before the retention window closed")
 	} else if errs.CodeOf(err) == errs.CodeOK {
@@ -299,7 +299,7 @@ func TestManualPurgeRemovesOnlyListedObjects(t *testing.T) {
 		t.Fatalf("purge plan: %v", err)
 	}
 	out, err := e.exec.ApplyPurgePlan(context.Background(), sctx, p.ID, p.Digest,
-		domain.NewBudget(300, 1<<30, 10, 1<<30, 0), true)
+		domain.NewBudget(300, 1<<30, 10, 1<<30, 0), trustOK)
 	if err != nil {
 		t.Fatalf("apply purge: %v", err)
 	}
@@ -442,13 +442,16 @@ func TestReconcileCompletesACrashedQuarantine(t *testing.T) {
 	srcPath := filepath.Join(e.base, "trees", "exports", "a.zip")
 	preID := decodeIdentity(t, it.PreIdentityJSON)
 	parentID := decodeIdentity(t, it.SourceParentIdentityJSON)
-	contentHash := hashFile(t, srcPath)
+	// The real executor records the content and metadata digests before the move,
+	// in both the manifest and the intent contract. The fixture uses the same two
+	// values so that reconciliation is asked the question it really faces.
+	contentHash, metaHash := e.stableEvidence(t, sctx, it.RawRelative)
 
 	if err := sctx.WriteManifest(execute.ManifestV1{
 		FormatVersion: 1, InstanceID: "inst_test", ScopeID: string(sc.ID),
 		ObjectID: it.ObjectName, RawRelativeB64: plan.B64(it.RawRelative),
 		ParentIdentity: parentID, ExpectedIdentity: preID,
-		ContentHash: string(contentHash), MetadataHash: "sha256:meta",
+		ContentHash: string(contentHash), MetadataHash: metaHash,
 		PlanDigest: string(res.Plan.Digest), CreatedAtNS: e.clock.Wall().UnixNano(),
 	}); err != nil {
 		t.Fatalf("write manifest: %v", err)
@@ -463,6 +466,7 @@ func TestReconcileCompletesACrashedQuarantine(t *testing.T) {
 		t.Fatalf("binding: %v", err)
 	}
 	planIDStr := string(res.Plan.ID)
+	contentHashStr := string(contentHash)
 	contract, err := json.Marshal(plan.OperationContractV1{
 		BindingVersion:  plan.BindingVersion,
 		ItemID:          string(it.ID),
@@ -476,6 +480,8 @@ func TestReconcileCompletesACrashedQuarantine(t *testing.T) {
 		ParentIdentity:  parentID,
 		ExpectedIdent:   preID,
 		ExpectedToken:   preTok,
+		ContentHash:     &contentHashStr,
+		MetadataHash:    &metaHash,
 		Binding:         binding,
 		MaxFiles:        1,
 		MaxLogicalBytes: 1 << 20,

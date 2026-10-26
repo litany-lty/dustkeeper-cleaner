@@ -14,9 +14,13 @@ import (
 //
 // What this test can and cannot prove: it proves the corpus is expressible in
 // the DSL, that the three-variant discriminator accepts exactly one variant per
-// entry, and that canonicalisation is stable. It does not run a model. A live
-// model run is a release check, not a unit test; keeping a network dependency
-// out of the test suite is deliberate.
+// entry, and that canonicalisation is stable. It does not run a model, so it is
+// not evidence that "没用过" or "保留发票" was understood.
+//
+// The semantic half lives in test/eval, which sends the same corpus to a real
+// model and records the provider, the model, the prompt digest, the raw answer
+// and the host's decision. It skips unless DUSTKEEPER_EVAL_BASE_URL is set, so a
+// network call is never a precondition for `go test ./...`.
 
 type corpusFixture struct {
 	ID     string          `json:"id"`

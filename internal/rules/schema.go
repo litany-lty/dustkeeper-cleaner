@@ -71,6 +71,16 @@ func Parse(data []byte, allowedScopes map[string]bool) (*Rule, error) {
 	}); err != nil {
 		return nil, mapStrict(err)
 	}
+	// The field contract is checked against the document, not against the bound
+	// struct: binding erases the difference between a missing field, a null field
+	// and an empty list, and those three mean different things here.
+	presence, err := strictjson.Inspect(data)
+	if err != nil {
+		return nil, mapStrict(err)
+	}
+	if err := checkRuleFields(presence); err != nil {
+		return nil, err
+	}
 	// Normalise nil slices so canonical output always uses [] rather than null.
 	if r.Match.RelativeDirPrefixes == nil {
 		r.Match.RelativeDirPrefixes = []string{}
@@ -91,12 +101,66 @@ func Parse(data []byte, allowedScopes map[string]bool) (*Rule, error) {
 	return &r, nil
 }
 
+// ruleFields is the documented field contract. Every field the DSL lists is
+// required: a missing `except` is not "no exclusions were needed", it is "the
+// output lost the exclusion the reviewer was looking at".
+//
+// max_size_bytes is the single documented exception. It is nullable, and absent
+// and null both mean "no upper bound", because the DSL has no third spelling for
+// unlimited.
+var ruleFields = []strictjson.Field{
+	{Path: "dsl_version", Only: []strictjson.Shape{strictjson.ShapeScalar}},
+	{Path: "scope_id", Only: []strictjson.Shape{strictjson.ShapeScalar}},
+	{Path: "action", Only: []strictjson.Shape{strictjson.ShapeScalar}},
+	{Path: "match", Only: []strictjson.Shape{strictjson.ShapeObject}},
+	{Path: "match.min_mtime_age_seconds", Only: []strictjson.Shape{strictjson.ShapeScalar}},
+	{Path: "match.min_size_bytes", Only: []strictjson.Shape{strictjson.ShapeScalar}},
+	{Path: "match.relative_dir_prefixes", Only: []strictjson.Shape{strictjson.ShapeArray}},
+	{Path: "match.basename_patterns", Only: []strictjson.Shape{strictjson.ShapeArray}},
+	{Path: "except", Only: []strictjson.Shape{strictjson.ShapeObject}},
+	{Path: "except.relative_dir_prefixes", Only: []strictjson.Shape{strictjson.ShapeArray}},
+	{Path: "except.basename_patterns", Only: []strictjson.Shape{strictjson.ShapeArray}},
+	{Path: "retention_seconds", Only: []strictjson.Shape{strictjson.ShapeScalar}},
+}
+
+// optionalFields lists the fields that may be absent, with the shapes they may
+// take when they are present.
+var optionalFields = map[string][]strictjson.Shape{
+	"match.max_size_bytes": {strictjson.ShapeScalar, strictjson.ShapeNull},
+}
+
+// checkRuleFields enforces the table above.
+func checkRuleFields(presence map[string]strictjson.Shape) error {
+	if err := strictjson.Require(presence, ruleFields); err != nil {
+		return mapStrict(err)
+	}
+	for path, allowed := range optionalFields {
+		got, ok := presence[path]
+		if !ok {
+			continue
+		}
+		okShape := false
+		for _, want := range allowed {
+			if got == want {
+				okShape = true
+				break
+			}
+		}
+		if !okShape {
+			return errs.Newf(errs.CodeDSLInvalid, "field %q has the wrong shape %q", path, got)
+		}
+	}
+	return nil
+}
+
 func mapStrict(err error) error {
 	se, ok := err.(*strictjson.Error)
 	if !ok {
 		return errs.Newf(errs.CodeDSLInvalid, "%v", err)
 	}
 	switch se.Kind {
+	case strictjson.KindMissing, strictjson.KindShape:
+		return errs.Newf(errs.CodeDSLInvalid, "%s", se.Detail)
 	case strictjson.KindUnknown:
 		return errs.Newf(errs.CodeUnknownField, "%s", se.Detail)
 	case strictjson.KindDuplicate:

@@ -174,6 +174,37 @@ func bootOrRunID() (string, error) {
 // mountIDFor is unavailable on macOS; nil means "not available", not zero.
 func mountIDFor(string) (*uint64, error) { return nil, nil }
 
+// birthTimeOfFD re-reads the creation time of an open descriptor. macOS reports
+// it in the ordinary stat structure, so no extra syscall is needed.
+func birthTimeOfFD(fd int) (int64, bool) {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return 0, false
+	}
+	if st.Btim.Sec == 0 {
+		return 0, false
+	}
+	return st.Btim.Sec*int64(1e9) + int64(st.Btim.Nsec), true
+}
+
+// mountIDOfFD has no macOS equivalent. Returning nil is honest: the runtime half
+// of the identity keeps only the boot session UUID, and the comparison must not
+// read "no mount id" as "same mount".
+func mountIDOfFD(int, string) *uint64 { return nil }
+
+// fileFlags reads the BSD file flags (uchg, hidden, compressed, ...). macOS carries
+// them in the ordinary stat structure, so no extra syscall is needed.
+func fileFlags(fd int) (uint64, string) {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return 0, "flags_unreadable"
+	}
+	return uint64(st.Flags), ""
+}
+
+// tokenFlags is the flags half of a change token for an open regular file.
+func tokenFlags(fd int, st *unix.Stat_t) uint64 { return uint64(st.Flags) }
+
 // syscallName keeps error text readable in reports without leaking numbers.
 func syscallName(err error) string {
 	if err == nil {

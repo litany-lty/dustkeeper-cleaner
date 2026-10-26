@@ -207,8 +207,19 @@ func Wrap(code Code, err error) error {
 	return &Error{Code: code, Message: err.Error(), Retryable: retryable[code], Cause: err}
 }
 
-func (e *Error) Error() string {
-	if e == nil {
+// Wrapf attaches a code and a cause to a formatted message. The cause is kept
+// so callers can still use errors.Is/As on the result; Newf deliberately does
+// not accept a cause, and must never be given a %w directive.
+func Wrapf(code Code, cause error, format string, args ...any) error {
+	return &Error{
+		Code:      code,
+		Message:   fmt.Sprintf(format, args...),
+		Retryable: retryable[code],
+		Cause:     cause,
+	}
+}
+
+func (e *Error) Error() string {	if e == nil {
 		return ""
 	}
 	if e.Message == "" {

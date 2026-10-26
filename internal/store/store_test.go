@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
+	"dustkeeper/migrations"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -78,15 +80,15 @@ func TestSchemaAndPragmas(t *testing.T) {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
-		t.Fatalf("user_version = %d, want 1", version)
+	if version != migrations.CurrentVersion {
+		t.Fatalf("user_version = %d, want %d", version, migrations.CurrentVersion)
 	}
 	meta, err := s.MetaGet(context.Background(), "schema_version")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta != "1" {
-		t.Fatalf("meta schema_version = %q", meta)
+	if want := strconv.Itoa(migrations.CurrentVersion); meta != want {
+		t.Fatalf("meta schema_version = %q, want %q", meta, want)
 	}
 }
 

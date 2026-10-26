@@ -151,3 +151,53 @@ func TestDefaultTimeWhenUnset(t *testing.T) {
 		t.Error("the documented 03:30 default was not applied")
 	}
 }
+
+// R15: an explicit midnight is a schedule. Treating 00:00 as "unset" silently
+// moved the run to 03:30, which an operator who asked for midnight would never
+// discover.
+func TestExplicitMidnightIsHonoured(t *testing.T) {
+	opt := linuxOptions()
+	opt.Hour, opt.Minute = 0, 0
+	opt.TimeSet = true
+	files, err := Render(opt)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(string(files[1].Content), "00:00:00") {
+		t.Fatalf("an explicit 00:00 was not rendered:\n%s", files[1].Content)
+	}
+	if strings.Contains(string(files[1].Content), "03:30:00") {
+		t.Fatal("an explicit 00:00 was silently replaced by the default")
+	}
+}
+
+// R15: install.sh accepts --label, so the renderer has to be able to produce a
+// unit named after it. A hardcoded label meant a non-default install could never
+// find its own files.
+func TestLabelDrivesTheFileNames(t *testing.T) {
+	for _, platform := range []Platform{Linux, Darwin} {
+		opt := linuxOptions()
+		opt.Platform = platform
+		opt.Label = "dustkeeper-nightly"
+		files, err := Render(opt)
+		if err != nil {
+			t.Fatalf("%s render: %v", platform, err)
+		}
+		var sawLabel bool
+		for _, f := range files {
+			if strings.HasPrefix(f.Name, "dustkeeper-nightly") {
+				sawLabel = true
+			}
+			if strings.Contains(string(f.Content), "dustkeeper.service") {
+				t.Fatalf("%s template still names the default unit:\n%s", platform, f.Content)
+			}
+		}
+		if !sawLabel {
+			var names []string
+			for _, f := range files {
+				names = append(names, f.Name)
+			}
+			t.Fatalf("%s templates are not named after the label: %v", platform, names)
+		}
+	}
+}

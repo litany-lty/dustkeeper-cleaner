@@ -269,13 +269,19 @@ type QuarantineResult struct {
 }
 
 // CompleteQuarantine records a verified quarantine.
+//
+// The state gate accepts both q_intent and unknown. "unknown" here means the
+// operation was parked after the move but before it could be proven, which is
+// precisely the case reconciliation exists to finish. The pending marker must
+// still match, so an item that was terminal-held (pending cleared) is not
+// silently completed.
 func (s *Store) CompleteQuarantine(ctx context.Context, in Intent, res QuarantineResult, resultJSON string) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		r, err := tx.ExecContext(ctx, `
 UPDATE items SET state='quarantined', pending_op_id=NULL,
   captured_identity_json=?, captured_token_json=?, quarantined_at_ns=?,
   purge_not_before_ns=?, content_hash=?, metadata_hash=?
-WHERE item_id=? AND pending_op_id=? AND state='q_intent'`,
+WHERE item_id=? AND pending_op_id=? AND state IN ('q_intent','unknown')`,
 			res.CapturedIdentityJSON, res.CapturedTokenJSON, res.QuarantinedAtNS,
 			res.PurgeNotBeforeNS, res.ContentHash, res.MetadataHash,
 			string(in.ItemID), string(in.OpID))
@@ -312,9 +318,11 @@ func (s *Store) CompletePurge(ctx context.Context, in Intent, resultJSON string)
 
 func (s *Store) finishSimple(ctx context.Context, in Intent, fromState, toState, resultJSON string) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
+		// "unknown" is accepted for the same reason as in CompleteQuarantine: a
+		// parked operation is unfinished, not held.
 		r, err := tx.ExecContext(ctx, `
 UPDATE items SET state=?, pending_op_id=NULL, hold_code=NULL
-WHERE item_id=? AND pending_op_id=? AND state=?`,
+WHERE item_id=? AND pending_op_id=? AND state IN (?, 'unknown')`,
 			toState, string(in.ItemID), string(in.OpID), fromState)
 		if err != nil {
 			return errs.Wrap(errs.CodeStateWriteFailed, err)
@@ -362,6 +370,11 @@ func completeTx(ctx context.Context, tx *sql.Tx, in Intent, resultJSON string) e
 // changed: the item moves to "unknown", reconciliation still examines it, and
 // nothing is claimed to have succeeded. Clearing the pending marker here would
 // orphan a file that really did move.
+//
+// The event phase is `park`, not `hold`. A hold is a verdict and is unique per
+// operation; writing one here used to make the later completion impossible,
+// because one_terminal_per_op then rejected the completion event for the same
+// operation. A park says "still unknown, keep looking".
 func (s *Store) ParkIntent(ctx context.Context, in Intent, code, resultJSON string) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		r, err := tx.ExecContext(ctx, `
@@ -385,10 +398,87 @@ WHERE item_id=? AND pending_op_id=?`, code, string(in.ItemID), string(in.OpID))
 			ItemID:          &itemID,
 			ExecutionPlanID: in.PlanID,
 			Action:          in.Action,
-			Phase:           domain.PhaseHold,
+			Phase:           domain.PhasePark,
 			OccurredAtNS:    in.OccurredAtNS,
 			ContractJSON:    in.ContractJSON,
 			ResultJSON:      &result,
+		})
+	})
+}
+
+// NoteParked records another failed reconciliation attempt without closing the
+// operation. Pending is kept on purpose: the object may still be finished once
+// the cause (an I/O error, a full disk, a temporary permission problem) clears.
+//
+// `attempts` is informational. There is no automatic give-up: a parked object
+// that keeps failing stays visible and keeps its evidence, which is what an
+// operator needs to decide what to do. Bounded retry exists so that the state
+// can be read as "not progressing", not to silently drop the item.
+func (s *Store) NoteParked(ctx context.Context, id domain.ItemID, code, detail string, attempts int) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE items SET hold_code=? WHERE item_id=? AND pending_op_id IS NOT NULL",
+			code, string(id)); err != nil {
+			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		}
+		itemID := id
+		result := `{"source":"reconciled","result":"still parked","hold_code":` +
+			quoteJSONString(code) + `,"attempts":` + itoa64(int64(attempts)) + `}`
+		if detail != "" {
+			result = `{"source":"reconciled","result":"still parked","hold_code":` +
+				quoteJSONString(code) + `,"attempts":` + itoa64(int64(attempts)) +
+				`,"detail":` + quoteJSONString(detail) + `}`
+		}
+		return appendEventTx(ctx, tx, Event{
+			EventID:      domain.NewID("ev"),
+			ItemID:       &itemID,
+			Action:       "reconcile",
+			Phase:        domain.PhaseInfo,
+			OccurredAtNS: s.now(),
+			ContractJSON: `{"source":"reconciled"}`,
+			ResultJSON:   &result,
+		})
+	})
+}
+
+// HoldIntentWithCapture is HoldIntent for the case where the object that
+// actually moved is known but is not the planned object.
+//
+// The captured identity and token are written in the same transaction as the
+// terminal hold, because a hold without that evidence is a file in the vault
+// that the product can neither purge nor restore. Section 11.3 requires the
+// expected and the actual evidence to be stored separately, and this column pair
+// is where "actual" lives.
+func (s *Store) HoldIntentWithCapture(ctx context.Context, in Intent, code, resultJSON string,
+	capturedIdentityJSON, capturedTokenJSON string) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		r, err := tx.ExecContext(ctx, `
+UPDATE items SET state='held', hold_code=?, pending_op_id=NULL,
+  captured_identity_json=?, captured_token_json=?
+WHERE item_id=? AND pending_op_id=?`,
+			code, capturedIdentityJSON, capturedTokenJSON, string(in.ItemID), string(in.OpID))
+		if err != nil {
+			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		}
+		if n, _ := r.RowsAffected(); n == 0 {
+			return errs.Newf(errs.CodePlanStale, "item %s is not awaiting a hold", in.ItemID)
+		}
+		itemID := in.ItemID
+		opID := in.OpID
+		var result *string
+		if resultJSON != "" {
+			result = &resultJSON
+		}
+		return appendEventTx(ctx, tx, Event{
+			EventID:         domain.NewID("ev"),
+			OpID:            &opID,
+			ItemID:          &itemID,
+			ExecutionPlanID: in.PlanID,
+			Action:          in.Action,
+			Phase:           domain.PhaseHold,
+			OccurredAtNS:    in.OccurredAtNS,
+			ContractJSON:    in.ContractJSON,
+			ResultJSON:      result,
 		})
 	})
 }

@@ -3,7 +3,17 @@
 //
 // Lock order is fixed and must never be inverted:
 //
-//	instance execution lock -> scope lock (if any) -> control lock
+//	registration lock -> instance lock -> scope lock (in-tree) -> control lock
+//
+// The registration lock is the only one that spans a user-level directory, so it
+// is taken first and released before any business action. The scope lock lives
+// inside the tree (see OpenVault), which is what makes two state directories
+// mutually exclusive over one scope instead of only over one database. Scopes are
+// visited in ascending scope ID order and a keeper scope is opened after its
+// source, so a cross-scope pass always takes its pair in the same direction. The
+// scope lock is also acquired non-blocking, so a cycle surfaces as INSTANCE_BUSY
+// for the loser rather than as a deadlock: the order keeps failures predictable,
+// it is not what makes them finite.
 //
 // The control lock never spans a content read, a rename, an unlink or a
 // post-move sync; it only guards "am I paused" and "commit the intent".
@@ -14,11 +24,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 
+	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
+	"dustkeeper/internal/fsops"
 )
 
 // Lock is a held advisory file lock.
@@ -94,9 +107,80 @@ func RegistrationLock(home string) (*Lock, error) {
 	return LockFor(filepath.Join(home, ".dustkeeper-registry.lock"), 30*time.Second)
 }
 
-// ScopeLock takes the in-tree mutex that spans state directories.
-func ScopeLock(rootPath string) (*Lock, error) {
-	return TryLock(filepath.Join(rootPath, ".dustkeeper", "scope.lock"))
+// ScopeLock lives on the vault descriptor, not on a path.
+//
+// The in-tree mutex is taken by OpenVault through the already-opened management
+// directory, because opening it by path would first have to create
+// ".dustkeeper" - which an observe or reference scope must never grow. There is
+// deliberately no path-based constructor here: R02 found the previous one
+// defined and never called, which is worse than not having it.
+
+// heldScopeLock is one scope lock owned by this process.
+type heldScopeLock struct {
+	file *fsops.File
+	refs int
+}
+
+var (
+	scopeLocksMu sync.Mutex
+	scopeLocks   = map[string]*heldScopeLock{}
+)
+
+// acquireScopeLock takes the in-tree scope lock for the directory d.
+//
+// flock is attached to the open file description, so a second open of the same
+// lock file from this process would be refused by a lock this process already
+// holds. That is not what "another task" means, and reconcile opens one scope
+// several times in a single command. The registry therefore makes the lock
+// re-entrant inside one process while keeping it exclusive across processes,
+// which is the property that actually matters: two installations must not act on
+// one tree.
+//
+// The key is the identity of the management directory, so two scopes that happen
+// to share a path string still get separate locks.
+func acquireScopeLock(d *fsops.Dir) (release func(), err error) {
+	id, _, err := d.Stat()
+	if err != nil {
+		return nil, errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	key := fmt.Sprintf("%d:%d", id.Device, id.Inode)
+
+	scopeLocksMu.Lock()
+	defer scopeLocksMu.Unlock()
+
+	if held, ok := scopeLocks[key]; ok {
+		held.refs++
+		return func() { releaseScopeLock(key) }, nil
+	}
+
+	file, err := d.LockFile(domain.VaultScopeLock)
+	if err != nil {
+		if errors.Is(err, fsops.ErrExists) {
+			return nil, errs.Newf(errs.CodeInstanceBusy,
+				"another Dustkeeper task is acting on this scope right now")
+		}
+		return nil, errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	scopeLocks[key] = &heldScopeLock{file: file, refs: 1}
+	return func() { releaseScopeLock(key) }, nil
+}
+
+// releaseScopeLock drops one reference and closes the descriptor when the last
+// holder in this process is done.
+func releaseScopeLock(key string) {
+	scopeLocksMu.Lock()
+	defer scopeLocksMu.Unlock()
+
+	held, ok := scopeLocks[key]
+	if !ok {
+		return
+	}
+	held.refs--
+	if held.refs > 0 {
+		return
+	}
+	held.file.Close()
+	delete(scopeLocks, key)
 }
 
 // ControlLock is the tiny gate shared by `pause` and the intent commit.

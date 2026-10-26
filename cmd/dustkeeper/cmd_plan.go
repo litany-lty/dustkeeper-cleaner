@@ -6,13 +6,13 @@ import (
 	"io"
 	"time"
 
+	"dustkeeper/internal/clocktrust"
 	"dustkeeper/internal/dedup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/rules"
-	"dustkeeper/internal/run"
 	"dustkeeper/internal/store"
 )
 
@@ -274,12 +274,12 @@ func planApply(ctx context.Context, a *app, args []string) (output, error) {
 			// Retention is only provable if the clock is. Section 10.4 lists a
 			// trustworthy clock among the per-purge conditions, and a manual
 			// approval does not make a jumped clock trustworthy.
-			trusted, note := run.ClockTrust(ctx, a.store, a.clock)
-			if !trusted {
-				return output{}, errs.Newf(errs.CodeClockUntrusted,
-					"%s; nothing was purged", note)
-			}
-			res, err = exec.ApplyPurgePlan(ctx, sctx, p.ID, domain.Digest(*digest), budget, true)
+			//
+			// The assertion is passed as a function so the executor re-evaluates
+			// it for every object, not once per batch: a clock that jumps
+			// halfway through must stop the batch, not finish it.
+			trust := clocktrust.Start(a.store, a.clock)
+			res, err = exec.ApplyPurgePlan(ctx, sctx, p.ID, domain.Digest(*digest), budget, trust.Assert)
 		default:
 			res, err = exec.ApplyQuarantinePlan(ctx, sctx, p.ID, domain.Digest(*digest), budget)
 		}

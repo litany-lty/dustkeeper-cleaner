@@ -9,6 +9,11 @@ import (
 )
 
 // ApplyResult summarises one apply.
+//
+// Control is the strongest control signal the batch produced. A caller must act
+// on it instead of reading "error is nil" as "keep going": a held scope used to
+// be reported through the error channel only, so a runner that saw nil went on
+// to hand the same scope to the next rule.
 type ApplyResult struct {
 	Plan      domain.PlanID            `json:"plan_id"`
 	Status    string                   `json:"status"`
@@ -16,6 +21,7 @@ type ApplyResult struct {
 	Completed int                      `json:"completed_count"`
 	Skipped   int                      `json:"skipped_count"`
 	Failed    int                      `json:"failed_count"`
+	Control   string                   `json:"control"`
 	Results   []domain.OperationResult `json:"results"`
 	Code      string                   `json:"code"`
 	Message   string                   `json:"message,omitempty"`
@@ -34,17 +40,38 @@ func stopCode(code string) bool {
 		string(errs.CodeStateWriteFailed),
 		string(errs.CodeDBError),
 		string(errs.CodeClockUntrusted),
+		string(errs.CodeProtectionAliasUnresolved),
+		string(errs.CodeUnsupportedMetadata),
 		string(errs.CodePaused):
 		return true
 	}
 	return false
 }
 
+// strongerControl keeps the most restrictive signal seen in a batch.
+func strongerControl(a, b string) string {
+	rank := func(s string) int {
+		switch s {
+		case domain.ControlStopRun:
+			return 3
+		case domain.ControlStopScope:
+			return 2
+		case domain.ControlStopPlan:
+			return 1
+		}
+		return 0
+	}
+	if rank(b) > rank(a) {
+		return b
+	}
+	return a
+}
+
 // ApplyQuarantinePlan executes an approved quarantine plan.
 func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID domain.PlanID,
 	approval domain.Digest, budget *domain.Budget) (ApplyResult, error) {
 
-	out := ApplyResult{Plan: planID, Code: string(errs.CodeOK)}
+	out := ApplyResult{Plan: planID, Code: string(errs.CodeOK), Control: domain.ControlContinue}
 
 	p, err := e.Store.GetPlan(ctx, planID)
 	if err != nil {
@@ -79,21 +106,29 @@ func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID
 	for _, it := range items {
 		if stopped {
 			out.Failed++
+			out.Results = append(out.Results, domain.OperationResult{
+				Item: it.ID, State: it.State, Code: string(errs.CodePaused),
+				Message: "not started: the batch stopped at an earlier item",
+				Control: domain.ControlContinue, Evidence: domain.EvidenceNotStarted,
+			})
 			continue
 		}
 		if err := ctx.Err(); err != nil {
 			out.Code = string(errs.CodeCancelled)
+			out.Control = strongerControl(out.Control, domain.ControlStopRun)
 			break
 		}
 		res, execErr := e.Quarantine(ctx, sc, p, it, budget)
 		if execErr != nil {
 			out.Failed++
+			res.Control = strongerControl(res.Control, controlOf(string(errs.CodeOf(execErr))))
 			out.Results = append(out.Results, res)
 			code := errs.CodeOf(execErr)
 			if stopCode(string(code)) {
 				stopped = true
 				out.Code = string(code)
 				out.Message = execErr.Error()
+				out.Control = strongerControl(out.Control, controlOf(out.Code))
 			}
 			continue
 		}
@@ -122,11 +157,17 @@ func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID
 	return out, nil
 }
 
-// ApplyPurgePlan executes an approved purge plan over existing objects.
+// ApplyPurgePlan executes an approved purge plan.
+//
+// Both the generic `plan apply` route and the dedicated `purge apply` route end
+// here, so they read the same member list (purge_members) and make the same
+// decision for the same object. They used to differ: the generic route loaded
+// items by plan id, which is empty for a purge plan, and the dedicated route
+// skipped checks the generic one performed.
 func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID domain.PlanID,
-	approval domain.Digest, budget *domain.Budget, clockTrusted bool) (ApplyResult, error) {
+	approval domain.Digest, budget *domain.Budget, trust TrustFunc) (ApplyResult, error) {
 
-	out := ApplyResult{Plan: planID, Code: string(errs.CodeOK)}
+	out := ApplyResult{Plan: planID, Code: string(errs.CodeOK), Control: domain.ControlContinue}
 
 	p, err := e.Store.GetPlan(ctx, planID)
 	if err != nil {
@@ -155,26 +196,45 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 	for _, m := range members {
 		if stopped {
 			out.Failed++
+			out.Results = append(out.Results, domain.OperationResult{
+				Item: m.Item.ID, State: m.Item.State, Code: string(errs.CodePaused),
+				Message: "not started: the batch stopped at an earlier item",
+				Control: domain.ControlContinue, Evidence: domain.EvidenceNotStarted,
+			})
 			continue
 		}
 		if err := ctx.Err(); err != nil {
 			out.Code = string(errs.CodeCancelled)
+			out.Control = strongerControl(out.Control, domain.ControlStopRun)
 			break
 		}
+		// The plan's own window is re-checked per item: a batch that was valid
+		// when it started must not still be executing an approval that expired
+		// halfway through a large vault.
+		if now := e.Clock.Wall().UnixNano(); now > p.ExpiresAtNS {
+			out.Code = string(errs.CodePlanExpired)
+			out.Message = "the plan expired during the batch; no further object was removed"
+			out.Control = strongerControl(out.Control, domain.ControlStopPlan)
+			stopped = true
+			out.Failed++
+			continue
+		}
 		res, execErr := e.Purge(ctx, sc, m.Item, PurgeOptions{
-			Automatic:    p.Kind == domain.PlanScheduledPurge,
-			Plan:         &p,
-			Budget:       budget,
-			ClockTrusted: clockTrusted,
+			Automatic: p.Kind == domain.PlanScheduledPurge,
+			Plan:      &p,
+			Budget:    budget,
+			Trust:     trust,
 		})
 		if execErr != nil {
 			out.Failed++
+			res.Control = strongerControl(res.Control, controlOf(string(errs.CodeOf(execErr))))
 			out.Results = append(out.Results, res)
 			code := errs.CodeOf(execErr)
 			if stopCode(string(code)) {
 				stopped = true
 				out.Code = string(code)
 				out.Message = execErr.Error()
+				out.Control = strongerControl(out.Control, controlOf(out.Code))
 			}
 			continue
 		}

@@ -96,12 +96,10 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	if err := e.validateItem(sc, p, it, binding); err != nil {
 		return res, err
 	}
-
-	// A path that became protected after planning must not move.
-	if ok, why := policy.GlobalProtected(string(it.RawRelative)); ok {
-		res.Code = string(errs.CodeSkippedProtected)
-		res.Message = "global protection: " + why
-		return res, nil
+	// A paused or held scope accepts no new business operation. The plan may
+	// predate the pause, so this is checked per item rather than per batch.
+	if err := e.scopeGate(ctx, sc); err != nil {
+		return res, err
 	}
 
 	preID, err := decodeID(it.PreIdentityJSON)
@@ -112,9 +110,18 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	if err != nil {
 		return res, err
 	}
-	if ok, why := e.Guard.CheckExact(string(it.RawRelative), preID); ok {
+
+	// One protection answer for scan, plan, quarantine and purge. Subtree
+	// protections and project trees are part of it; checking only an exact path
+	// match let a subtree protection added after a scan be bypassed by simply
+	// creating a new plan.
+	if ok, why, perr := e.protected(ctx, sc, it.RawRelative, preID); perr != nil {
+		return res, perr
+	} else if ok {
 		res.Code = string(errs.CodeSkippedProtected)
 		res.Message = why
+		res.Control = domain.ControlContinue
+		res.Evidence = domain.EvidenceNotStarted
 		return res, nil
 	}
 
@@ -173,28 +180,26 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 		return res, errs.New(errs.CodeBudgetExhausted,
 			"not enough read budget left to verify this file twice")
 	}
-
-	ev, err := MetadataOf(src)
-	if err != nil {
-		return res, err
-	}
-	if ev.Unsupported != "" {
-		res.Code = string(errs.CodeUnsupportedMetadata)
-		res.Message = "metadata cannot be normalised safely: " + ev.Unsupported
-		return res, nil
+	// The action allowance is checked before the content read, not after it. A
+	// batch that is not allowed to move anything must not hash anything either.
+	if budget != nil && !budget.CanReserve(src.Token.Size) {
+		return res, errs.New(errs.CodeBudgetExhausted,
+			"the quarantine allowance for this run does not permit another action")
 	}
 
 	opt := e.VerifyOpt(src.Token.Size)
 	opt.Budget = budget
-	preHash, _, err := HashFile(src, opt)
+	preEv, err := ReadStable(src, opt)
 	if err != nil {
+		if errors.Is(err, ErrUnstableObject) {
+			// Nothing has moved yet, so this attempt can be closed cleanly.
+			return res, errs.Newf(errs.CodePlanStale,
+				"%q changed while it was being verified; plan again", it.RawRelative)
+		}
 		return res, err
 	}
-	metaHash := MetadataDigest(ev, src.Token)
-
-	if err := checkNoWriterChange(src, preID, preTok); err != nil {
-		return res, err
-	}
+	preHash := preEv.Content
+	metaHash := preEv.Metadata
 
 	manifest := ManifestV1{
 		FormatVersion:    1,
@@ -291,16 +296,16 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	defer obj.Close()
 
 	if !obj.Identity.Equal(preID) {
-		return e.miscapture(ctx, sc, it, intent, obj.Identity)
+		return e.miscapture(ctx, sc, it, intent, obj)
 	}
 
 	opt2 := e.VerifyOpt(obj.Token.Size)
 	opt2.Budget = budget
-	postHash, _, err := HashFile(obj, opt2)
+	postEv, err := ReadStable(obj, opt2)
 	if err != nil {
 		return res, e.park(ctx, intent, "POST_VERIFY_READ_FAILED", err)
 	}
-	if postHash != preHash {
+	if postEv.Content != preHash {
 		return res, e.park(ctx, intent, "CONTENT_CHANGED_AFTER_MOVE", nil)
 	}
 	if err := SyncAfterMove(obj.FD(), parent, sc.Objects, sc.AnchorFD(), "quarantine"); err != nil {
@@ -327,20 +332,26 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 		CapturedTokenJSON:    string(capturedTokJSON),
 		QuarantinedAtNS:      nowNS,
 		PurgeNotBeforeNS:     purgeNotBefore,
-		ContentHash:          string(postHash),
+		ContentHash:          string(postEv.Content),
 		MetadataHash:         string(metaHash),
 	}, `{"source":"observed"}`); err != nil {
 		return res, err
 	}
+	if budget != nil {
+		budget.AddAction(obj.Token.Size)
+	}
 
 	res.State = domain.StateQuarantined
 	res.Code = string(errs.CodeOK)
+	res.Control = domain.ControlContinue
+	res.Evidence = domain.EvidencePersisted
 	res.Operation = opID
 	return res, nil
 }
 
 // hold freezes an item after the namespace changed but the outcome could not be
-// verified. A held item never becomes purge-eligible automatically.
+// verified, or after a state that cannot be explained. A held item never becomes
+// purge-eligible automatically.
 func (e *Executor) hold(ctx context.Context, in store.Intent, code string, cause error) error {
 	detail := ""
 	if cause != nil {
@@ -355,108 +366,161 @@ func (e *Executor) hold(ctx context.Context, in store.Intent, code string, cause
 // park records a failure that happened after the file already moved.
 //
 // The item becomes "unknown" and keeps its pending marker, so reconciliation
-// re-reads the vault and finishes or explains it. Calling hold here would clear
-// the marker and orphan a file that really did move.
+// re-reads the vault and finishes or explains it. The event it writes is a
+// non-terminal park, not a hold: an operation that stopped being provable is
+// still an operation that can be finished once the cause clears.
 func (e *Executor) park(ctx context.Context, in store.Intent, code string, cause error) error {
 	detail := ""
 	if cause != nil {
 		detail = cause.Error()
 	}
-	payload := `{"hold_code":` + quoteJSON(code) + `,"detail":` + quoteJSON(detail) + `,"source":"observed","after_move":true}`
+	payload := `{"hold_code":` + quoteJSON(code) + `,"detail":` + quoteJSON(detail) +
+		`,"source":"observed","after_move":true,"pending":true}`
 	_ = e.Store.ParkIntent(ctx, in, code, payload)
 	return errs.Newf(errs.CodeHeld,
 		"item %s moved but its outcome could not be proven (%s); run recover reconcile", in.ItemID, code)
 }
 
 // miscapture handles the case where the object that moved is not the object the
-// plan described. The scope stops, the real identity is recorded, and a
-// compensation restore is attempted only if the original slot is provably safe.
+// plan described.
+//
+// Two facts are recorded before anything else happens: the object that actually
+// moved (identity and token) and the plan's original expectation. Without the
+// first, the file sitting in the vault has no product path back: reconcile reads
+// item.captured_*, restore requires it, and the hold used to write it only into
+// an event payload. "The file is preserved" is not the same as "the operator can
+// get it back".
 func (e *Executor) miscapture(ctx context.Context, sc *ScopeCtx, it store.Item,
-	in store.Intent, actual domain.FileIdentity) (domain.OperationResult, error) {
+	in store.Intent, obj *fsops.File) (domain.OperationResult, error) {
 
 	res := domain.OperationResult{Item: it.ID, State: domain.StateHeld, Operation: in.OpID}
-	actualJSON, _ := json.Marshal(actual)
-	payload := `{"hold_code":"MISCAPTURE","captured_identity":` + quoteJSON(string(actualJSON)) + `,"source":"observed"}`
-	_ = e.Store.HoldIntent(ctx, in, "MISCAPTURE", payload)
-	_ = e.Store.SetHoldCode(ctx, it.ID, "MISCAPTURE")
+	res.Control = domain.ControlStopScope
+	res.Evidence = domain.EvidencePendingRecn
+
+	actualJSON, _ := json.Marshal(obj.Identity)
+	tokJSON, _ := json.Marshal(obj.Token)
+	payload := `{"hold_code":"MISCAPTURE","captured_identity":` + quoteJSON(string(actualJSON)) +
+		`,"captured_token":` + quoteJSON(string(tokJSON)) + `,"source":"observed"}`
+	_ = e.Store.HoldIntentWithCapture(ctx, in, "MISCAPTURE", payload,
+		string(actualJSON), string(tokJSON))
 	_ = e.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld)
 
-	if e.tryCompensate(ctx, sc, it, actual) {
+	compensated, detail := e.tryCompensate(ctx, sc, it, obj)
+	if compensated {
 		res.Code = string(errs.CodeHeld)
 		res.Message = "the wrong object was captured and has been put back; the scope is held"
 	} else {
 		res.Code = string(errs.CodeHeld)
-		res.Message = "the wrong object was captured; both objects were preserved; the scope is held"
+		res.Message = "the wrong object was captured; nothing was overwritten and the captured object can be restored explicitly"
 	}
 	return res, errs.Newf(errs.CodeHeld,
-		"item %s: the object at that path was not the planned object", it.ID)
+		"item %s: the object at that path was not the planned object (%s)", it.ID, detail)
 }
 
-// tryCompensate puts a wrongly captured object back without overwriting
-// anything. Any doubt leaves both objects in place.
-func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Item, actual domain.FileIdentity) bool {
+// tryCompensate puts a wrongly captured object back, but only when that is
+// provably safe: same parent, entry absent, and the vault object still the one
+// that moved.
+//
+// It reuses the full restore protocol rather than a bare rename. The earlier
+// version saved a one-field JSON purpose, ignored the file sync, both directory
+// syncs and the abort error, and hardcoded "quarantined" as the state to return
+// to. A compensation that fails halfway must return the item to held, not to a
+// state that implies the original was still there.
+func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Item, obj *fsops.File) (bool, string) {
 	parent, err := sc.Root.OpenParent(it.RawRelative)
 	if err != nil {
-		return false
+		return false, "the original directory cannot be resolved; the captured object stays in the vault"
 	}
 	defer parent.Close()
 
 	parentID, _, err := parent.Stat()
 	if err != nil {
-		return false
+		return false, "the original directory cannot be inspected; the captured object stays in the vault"
 	}
 	storedParent, err := decodeID(it.SourceParentIdentityJSON)
 	if err != nil || !parentID.Equal(storedParent) {
-		return false
+		return false, "the original directory was replaced; the captured object stays in the vault"
 	}
 	exists, err := parent.Exists()
-	if err != nil || exists {
-		return false
-	}
-
-	objParent, err := sc.Objects.ParentOf(it.ObjectName)
 	if err != nil {
-		return false
+		return false, "the original path cannot be inspected; the captured object stays in the vault"
 	}
-	defer objParent.Close()
-	obj, err := fsops.OpenRegularAt(objParent, sc.RootDev)
-	if err != nil {
-		return false
-	}
-	defer obj.Close()
-	if !obj.Identity.Equal(actual) {
-		return false
+	if exists {
+		return false, "the original path now holds another file; that file was left untouched"
 	}
 
 	opID := domain.OperationID(domain.NewID("op"))
+	contract := plan.OperationContractV1{
+		BindingVersion:  plan.BindingVersion,
+		ItemID:          string(it.ID),
+		NextState:       domain.StateRIntent,
+		PriorState:      domain.StateHeld,
+		Purpose:         plan.PurposeMiscaptureFixup,
+		ScopeID:         string(sc.Scope.ID),
+		RawRelativeB64:  plan.B64(it.RawRelative),
+		ObjectName:      it.ObjectName,
+		ExpectedIdent:   obj.Identity,
+		ExpectedToken:   obj.Token,
+		MaxFiles:        e.Config.MaxFiles,
+		MaxLogicalBytes: e.Config.MaxBytes,
+	}
+	contractJSON, err := json.Marshal(contract)
+	if err != nil {
+		return false, "the compensation contract could not be written"
+	}
 	comp := store.Intent{
 		OpID:         opID,
 		ItemID:       it.ID,
 		Action:       "compensate",
 		PriorState:   domain.StateHeld,
 		NextState:    domain.StateRIntent,
-		ContractJSON: `{"purpose":"miscapture_compensation"}`,
+		ContractJSON: string(contractJSON),
 		OccurredAtNS: e.Clock.Wall().UnixNano(),
 	}
 	if err := e.Store.BeginIntent(ctx, comp); err != nil {
-		return false
+		return false, "a compensation intent could not be recorded"
 	}
 	if err := fsops.RenameNoReplace(sc.Objects, it.ObjectName, parent, parent.Name()); err != nil {
-		_ = e.Store.AbortIntent(ctx, comp, domain.StateHeld, `{"reason":"compensation rename failed"}`)
-		return false
+		_ = e.Store.AbortIntent(ctx, comp, domain.StateHeld,
+			`{"source":"observed","reason":"compensation rename failed"}`)
+		return false, "the compensation move failed; the captured object stays in the vault"
 	}
-	if back, err := fsops.OpenRegularAt(parent, sc.RootDev); err == nil {
-		_ = back.Sync()
-		back.Close()
-	}
-	_ = fsops.DurableDir(parent)
-	_ = fsops.DurableDir(sc.Objects)
 
-	// The attempt ends, but the item stays held: a compensated miscapture never
+	back, err := fsops.OpenRegularAt(parent, sc.RootDev)
+	if err != nil {
+		// The object moved back but cannot be re-opened: the compensation intent
+		// stays open so reconciliation can finish it from the observed state.
+		return false, "the object was moved back but could not be re-verified; reconcile will finish it"
+	}
+	if !back.Identity.Equal(obj.Identity) {
+		back.Close()
+		return false, "the object that moved back is not the captured object; reconcile will explain it"
+	}
+	if err := back.Sync(); err != nil {
+		back.Close()
+		return false, "the object was moved back but its data could not be flushed; reconcile will finish it"
+	}
+	back.Close()
+	if err := fsops.DurableDir(parent); err != nil {
+		return false, "the destination directory could not be flushed; reconcile will finish it"
+	}
+	if err := fsops.DurableDir(sc.Objects); err != nil {
+		return false, "the vault directory could not be flushed; reconcile will finish it"
+	}
+	if sc.AnchorFD() >= 0 {
+		if err := fsops.Barrier(sc.AnchorFD(), []byte("compensate")); err != nil {
+			return false, "the durability barrier failed; reconcile will finish it"
+		}
+	}
+
+	// The attempt ends where it started: held. A compensated miscapture never
 	// regains purge eligibility on its own.
-	_ = e.Store.AbortIntent(ctx, comp, domain.StateHeld,
-		`{"source":"compensated","result":"original slot restored; item remains held"}`)
-	return true
+	if err := e.Store.AbortIntent(ctx, comp, domain.StateHeld,
+		`{"source":"compensated","result":"original slot restored; item remains held"}`); err != nil {
+		return false, "the object was put back but the record could not be closed; reconcile will finish it"
+	}
+	_ = e.Store.ReleaseItemKeeperPin(ctx, it.ID)
+	return true, "put back"
 }
 
 func strPtr(s string) *string { return &s }

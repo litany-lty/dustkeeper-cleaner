@@ -2,6 +2,7 @@ package rules
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"unicode/utf8"
 
@@ -56,10 +57,12 @@ type DraftProvider interface {
 // rejected, so a model cannot smuggle an extra "auto_purge": true alongside a
 // valid draft.
 type envelope struct {
-	Kind      string   `json:"kind"`
-	DSL       *Rule    `json:"dsl"`
-	Questions []string `json:"questions"`
-	Reason    string   `json:"reason"`
+	Kind string `json:"kind"`
+	// DSL is kept raw so the draft body goes through the same validator as an
+	// imported rule file. Binding it here would apply a second, weaker contract.
+	DSL       *json.RawMessage `json:"dsl"`
+	Questions []string         `json:"questions"`
+	Reason    string           `json:"reason"`
 }
 
 // ParseDraft validates the model's answer under the strict contract.
@@ -80,28 +83,36 @@ func ParseDraft(raw []byte, allowedScopes map[string]bool) (Draft, error) {
 			"the model answer is not a strict JSON draft: %v", err)
 	}
 
+	// Which variant this is depends on which fields are present, not on whether
+	// the ones present happen to be empty. An answer carrying `questions: []`
+	// is trying to be two things at once.
+	presence, err := strictjson.Inspect(raw)
+	if err != nil {
+		return Draft{}, errs.Newf(errs.CodeDSLInvalid,
+			"the model answer is not a strict JSON draft: %v", err)
+	}
+
 	switch env.Kind {
 	case DraftKind:
-		if len(env.Questions) > 0 || env.Reason != "" {
-			return Draft{}, errs.New(errs.CodeDSLInvalid,
-				"a draft must not also carry questions or an unsupported reason")
+		if err := forbidFields(presence, "draft", "questions", "reason"); err != nil {
+			return Draft{}, err
 		}
 		if env.DSL == nil {
 			return Draft{}, errs.New(errs.CodeDSLInvalid, "a draft without a rule body")
 		}
-		if err := env.DSL.Validate(allowedScopes); err != nil {
+		rule, err := Parse(*env.DSL, allowedScopes)
+		if err != nil {
 			return Draft{}, err
 		}
-		canonical, err := env.DSL.CanonicalJSON()
+		canonical, err := rule.CanonicalJSON()
 		if err != nil {
 			return Draft{}, errs.Wrap(errs.CodeDSLInvalid, err)
 		}
 		return Draft{Kind: DraftKind, DSL: string(canonical)}, nil
 
 	case DraftNeedsInputKind:
-		if env.DSL != nil || env.Reason != "" {
-			return Draft{}, errs.New(errs.CodeDSLInvalid,
-				"a clarification request must not carry a rule body or an unsupported reason")
+		if err := forbidFields(presence, "clarification request", "dsl", "reason"); err != nil {
+			return Draft{}, err
 		}
 		if len(env.Questions) == 0 || len(env.Questions) > MaxQuestions {
 			return Draft{}, errs.Newf(errs.CodeDSLInvalid,
@@ -115,9 +126,8 @@ func ParseDraft(raw []byte, allowedScopes map[string]bool) (Draft, error) {
 		return Draft{Kind: DraftNeedsInputKind, Questions: env.Questions, NeedsInput: true}, nil
 
 	case DraftUnsupported:
-		if env.DSL != nil || len(env.Questions) > 0 {
-			return Draft{}, errs.New(errs.CodeDSLInvalid,
-				"an unsupported answer must not carry a rule body or questions")
+		if err := forbidFields(presence, "unsupported answer", "dsl", "questions"); err != nil {
+			return Draft{}, err
 		}
 		if strings.TrimSpace(env.Reason) == "" {
 			return Draft{}, errs.New(errs.CodeDSLInvalid, "an unsupported answer needs a reason")
@@ -128,6 +138,18 @@ func ParseDraft(raw []byte, allowedScopes map[string]bool) (Draft, error) {
 	return Draft{}, errs.Newf(errs.CodeDSLInvalid,
 		"unknown draft kind %q; expected %s, %s or %s",
 		env.Kind, DraftKind, DraftNeedsInputKind, DraftUnsupported)
+}
+
+// forbidFields rejects a variant that carries a field belonging to another
+// variant. Empty values count: the field being there at all is the signal.
+func forbidFields(presence map[string]strictjson.Shape, what string, paths ...string) error {
+	for _, path := range paths {
+		if _, ok := presence[path]; ok {
+			return errs.Newf(errs.CodeDSLInvalid,
+				"a %s must not carry the field %q", what, path)
+		}
+	}
+	return nil
 }
 
 // Compile runs one provider call and validates the answer.

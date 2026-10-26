@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"dustkeeper/internal/errs"
@@ -368,6 +371,168 @@ func TestEnvelopeHasNoNoise(t *testing.T) {
 	for _, k := range []string{"schema_version", "status", "code", "message", "retryable", "run_id"} {
 		if _, ok := first[k]; !ok {
 			t.Errorf("the envelope has no %q", k)
+		}
+	}
+}
+
+// R15: the flags install.sh passes must actually reach the renderer. A renderer
+// that understands midnight and a custom label is useless if the CLI drops them.
+func TestScheduleRenderHonoursMidnightAndLabel(t *testing.T) {
+	newHome(t)
+	dir := t.TempDir()
+	r := cli(t, "schedule", "render", "--platform", "linux", "--output", dir,
+		"--hour", "0", "--minute", "0", "--label", "dustkeeper-nightly", "--json")
+	if r.code != 0 {
+		t.Fatalf("schedule render exited %d:\n%s%s", r.code, r.stdout, r.stderr)
+	}
+	timer, err := os.ReadFile(filepath.Join(dir, "dustkeeper-nightly.timer"))
+	if err != nil {
+		t.Fatalf("the timer was not named after the label: %v", err)
+	}
+	if !strings.Contains(string(timer), "00:00:00") {
+		t.Fatalf("an explicit 00:00 was not rendered:\n%s", timer)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dustkeeper-nightly.service")); err != nil {
+		t.Fatalf("the service unit was not named after the label: %v", err)
+	}
+}
+
+// The default stays 03:30 when the caller asks for nothing, so the documented
+// behaviour and the explicit-midnight case can both be true.
+func TestScheduleRenderKeepsTheDocumentedDefault(t *testing.T) {
+	newHome(t)
+	dir := t.TempDir()
+	r := cli(t, "schedule", "render", "--platform", "linux", "--output", dir, "--json")
+	if r.code != 0 {
+		t.Fatalf("schedule render exited %d:\n%s%s", r.code, r.stdout, r.stderr)
+	}
+	timer, err := os.ReadFile(filepath.Join(dir, "dustkeeper.timer"))
+	if err != nil {
+		t.Fatalf("read timer: %v", err)
+	}
+	if !strings.Contains(string(timer), "03:30:00") {
+		t.Fatalf("the documented default was not applied:\n%s", timer)
+	}
+}
+
+// countingModel is a stand-in for a rule-draft service that records how many
+// times it was called.
+type countingModel struct {
+	*httptest.Server
+	mu   sync.Mutex
+	hits int
+}
+
+func newCountingModel(t *testing.T) *countingModel {
+	t.Helper()
+	c := &countingModel{}
+	c.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		c.hits++
+		c.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		// A well-formed chat completion carrying a refusal: enough for the
+		// adapter to return, so a call is observable as a call and not as a
+		// timeout.
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"kind\":\"unsupported\",\"reason\":\"test\"}"}}]}`))
+	}))
+	t.Cleanup(c.Close)
+	return c
+}
+
+func (c *countingModel) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hits
+}
+
+func (c *countingModel) reset() {
+	c.mu.Lock()
+	c.hits = 0
+	c.mu.Unlock()
+}
+
+// pointModelAt rewrites model.base_url in the config init wrote.
+func pointModelAt(t *testing.T, cfgPath, baseURL string) {
+	t.Helper()
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	model, _ := cfg["model"].(map[string]any)
+	if model == nil {
+		t.Fatalf("the default config has no model block to point at a test service")
+	}
+	// Only the endpoint changes. Everything else stays as `init` wrote it, so this
+	// test also proves the default configuration is one the adapter accepts.
+	model["enabled"] = true
+	model["base_url"] = baseURL
+	model["model"] = "test-model"
+	model["request_timeout_seconds"] = 5
+	apiKeyEnv, _ := model["api_key_env"].(string)
+	if apiKeyEnv == "" {
+		t.Fatalf("the default config has no api_key_env; the adapter would refuse it")
+	}
+	t.Setenv(apiKeyEnv, "test-key")
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	if err := os.WriteFile(cfgPath, out, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+// A scan, a restore, a purge and a background run are local operations. Only
+// `rule draft` may talk to a model; if any other command reaches one, the count
+// below is non-zero and the test says which command did it.
+func TestNormalCommandsNeverCallTheModel(t *testing.T) {
+	base := newHome(t)
+	model := newCountingModel(t)
+
+	if r := cli(t, "init", "--json"); r.code != 0 {
+		t.Fatalf("init exited %d: %s", r.code, r.stdout)
+	}
+	cfgPath := filepath.Join(base, "config", "config.json")
+	pointModelAt(t, cfgPath, model.URL)
+
+	tree := filepath.Join(base, "tree")
+	if err := os.MkdirAll(filepath.Join(tree, "keep"), 0o755); err != nil {
+		t.Fatalf("mkdir tree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tree, "old.zip"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if r := cli(t, "scope", "add", "--path", tree, "--kind", "managed_disposable", "--name", "exports", "--json"); r.code != 0 {
+		t.Fatalf("scope add exited %d: %s\n%s", r.code, r.stdout, r.stderr)
+	}
+
+	// Positive control: the counter has to be able to move, otherwise "zero
+	// calls" would also be true of a counter that was never wired up.
+	if r := cli(t, "rule", "draft", "--text", "把 exports 里 30 天没改过的 zip 收起来", "--scope", "exports", "--json"); model.count() == 0 {
+		t.Fatalf("rule draft did not reach the model adapter (code %d: %s%s)", r.code, r.stdout, r.stderr)
+	}
+	model.reset()
+
+	local := [][]string{
+		{"scan", "--scope", "exports", "--json"},
+		{"purge", "plan", "--json"},
+		{"quarantine", "list", "--json"},
+		{"quarantine", "restore", "--object", "obj-00000000000000000000000000000001", "--json"},
+		{"run", "--json"},
+		{"status", "--json"},
+	}
+	for _, args := range local {
+		r := cli(t, args...)
+		// The command may legitimately fail (nothing to restore, nothing due);
+		// what matters is that no request left the process.
+		if got := model.count(); got != 0 {
+			t.Fatalf("%v made %d model request(s); a local command must make none (code %d: %s%s)",
+				args, got, r.code, r.stdout, r.stderr)
 		}
 	}
 }

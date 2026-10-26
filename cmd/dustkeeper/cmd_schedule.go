@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -23,9 +24,19 @@ func cmdSchedule(ctx context.Context, a *app, args []string) (output, error) {
 	dir := fs.String("output", "", "directory to write the templates into")
 	hour := fs.Int("hour", 3, "local hour to run")
 	minute := fs.Int("minute", 30, "local minute to run")
+	label := fs.String("label", "dustkeeper", "systemd unit prefix and launchd label")
 	if err := parseFlags(fs, args[1:]); err != nil {
 		return output{}, err
 	}
+	// An explicit 00:00 is a schedule, not "unset". Only the flags the caller
+	// actually passed count, so the documented 03:30 default still applies when
+	// nothing was asked for.
+	timeSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "hour" || f.Name == "minute" {
+			timeSet = true
+		}
+	})
 	if *platform == "" || *dir == "" {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--platform and --output are required")
 	}
@@ -45,7 +56,8 @@ func cmdSchedule(ctx context.Context, a *app, args []string) (output, error) {
 		ConfigFile: a.paths.ConfigFile,
 		Hour:       *hour,
 		Minute:     *minute,
-		Label:      "dustkeeper",
+		TimeSet:    timeSet,
+		Label:      *label,
 	}, *dir)
 	if err != nil {
 		return output{}, err

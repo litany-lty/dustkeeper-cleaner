@@ -18,6 +18,7 @@ import (
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
 	"dustkeeper/internal/fsops"
+	"dustkeeper/internal/plan"
 	"dustkeeper/internal/scope"
 	"dustkeeper/internal/store"
 )
@@ -128,18 +129,22 @@ func (r *Reconciler) reconcileOne(ctx context.Context, sc *execute.ScopeCtx, po 
 }
 
 // reconcileQuarantine implements the Q_INTENT rows of the matrix.
+//
+// The evidence used to complete an interrupted quarantine comes from the intent
+// contract, not from the item row. R08 documents both halves of the old bug: the
+// completion wrote whatever the item happened to carry (often nothing) as the
+// metadata hash, and the manifest was treated as optional. Either one leaves an
+// object whose recorded evidence can never match the object itself, so the object
+// can never be purged and can never be explained.
 func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
 	it := po.Item
 	out := Result{Item: it.ID, Action: "quarantine"}
 
-	expected, err := identityOf(it.PreIdentityJSON)
+	contract, err := plan.ParseContract(po.ContractJSON)
 	if err != nil {
-		return r.markUnknown(ctx, it.ID, out, "ITEM_IDENTITY_UNREADABLE")
+		return r.markUnknown(ctx, it.ID, out, "INTENT_CONTRACT_UNREADABLE: "+err.Error())
 	}
-	expectedTok, err := tokenOf(it.PreTokenJSON)
-	if err != nil {
-		return r.markUnknown(ctx, it.ID, out, "ITEM_TOKEN_UNREADABLE")
-	}
+	expected := contract.ExpectedIdent
 
 	srcID, srcFound := statEntry(sc, it.RawRelative)
 	vaultID, vaultFound := statVault(sc, it.ObjectName)
@@ -158,7 +163,7 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 
 	case !srcFound && vaultFound && vaultID.Equal(expected) && srcID.IsZero():
 		// The move happened but was not recorded. Complete it after re-verifying.
-		completion, err := r.completeQuarantine(ctx, sc, po, expected, expectedTok)
+		completion, err := r.completeQuarantine(ctx, sc, po, contract)
 		if err != nil {
 			return r.markUnknown(ctx, it.ID, out, "COMPLETION_VERIFY_FAILED: "+err.Error())
 		}
@@ -194,7 +199,7 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 		// intact, so the quarantine itself can be completed without touching the
 		// new file.
 		if vaultFound && vaultID.Equal(expected) {
-			completion, err := r.completeQuarantine(ctx, sc, po, expected, expectedTok)
+			completion, err := r.completeQuarantine(ctx, sc, po, contract)
 			if err != nil {
 				return r.markUnknown(ctx, it.ID, out, "COMPLETION_VERIFY_FAILED: "+err.Error())
 			}
@@ -206,10 +211,52 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 	}
 }
 
+// completeQuarantine finishes a move that already happened.
+//
+// Every fact is taken from the contract and cross-checked against the manifest and
+// the object itself. Nothing is "rebuilt from what is currently there": the point
+// of the completion record is that it describes the object that was verified, and
+// an object whose evidence cannot be established is held for a human, not
+// completed with weaker claims.
 func (r *Reconciler) completeQuarantine(ctx context.Context, sc *execute.ScopeCtx,
-	po store.PendingOp, expected domain.FileIdentity, expectedTok domain.ChangeToken) (string, error) {
+	po store.PendingOp, contract plan.OperationContractV1) (string, error) {
 
 	it := po.Item
+
+	wantContent, err := contract.ContentDigest()
+	if err != nil {
+		return "", err
+	}
+	wantMetadata, err := contract.MetadataDigest()
+	if err != nil {
+		return "", err
+	}
+	// The manifest is an independent record written before the move. A missing or
+	// damaged manifest means the two records cannot be cross-checked, which the
+	// review requires to be a refusal rather than a silent pass.
+	manifest, err := r.readManifest(sc, it.ObjectName)
+	if err != nil {
+		return "", errs.Newf(errs.CodeRecoveryRequired,
+			"the manifest for %s is missing or unreadable, so the move cannot be cross-checked: %v",
+			it.ID, err)
+	}
+	if manifest.ObjectID != string(it.ID) {
+		return "", errs.Newf(errs.CodeRecoveryRequired,
+			"the manifest describes object %q, not %q", manifest.ObjectID, it.ID)
+	}
+	if !manifest.ExpectedIdentity.Equal(contract.ExpectedIdent) {
+		return "", errs.New(errs.CodeRecoveryRequired,
+			"the manifest and the intent contract record different expected identities")
+	}
+	if manifest.ContentHash != string(wantContent) {
+		return "", errs.New(errs.CodeRecoveryRequired,
+			"the manifest and the intent contract record different content hashes")
+	}
+	if manifest.MetadataHash != wantMetadata {
+		return "", errs.New(errs.CodeRecoveryRequired,
+			"the manifest and the intent contract record different metadata hashes")
+	}
+
 	objParent, err := sc.Objects.ParentOf(it.ObjectName)
 	if err != nil {
 		return "", err
@@ -221,58 +268,62 @@ func (r *Reconciler) completeQuarantine(ctx context.Context, sc *execute.ScopeCt
 	}
 	defer obj.Close()
 
-	if !obj.Identity.Equal(expected) {
+	if !obj.Identity.Equal(contract.ExpectedIdent) {
 		return "", errs.New(errs.CodeHeld, "vault object identity differs")
 	}
-	// Re-establish that the bytes are what the manifest recorded.
+	// Re-establish the object's own evidence with the same stable read the normal
+	// path uses, rather than trusting a single hash of the current bytes.
 	opt := r.Exec.VerifyOpt(obj.Token.Size)
-	hash, _, err := execute.HashFile(obj, opt)
+	evidence, err := execute.ReadStable(obj, opt)
 	if err != nil {
 		return "", err
 	}
-	ok := true
-	if m, mErr := r.readManifest(sc, it.ObjectName); mErr == nil && m.ContentHash != "" {
-		ok = string(hash) == m.ContentHash
+	if evidence.Content != wantContent {
+		return "", errs.New(errs.CodeHeld, "vault object content differs from the intent contract")
 	}
-	if !ok {
-		return "", errs.New(errs.CodeHeld, "vault object content differs from the manifest")
+	if string(evidence.Metadata) != wantMetadata {
+		return "", errs.New(errs.CodeHeld, "vault object metadata differs from the intent contract")
+	}
+	// The rename changed the vault object's ctime, so the whole token cannot match.
+	// Everything a rename leaves alone still has to.
+	if evidence.Token.Size != contract.ExpectedToken.Size ||
+		evidence.Token.NLink != contract.ExpectedToken.NLink ||
+		evidence.Token.Mode != contract.ExpectedToken.Mode ||
+		evidence.Token.UID != contract.ExpectedToken.UID ||
+		evidence.Token.GID != contract.ExpectedToken.GID {
+		return "", errs.New(errs.CodeHeld, "the vault object does not match the token in the intent contract")
 	}
 
-	if err := fsops.DurableFile(obj.FD()); err != nil {
-		return "", err
+	// Same persistence protocol as the normal path: object data, both parent
+	// directories, then the anchor barrier.
+	srcParent, perr := sc.Root.OpenParent(it.RawRelative)
+	if perr != nil {
+		return "", errs.Wrap(errs.CodeDurabilityFailed, perr)
 	}
-	if err := fsops.DurableDir(sc.Objects); err != nil {
+	defer srcParent.Close()
+	if err := execute.SyncAfterMove(obj.FD(), srcParent, sc.Objects, sc.AnchorFD(), "reconcile-quarantine"); err != nil {
 		return "", err
-	}
-	if srcParent, perr := sc.Root.OpenParent(it.RawRelative); perr == nil {
-		_ = fsops.DurableDir(srcParent)
-		srcParent.Close()
 	}
 
 	// Retention starts now, from a verified completion. Reconciliation must
 	// never backdate it to a moment it cannot prove.
 	nowNS := r.Clock.Wall().UnixNano()
-	purgeNotBefore, ok2 := domain.AddSecondsNS(nowNS, it.BoundRetentionSeconds)
-	if !ok2 {
+	purgeNotBefore, ok := domain.AddSecondsNS(nowNS, it.BoundRetentionSeconds)
+	if !ok {
 		return "", errs.New(errs.CodeHeld, "retention overflow")
 	}
-	idJSON, _ := json.Marshal(obj.Identity)
-	tokJSON, _ := json.Marshal(obj.Token)
-	metaHash := ""
-	if it.MetadataHash != nil {
-		metaHash = *it.MetadataHash
-	}
+	idJSON, _ := json.Marshal(evidence.Identity)
+	tokJSON, _ := json.Marshal(evidence.Token)
 	if err := r.Store.CompleteQuarantine(ctx, intentOf(po), store.QuarantineResult{
 		CapturedIdentityJSON: string(idJSON),
 		CapturedTokenJSON:    string(tokJSON),
 		QuarantinedAtNS:      nowNS,
 		PurgeNotBeforeNS:     purgeNotBefore,
-		ContentHash:          string(hash),
-		MetadataHash:         metaHash,
+		ContentHash:          string(wantContent),
+		MetadataHash:         wantMetadata,
 	}, `{"source":"reconciled","result":"RECONCILED_OBSERVED"}`); err != nil {
 		return "", err
 	}
-	_ = expectedTok
 	return "the move was already done; its record was completed and the retention window restarted from now", nil
 }
 
@@ -302,12 +353,24 @@ func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx,
 
 	switch {
 	case destFound && destID.Equal(captured) && !vaultFound:
-		if err := fsops.DurableDir(sc.Objects); err != nil {
-			return r.markUnknown(ctx, it.ID, out, "SYNC_FAILED")
+		// Same persistence protocol as the normal restore: the destination's own
+		// data, the objects directory it came from, the destination's parent, then
+		// the anchor barrier. R08 records that the destination parent sync was
+		// ignored here and the object data was never synced at all, so a crash
+		// after this record could leave a completion that was not on disk.
+		destParent, perr := sc.Root.OpenParent(dest)
+		if perr != nil {
+			return r.markUnknown(ctx, it.ID, out, "DEST_PARENT_UNAVAILABLE")
 		}
-		if parent, err := sc.Root.OpenParent(dest); err == nil {
-			_ = fsops.DurableDir(parent)
-			parent.Close()
+		defer destParent.Close()
+		des, oerr := fsops.OpenRegularAt(destParent, sc.RootDev)
+		if oerr != nil {
+			return r.markUnknown(ctx, it.ID, out, "DEST_OPEN_FAILED")
+		}
+		defer des.Close()
+		if serr := execute.SyncAfterMove(des.FD(), sc.Objects, destParent,
+			sc.AnchorFD(), "reconcile-restore"); serr != nil {
+			return r.markUnknown(ctx, it.ID, out, "SYNC_FAILED: "+serr.Error())
 		}
 		if err := r.Store.CompleteRestore(ctx, intentOf(po), `{"source":"reconciled"}`); err != nil {
 			return r.markUnknown(ctx, it.ID, out, "COMPLETE_FAILED")
@@ -382,8 +445,12 @@ func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, p
 	// The object is gone and the vault identity is trusted, so the intent is
 	// complete. This is not an observation of a successful unlink and it does
 	// not claim that any disk space was released.
-	if err := fsops.DurableDir(sc.Objects); err != nil {
-		return r.markUnknown(ctx, it.ID, out, "SYNC_FAILED")
+	//
+	// The steps are the ones the normal purge path issues. R08 found this branch
+	// syncing only the objects directory and skipping the anchor barrier, so the
+	// completion record could be durable while the removal it describes was not.
+	if err := execute.SyncAfterUnlink(sc.Objects, sc.AnchorFD(), "reconcile-purge"); err != nil {
+		return r.markUnknown(ctx, it.ID, out, "SYNC_FAILED: "+err.Error())
 	}
 	if err := r.Store.CompletePurge(ctx, intentOf(po),
 		`{"source":"reconciled","result":"RECONCILED_ABSENT"}`); err != nil {

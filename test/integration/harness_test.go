@@ -21,6 +21,7 @@ import (
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
+	"dustkeeper/internal/fsops"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/policy"
 	"dustkeeper/internal/recovery"
@@ -32,6 +33,18 @@ import (
 
 // fixedNow is the wall clock every test starts from.
 var fixedNow = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+
+// trustOK is the clock assertion a test supplies when it has already decided the
+// clock is fine (the fake clock never moves backwards). Production code goes
+// through clocktrust.Guard.Assert instead; the purge path requires an explicit
+// assertion so that "nobody checked" can never be mistaken for "trusted".
+func trustOK(context.Context) error { return nil }
+
+// trustFails is the assertion a test supplies when it wants the purge path to
+// refuse because the clock is not trustworthy.
+func trustFails(context.Context) error {
+	return errs.New(errs.CodeClockUntrusted, "clock is not trusted in this test")
+}
 
 // env is one isolated installation: state directory, database, clock, scopes.
 type env struct {
@@ -184,12 +197,33 @@ func (e *env) guard(sctx *execute.ScopeCtx) *policy.Guard {
 	return g
 }
 
+// stableEvidence reproduces the evidence the executor records before a move, so a
+// test fixture that simulates a crash writes the same facts the real path writes.
+func (e *env) stableEvidence(t *testing.T, sctx *execute.ScopeCtx, rel []byte) (domain.Digest, string) {
+	t.Helper()
+	parent, err := sctx.Root.OpenParent(rel)
+	if err != nil {
+		t.Fatalf("open parent: %v", err)
+	}
+	defer parent.Close()
+	f, err := fsops.OpenRegularAt(parent, sctx.RootDev)
+	if err != nil {
+		t.Fatalf("open file: %v", err)
+	}
+	defer f.Close()
+	ev, err := execute.ReadStable(f, e.exec.VerifyOpt(f.Token.Size))
+	if err != nil {
+		t.Fatalf("stable evidence: %v", err)
+	}
+	return ev.Content, string(ev.Metadata)
+}
+
 // scan runs one complete metadata scan of a scope.
 func (e *env) scan(id domain.ScopeID) {
 	e.t.Helper()
 	sctx := e.scopeCtx(id)
-	budget := domain.NewBudget(300, 1<<30, 0, 0, 0)
-	if _, _, err := run.ScanScope(context.Background(), e.st, e.clock, 500, sctx, e.guard(sctx), budget); err != nil {
+	ledger := domain.NewRunLedger(300, 1<<30, 0)
+	if _, _, err := run.ScanScope(context.Background(), e.st, e.clock, 500, sctx, e.guard(sctx), ledger); err != nil {
 		e.t.Fatalf("scan: %v", err)
 	}
 }

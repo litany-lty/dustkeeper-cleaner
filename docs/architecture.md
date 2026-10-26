@@ -51,7 +51,7 @@
 |---|---|---|
 | `domain` | 标识符、身份元组、预算、时钟接口、摘要 | 仅标准库 |
 | `errs` | 稳定错误码 → 退出码 / status / retryable | 仅标准库 |
-| `strictjson` | 严格 JSON 词法校验 | 仅标准库 |
+| `strictjson` | 严格 JSON 词法校验 + 字段存在性/形状表 | 仅标准库 |
 | `migrations` | 内嵌 SQL，`user_version` 迁移 | 仅标准库 |
 | `fsops` | 一切与文件系统打交道的系统调用 | `domain` |
 | `store` | SQLite 持久化，单写连接 | `domain`、`migrations` |
@@ -62,7 +62,9 @@
 | `scan` | 只读遍历与候选入库 | `fsops`、`policy`、`scope`、`store` |
 | `plan` | 冻结计划、绑定摘要、清空计划 | `config`、`policy`、`rules`、`store` |
 | `execute` | 隔离 / 恢复 / 清空三个原语 | `fsops`、`plan`、`policy`、`scope`、`store` |
+| `clocktrust` | 时钟可信基线、确认动作与受影响对象的新到期时间 | `domain`、`store` |
 | `recovery` | 对账矩阵 | `execute`、`fsops`、`scope`、`store` |
+| `rescue` | 不打开数据库的只读清单（`recover inspect --root`） | `fsops`、`domain` |
 | `dedup` | 精确重复检测（实现 `execute.KeeperVerifier`） | 以上全部 |
 | `run` | 编排一次运行 | 以上全部 |
 | `schedule` | systemd / launchd 模板渲染 | `errs` |
@@ -331,10 +333,15 @@ plan_digest      = sha256(purpose + "\n" + canonicalJSON{plan 字段 + 每个 it
 | 锁 | 位置 | 作用 |
 |---|---|---|
 | 实例锁 | `<state>/instance.lock` | 整个状态库同时只有一个写者（`INSTANCE_BUSY`，exit 3） |
+| scope 锁 | `<scope>/.dustkeeper/scope.lock` | 同一棵树同时只有一个任务在动它：锁在**树内**，所以换一个 `DUSTKEEPER_STATE_DIR` 也抢不到第二把锁 |
 | 控制锁 | `<state>/control.lock` | `pause` / `resume` 与运行互斥 |
 | 注册锁 | `~/.dustkeeper-registry.lock` | 注册可变更 scope 时串行化，避免两个状态库抢同一棵树的 owner marker |
 
-注册锁刻意放在 home 下、与状态目录无关：改 `DUSTKEEPER_STATE_DIR` 不能造出两把互不相干的锁去管同一棵树。
+锁序固定为 `注册 → 实例 → scope → 控制`。BSD `flock` 是进程级的，同一进程重复 `flock` 不冲突，所以
+`scope` 包在进程内还维护了一份路径 → 引用计数的表：同进程的第二次打开是重入，不是第二把锁。
+
+注册锁与 scope 锁刻意放在状态目录之外（一个在 home，一个在树内）：改 `DUSTKEEPER_STATE_DIR` 造不出
+两把互不相干的锁去管同一棵树。
 
 SQLite 本身用单写连接（`SetMaxOpenConns(1)`）、`journal_mode=DELETE`、`synchronous=EXTRA`、
 `foreign_keys=ON`、`busy_timeout=1000`、`mmap_size=0`、darwin 上 `fullfsync=ON`。不用 WAL、不用 mmap，
@@ -358,18 +365,18 @@ SQLite 本身用单写连接（`SetMaxOpenConns(1)`）、`journal_mode=DELETE`�
 ## 11. 已知限制（一期）
 
 - 只支持 Linux 与 macOS；其他平台 `init` 之后第一个 `doctor` 就会返回 `UNSUPPORTED_FS`。
-- 交叉编译需要目标平台的 C 编译器（cgo）；`build/build.sh` 缺编译器时跳过该目标并打印原因，不静默产出错误产物。
+- 四个发布目标（darwin-arm64/amd64、linux-amd64/arm64）都能交叉编译，但只有 darwin/arm64 跑过完整闭环。
+  其余三个在 README 的平台表里标为**实验性**，不声称已验收。
+- `build/build.sh --release` 要求四个目标、签名与 `SHA256SUMS` 全部齐备，缺一个就退出 1；Linux 固定
+  musl 静态链接，不产出 glibc 版本。
 - 隔离区在被清理的目录内部（`<scope>/.dustkeeper/objects`），因此 `scan` 显式跳过 `.dustkeeper`
   （`scan.vaultName`）；这在一期是可接受的取舍（同卷保证排他 rename 可用），代价是清理整棵目录时会连同
   隔离区一起被带走。
 - `dedup` 的 keeper 选择是保守的：元数据不一致就报告"保留"，不做近似判定；跨 scope 提升 keeper 只在
-  提供 `--keeper-scope` 时发生。
-- `run` 的磁盘压力门槛（`MinFreeBytes` / `MinFreePercent`）尚未接入编排器。配置项已经存在并通过校验，
-  但运行时**没有**依据剩余空间提前停止；目前只有 `CLOCK_UNTRUSTED` 与预算耗尽会中止一轮。
-- `doctor --acknowledge-clock` 只记录确认时刻，**没有**把无法证明保留期的对象 `purge_not_before` 延后到
-  "确认时刻 + 完整保留期"（文档 §11.2 的要求）。确认后到期对象会立即可清空。
-- 没有运行日志子系统：`logs/` 目录会被创建和检查，但没有写入与 5 MiB × 5 轮转（文档 §13.2）。
-- `recover inspect` 依赖数据库；`--manifests` 只读恢复清单尚未实现（文档 §8.3）。
-- `internal/scan`、`execute`、`recovery`、`dedup`、`run` 没有包内单测，主路径由 `test/integration` 覆盖。
+  提供 `--keeper-scope` 时发生。分组仍是一次性按 size/hash 读完，没有分页。
+- 没有运行日志子系统：`logs/` 目录会被创建和检查，但没有写入、没有 5 MiB × 5 轮转，也没有
+  run_id/op_id 结构化诊断（文档 §13.2 / R13 P2）。
+- `internal/scan`、`execute`、`recovery`、`dedup`、`run` 仍没有包内单测，主路径由 `test/integration`
+  覆盖；`test/bench` 只有一条内存门槛用例，R14 的"先记完整 epoch 与有效记录数"还没做。
 
-逐条的文档对照与仍缺的验收用例见 [`docs/compliance.md`](compliance.md)。
+逐条的文档对照、仍缺的验收用例与"实现待补测"清单见 [`docs/compliance.md`](compliance.md)。

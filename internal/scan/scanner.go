@@ -10,6 +10,7 @@ package scan
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"unicode/utf8"
 
@@ -38,6 +39,16 @@ type Scanner struct {
 }
 
 // Stats reports what one scan pass did.
+//
+// Interrupted and Incomplete are separate facts and neither means success:
+//
+//	Interrupted  the batch stopped at a safe boundary because its budget ran out
+//	Incomplete   a directory could not be finished (read error, vanished root)
+//
+// A caller may retire unseen observations only when the queue is empty and
+// neither flag is set. The previous version returned nil from a budget stop and
+// then declared the epoch complete, which turned "not scanned yet" into
+// "deleted" for the tail of every large directory.
 type Stats struct {
 	Dirs           int   `json:"dirs"`
 	Files          int   `json:"files"`
@@ -45,6 +56,9 @@ type Stats struct {
 	ProtectedDirs  int   `json:"protected_dirs"`
 	SkippedEntries int   `json:"skipped_entries"`
 	Unreadable     int   `json:"unreadable"`
+	FailedDirs     int   `json:"failed_dirs"`
+	Interrupted    bool  `json:"interrupted"`
+	Incomplete     bool  `json:"incomplete"`
 }
 
 // New returns a scanner with conservative defaults.
@@ -62,12 +76,21 @@ func New(st *store.Store, clock domain.Clock, guard *policy.Guard, batch int) *S
 	}
 }
 
-// Run processes directories until the queue is empty or the budget is spent.
+// dirState is the outcome for one directory.
+type dirState int
+
+const (
+	dirDone dirState = iota
+	dirInterrupted
+	dirFailed
+)
+
+// Run processes directories until the queue is empty or the run budget is spent.
 //
 // The caller starts the epoch and, after a completed Run with no pending work,
 // retires unseen entries. Calling that retire step from a partial scan would
 // turn "not scanned yet" into "deleted".
-func (s *Scanner) Run(ctx context.Context, vs scope.VerifiedScope, epoch int64, budget *domain.Budget) (Stats, error) {
+func (s *Scanner) Run(ctx context.Context, vs scope.VerifiedScope, epoch int64, run *domain.RunLedger) (Stats, error) {
 	var stats Stats
 	rootDev := vs.RootID.Runtime.Device
 
@@ -75,7 +98,8 @@ func (s *Scanner) Run(ctx context.Context, vs scope.VerifiedScope, epoch int64, 
 		if err := ctx.Err(); err != nil {
 			return stats, errs.New(errs.CodeCancelled, "scan cancelled")
 		}
-		if budget.TimeUp(s.Clock) || budget.ReadUp() {
+		if run.TimeUp(s.Clock.Mono()) || run.ReadUp() {
+			stats.Interrupted = true
 			return stats, nil
 		}
 
@@ -88,14 +112,37 @@ func (s *Scanner) Run(ctx context.Context, vs scope.VerifiedScope, epoch int64, 
 		}
 
 		for _, rel := range dirs {
-			if err := s.scanDir(ctx, vs, epoch, rootDev, rel, budget, &stats); err != nil {
+			state, err := s.scanDir(ctx, vs, epoch, rootDev, rel, run, &stats)
+			if err != nil {
 				return stats, err
 			}
-			if err := s.Store.MarkDirDone(ctx, vs.Scope.ID, epoch, rel); err != nil {
-				return stats, err
+			switch state {
+			case dirDone:
+				if err := s.Store.MarkDirDone(ctx, vs.Scope.ID, epoch, rel); err != nil {
+					return stats, err
+				}
+				stats.Dirs++
+			case dirFailed:
+				// A directory that cannot be read is not "empty" and not
+				// "done": it is counted, the epoch cannot call itself complete,
+				// and the next epoch will walk it again from the root. Marking
+				// it done here is what lets the queue advance instead of
+				// spinning on the same entry for ever.
+				if err := s.Store.MarkDirDone(ctx, vs.Scope.ID, epoch, rel); err != nil {
+					return stats, err
+				}
+				stats.FailedDirs++
+				stats.Incomplete = true
+			case dirInterrupted:
+				// Leave it claimed. The next run requeues active directories and
+				// resumes this one instead of starting a new epoch that would
+				// never reach the tail.
+				stats.Interrupted = true
+				stats.Incomplete = true
+				return stats, nil
 			}
-			stats.Dirs++
-			if budget.TimeUp(s.Clock) {
+			if run.TimeUp(s.Clock.Mono()) {
+				stats.Interrupted = true
 				return stats, nil
 			}
 		}
@@ -103,7 +150,7 @@ func (s *Scanner) Run(ctx context.Context, vs scope.VerifiedScope, epoch int64, 
 }
 
 func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int64, rootDev uint64,
-	rel []byte, budget *domain.Budget, stats *Stats) error {
+	rel []byte, run *domain.RunLedger, stats *Stats) (dirState, error) {
 
 	dir, err := vs.Root.OpenDir(rel)
 	if err != nil {
@@ -112,25 +159,38 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 		// it as fatal would stop the whole scope for one bad entry.
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, fsops.ErrSymlink) || errors.Is(err, fsops.ErrCrossMount) {
 			stats.Unreadable++
-			return nil
+			return dirDone, nil
 		}
-		return errs.Wrap(errs.CodeAccessDenied, err)
+		if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) {
+			stats.Unreadable++
+			return dirFailed, nil
+		}
+		return dirFailed, errs.Wrap(errs.CodeAccessDenied, err)
 	}
 	defer dir.Close()
 
 	dirID, _, err := dir.Stat()
 	if err != nil {
 		stats.Unreadable++
-		return nil
+		return dirFailed, nil
 	}
 	if ok, _ := s.Guard.CheckSubtree(string(rel), dirID); ok {
 		stats.ProtectedDirs++
-		return nil
+		return dirDone, nil
+	}
+	// A directory containing a project marker is a project tree. Protecting only
+	// the marker's own subtree leaves "repo/src/main.go" exposed, because no
+	// segment of that path is ".git".
+	for _, marker := range []string{".git", ".hg", ".svn"} {
+		if _, _, merr := dir.StatEntry(marker); merr == nil {
+			stats.ProtectedDirs++
+			return dirDone, nil
+		}
 	}
 
 	parentIdentityJSON, err := jsonIdentity(dirID)
 	if err != nil {
-		return err
+		return dirFailed, err
 	}
 
 	var (
@@ -158,8 +218,17 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 	for {
 		entries, err := dir.Readdir(s.ReadDirBatch)
 		if err != nil && len(entries) == 0 {
-			// End of directory.
-			break
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			// A non-EOF read error is not the end of the directory. Flushing what
+			// was seen and marking the directory finished would record a partial
+			// listing as complete.
+			if ferr := flush(); ferr != nil {
+				return dirFailed, ferr
+			}
+			stats.Unreadable++
+			return dirFailed, nil
 		}
 		if len(entries) == 0 {
 			break
@@ -230,15 +299,24 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 
 		if len(obsBatch) >= s.Batch || len(dirBatch) >= s.Batch {
 			if err := flush(); err != nil {
-				return err
+				return dirFailed, err
 			}
 		}
-		if budget.TimeUp(s.Clock) {
-			break
+		if run.TimeUp(s.Clock.Mono()) {
+			// Flush what we have, then report the directory as unfinished. Its
+			// already-recorded observations stay; the rest is picked up by the
+			// next run, which resumes this epoch.
+			if err := flush(); err != nil {
+				return dirInterrupted, err
+			}
+			return dirInterrupted, nil
 		}
 	}
 
-	return flush()
+	if err := flush(); err != nil {
+		return dirFailed, err
+	}
+	return dirDone, nil
 }
 
 // InsertFailures counts unreadable entries per run; kept for reporting only.

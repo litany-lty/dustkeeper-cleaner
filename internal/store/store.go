@@ -157,25 +157,36 @@ func (s *Store) migrate() error {
 		return nil
 	}
 
-	if _, err := s.db.Exec("BEGIN IMMEDIATE"); err != nil {
+	steps, err := migrations.For(version)
+	if err != nil {
 		return errs.Wrap(errs.CodeDBError, err)
 	}
-	if _, err := s.db.Exec(migrations.Schema001); err != nil {
-		s.db.Exec("ROLLBACK")
-		return errs.Newf(errs.CodeDBError, "apply schema 001: %v", err)
-	}
-	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version=%d", migrations.CurrentVersion)); err != nil {
-		s.db.Exec("ROLLBACK")
-		return errs.Wrap(errs.CodeDBError, err)
-	}
-	if _, err := s.db.Exec("INSERT INTO meta(key,value) VALUES('schema_version',?)",
-		fmt.Sprintf("%d", migrations.CurrentVersion)); err != nil {
-		s.db.Exec("ROLLBACK")
-		return errs.Wrap(errs.CodeDBError, err)
-	}
-	if _, err := s.db.Exec("COMMIT"); err != nil {
-		s.db.Exec("ROLLBACK")
-		return errs.Wrap(errs.CodeDBError, err)
+	for _, step := range steps {
+		// Each step commits on its own. A failed step leaves the database at the
+		// previous version, which is the only state that can be re-opened
+		// without guessing which half of a rebuild ran.
+		if _, err := s.db.Exec("BEGIN IMMEDIATE"); err != nil {
+			return errs.Wrap(errs.CodeDBError, err)
+		}
+		if _, err := s.db.Exec(step.SQL); err != nil {
+			s.db.Exec("ROLLBACK")
+			return errs.Newf(errs.CodeDBError, "apply schema %03d (%s): %v", step.Version, step.Note, err)
+		}
+		if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version=%d", step.Version)); err != nil {
+			s.db.Exec("ROLLBACK")
+			return errs.Wrap(errs.CodeDBError, err)
+		}
+		if _, err := s.db.Exec(
+			"INSERT INTO meta(key,value) VALUES('schema_version',?) "+
+				"ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+			fmt.Sprintf("%d", step.Version)); err != nil {
+			s.db.Exec("ROLLBACK")
+			return errs.Wrap(errs.CodeDBError, err)
+		}
+		if _, err := s.db.Exec("COMMIT"); err != nil {
+			s.db.Exec("ROLLBACK")
+			return errs.Wrap(errs.CodeDBError, err)
+		}
 	}
 	return nil
 }

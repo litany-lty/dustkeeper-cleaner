@@ -135,11 +135,17 @@ const (
 )
 
 // Event phases.
+//
+// PhasePark is deliberately non-terminal: it records "the namespace changed but
+// the outcome is not proven yet" and leaves the operation open so reconciliation
+// can still finish it. PhaseHold is the terminal verdict and is unique per
+// operation.
 const (
 	PhaseIntent   = "intent"
 	PhaseComplete = "complete"
 	PhaseAbort    = "abort"
 	PhaseHold     = "hold"
+	PhasePark     = "park"
 	PhaseInfo     = "info"
 )
 
@@ -294,13 +300,40 @@ type Approval struct {
 }
 
 // OperationResult is the per-item outcome of an apply.
+//
+// The three axes are separated because they answer different questions and the
+// runner must not read one as another:
+//
+//	Code      what happened to this object (business result)
+//	Control   what the caller should do next (continue / stop scope / stop run)
+//	Evidence  whether an action was observed and persisted
+//
+// "Code is empty and error is nil" used to be the only signal a batch had, which
+// is why a held scope could still be given a second rule's plan.
 type OperationResult struct {
 	Operation OperationID `json:"operation_id"`
 	Item      ItemID      `json:"item_id"`
 	State     string      `json:"state"`
 	Code      string      `json:"code"`
 	Message   string      `json:"message,omitempty"`
+	Control   string      `json:"control,omitempty"`
+	Evidence  string      `json:"evidence,omitempty"`
 }
+
+// Control results (section 6.2).
+const (
+	ControlContinue  = "continue"
+	ControlStopPlan  = "stop_plan"
+	ControlStopScope = "stop_scope"
+	ControlStopRun   = "stop_run"
+)
+
+// Evidence results (section 6.2).
+const (
+	EvidenceNotStarted  = "not_started"
+	EvidencePersisted   = "observed_and_persisted"
+	EvidencePendingRecn = "pending_reconciliation"
+)
 
 // Operation result sources (section 11.1).
 const (

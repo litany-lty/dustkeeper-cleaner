@@ -121,6 +121,34 @@ func Probe(base string) Capabilities {
 	return caps
 }
 
-// Capable reports whether the host can be trusted with file mutation: exclusive
-// rename plus directory sync are the two non-negotiable primitives.
-func (c Capabilities) Capable() bool { return c.NoReplaceRename && c.DirSync && c.NoFollow }
+// Capable reports whether the host can be trusted with file mutation.
+//
+// The bar is every primitive the protocol actually depends on, not the two that
+// happened to be checked first: exclusive rename, directory sync, symlink
+// refusal and the full device barrier. R01 records that FullBarrier failures
+// were collected as a note and then ignored, so a scope could be moved and only
+// afterwards discover that the barrier needed to close the operation could never
+// succeed. A capability that the protocol requires must fail closed here, before
+// there is anything to undo.
+func (c Capabilities) Capable() bool {
+	return c.NoReplaceRename && c.DirSync && c.NoFollow && c.FullBarrier
+}
+
+// Missing names every required capability that was not observed. The caller
+// reports this verbatim so that "not capable" is actionable rather than opaque.
+func (c Capabilities) Missing() []string {
+	var out []string
+	if !c.NoReplaceRename {
+		out = append(out, "exclusive rename (renameatx_np/renameat2 RENAME_NOREPLACE)")
+	}
+	if !c.DirSync {
+		out = append(out, "directory fsync")
+	}
+	if !c.NoFollow {
+		out = append(out, "O_NOFOLLOW refusal of symlinked directories")
+	}
+	if !c.FullBarrier {
+		out = append(out, "full device barrier on a same-volume anchor")
+	}
+	return out
+}

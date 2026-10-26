@@ -128,9 +128,14 @@ func (d *Detector) Detect(ctx context.Context, source *execute.ScopeCtx, keeperS
 	}
 
 	// 2. Hash every file in a size group that has more than one member.
+	//
+	// A group with exactly one in-scope member still has to be hashed when a
+	// reference scope is being searched: one copy here and one copy there is a
+	// duplicate, and the old code dropped that case before the reference query
+	// even ran.
 	byHash := map[string][]Candidate{}
 	for size, group := range bySize {
-		if len(group) < 2 {
+		if len(group) < 2 && keeperScope == nil {
 			continue
 		}
 		res.ContentGroups++
@@ -161,7 +166,9 @@ func (d *Detector) Detect(ctx context.Context, source *execute.ScopeCtx, keeperS
 
 	for _, key := range keys {
 		members := byHash[key]
-		if len(members) < 2 {
+		// One member is enough only when a reference scope might hold the other
+		// copy; without a keeper scope a lone file is not a duplicate.
+		if len(members) < 2 && keeperScope == nil {
 			continue
 		}
 		sort.Slice(members, func(i, j int) bool {
@@ -198,18 +205,21 @@ func (d *Detector) Detect(ctx context.Context, source *execute.ScopeCtx, keeperS
 		}
 		keeperCleanup()
 
-		if !equal || len(g.Others) == 0 {
+		if !equal {
 			continue
 		}
 
+		// The reference scope is consulted before the "is there anything to do"
+		// question is answered, because in the one-to-one case the answer only
+		// becomes yes after the swap.
 		if keeperScope != nil {
 			d.preferReferenceKeeper(ctx, source, keeperScope, &g, &res)
-			if len(g.Others) == 0 {
-				continue
-			}
+		}
+		if len(g.Others) == 0 {
+			continue
 		}
 
-		g.MetadataCompatible, g.Note = d.metadataCompatible(source, keeperScope, g)
+		g.MetadataCompatible, g.Note = d.metadataCompatible(source, keeperScope, &g)
 		res.Groups = append(res.Groups, g)
 		if !g.MetadataCompatible {
 			continue
@@ -257,7 +267,7 @@ func openCandidate(sc *execute.ScopeCtx, c Candidate) (*fsops.File, func(), erro
 // metadataCompatible checks that the copies agree on the metadata that carries
 // meaning. Disagreement keeps every copy: two files can be byte-identical and
 // still not be interchangeable.
-func (d *Detector) metadataCompatible(sc, keeperScope *execute.ScopeCtx, g Group) (bool, string) {
+func (d *Detector) metadataCompatible(sc, keeperScope *execute.ScopeCtx, g *Group) (bool, string) {
 	keeperFile, cleanup, err := openCandidate(scopeFor(g.Keeper, sc, keeperScope), g.Keeper)
 	if err != nil {
 		return false, "keeper unreadable"
@@ -268,9 +278,16 @@ func (d *Detector) metadataCompatible(sc, keeperScope *execute.ScopeCtx, g Group
 		return false, "keeper metadata cannot be normalised"
 	}
 	keeperDigest := execute.MetadataDigest(kMeta, g.Keeper.Token)
+	// The digest is recorded on the candidate so it reaches the keeper evidence in
+	// the plan. R09 found this field declared, read by create.go, and never
+	// assigned - so every keeper carried an empty metadata hash and the purge
+	// check had nothing to compare against.
+	g.Keeper.Meta = kMeta
+	g.Keeper.MetaHash = keeperDigest
 
-	for _, o := range g.Others {
-		f, cleanup, err := openCandidate(scopeFor(o, sc, keeperScope), o)
+	for i := range g.Others {
+		o := &g.Others[i]
+		f, cleanup, err := openCandidate(scopeFor(*o, sc, keeperScope), *o)
 		if err != nil {
 			return false, "a copy is unreadable"
 		}
@@ -279,9 +296,12 @@ func (d *Detector) metadataCompatible(sc, keeperScope *execute.ScopeCtx, g Group
 		if err != nil || meta.Unsupported != "" {
 			return false, "a copy's metadata cannot be normalised"
 		}
-		if execute.MetadataDigest(meta, o.Token) != keeperDigest {
+		digest := execute.MetadataDigest(meta, o.Token)
+		if digest != keeperDigest {
 			return false, "the copies differ in mtime, permissions, ownership or extended attributes"
 		}
+		o.Meta = meta
+		o.MetaHash = digest
 	}
 	return true, ""
 }
@@ -346,14 +366,52 @@ func (d *Detector) preferReferenceKeeper(ctx context.Context, source, keeper *ex
 		if herr != nil || got != g.Hash {
 			continue
 		}
-		// Byte equality was already proven for the in-scope keeper against the
-		// group hash, so an equal hash here proves it against every copy too.
+		// An equal hash is a claim, not proof. The replacement keeper has to hold
+		// the same bytes and the same extended metadata as the copy it replaces,
+		// because the old keeper becomes a deletion candidate after the swap.
+		if !d.referenceKeeperMatches(source, keeper, c, *g) {
+			continue
+		}
 		old := g.Keeper
 		c.Hash = got
 		g.Keeper = c
+		// A swap invalidates the metadata digest recorded for the old keeper.
+		g.Keeper.MetaHash = ""
+		g.Keeper.Meta = fsops.MetadataEvidence{}
 		g.Others = append(g.Others, old)
 		return
 	}
+}
+
+// referenceKeeperMatches proves a reference-scope candidate really is
+// interchangeable with the group's current keeper.
+func (d *Detector) referenceKeeperMatches(source, keeper *execute.ScopeCtx, c Candidate, g Group) bool {
+	opt := execute.VerifyOptions{Buffer: d.Buffer, Budget: d.Budget, RatePerSec: d.RatePerSec}
+
+	cand, candCleanup, err := openCandidate(keeper, c)
+	if err != nil {
+		return false
+	}
+	defer candCleanup()
+	cur, curCleanup, err := openCandidate(source, g.Keeper)
+	if err != nil {
+		return false
+	}
+	defer curCleanup()
+
+	same, err := execute.CompareFiles(cur, cand, opt)
+	if err != nil || !same {
+		return false
+	}
+	curMeta, err := execute.MetadataOf(cur)
+	if err != nil || curMeta.Unsupported != "" {
+		return false
+	}
+	candMeta, err := execute.MetadataOf(cand)
+	if err != nil || candMeta.Unsupported != "" {
+		return false
+	}
+	return execute.MetadataDigest(candMeta, c.Token) == execute.MetadataDigest(curMeta, g.Keeper.Token)
 }
 
 // VerifyKeeper re-proves that a duplicate's surviving copy is intact.
@@ -361,6 +419,11 @@ func (d *Detector) preferReferenceKeeper(ctx context.Context, source, keeper *ex
 // It runs immediately before a purge. If the keeper is missing, replaced,
 // modified or unreadable, the purge is blocked: choosing another copy on the
 // spot would risk deleting the last one.
+//
+// R09 lists what this check used to skip: the extended metadata, the link count,
+// the state after the read finished, and any byte comparison against the copy
+// about to be deleted. Each of those is now required. The bytes matter most: an
+// equal hash is a claim, and comparing the two files is the evidence.
 func (d *Detector) VerifyKeeper(ctx context.Context, it store.Item) error {
 	if it.KeeperJSON == nil {
 		return errs.New(errs.CodeHeld, "this duplicate has no recorded keeper")
@@ -373,6 +436,15 @@ func (d *Detector) VerifyKeeper(ctx context.Context, it store.Item) error {
 	if err != nil {
 		return errs.New(errs.CodeHeld, "the keeper path is unreadable")
 	}
+	if ev.MetadataHash == "" {
+		// A plan made without metadata evidence cannot prove equivalence now.
+		// Refusing is the only honest answer; guessing that "no evidence" means
+		// "no difference" is how a non-equivalent copy gets deleted.
+		return errs.New(errs.CodeHeld,
+			"the plan recorded no metadata evidence for this keeper, so equivalence cannot be re-proven")
+	}
+
+	opt := execute.VerifyOptions{Buffer: d.Buffer, RatePerSec: d.RatePerSec, Budget: d.Budget}
 
 	sc, err := execute.OpenScopeCtx(ctx, d.Registrar, domain.ScopeID(ev.ScopeID))
 	if err != nil {
@@ -394,22 +466,75 @@ func (d *Detector) VerifyKeeper(ctx context.Context, it store.Item) error {
 	if !f.Identity.Equal(ev.Identity) {
 		return errs.New(errs.CodeHeld, "the keeper is no longer the recorded object")
 	}
-	if f.Token.Size != ev.Token.Size || f.Token.MTimeNS != ev.Token.MTimeNS {
-		return errs.New(errs.CodeHeld, "the keeper was modified after the plan was made")
-	}
 
-	opt := execute.VerifyOptions{Buffer: d.Buffer, RatePerSec: d.RatePerSec, Budget: d.Budget}
-	hash, _, err := execute.HashFile(f, opt)
+	// One stable read establishes content, metadata and the post-read identity in
+	// the same shape the payload path uses.
+	ev2, err := execute.ReadStable(f, opt)
 	if err != nil {
+		if errors.Is(err, execute.ErrUnstableObject) {
+			return errs.Newf(errs.CodeHeld, "the keeper changed while it was being verified: %v", err)
+		}
 		return err
 	}
-	if string(hash) != ev.ContentHash {
+	if ev2.Token.NLink != 1 {
+		return errs.Newf(errs.CodeHeld,
+			"the keeper now has %d links; another name can outlive the copy being deleted",
+			ev2.Token.NLink)
+	}
+	if ev2.Token.Size != ev.Token.Size || ev2.Token.MTimeNS != ev.Token.MTimeNS {
+		return errs.New(errs.CodeHeld, "the keeper was modified after the plan was made")
+	}
+	if ev2.Token.Mode != ev.Token.Mode || ev2.Token.UID != ev.Token.UID || ev2.Token.GID != ev.Token.GID {
+		return errs.New(errs.CodeHeld,
+			"the keeper's permissions or ownership changed after the plan was made")
+	}
+	if string(ev2.Content) != ev.ContentHash {
 		return errs.New(errs.CodeHeld, "the keeper's content no longer matches the plan")
+	}
+	if string(ev2.Metadata) != ev.MetadataHash {
+		return errs.New(errs.CodeHeld, "the keeper's extended metadata no longer matches the plan")
 	}
 	if it.ContentHash != nil && *it.ContentHash != ev.ContentHash {
 		return errs.New(errs.CodeHeld, "the keeper does not hold the same content as this copy")
 	}
+
+	// Finally, compare the two files byte for byte. The quarantined copy is still
+	// in the vault, so the comparison is against the bytes that are about to be
+	// deleted, not against a remembered digest.
+	obj, closeObj, err := openQuarantined(ctx, d.Registrar, it)
+	if err != nil {
+		return errs.Newf(errs.CodeHeld, "the quarantined copy cannot be read for comparison: %v", err)
+	}
+	defer closeObj()
+	same, err := execute.CompareFiles(f, obj, opt)
+	if err != nil {
+		return err
+	}
+	if !same {
+		return errs.New(errs.CodeHeld,
+			"the keeper and the quarantined copy hold different bytes despite an equal hash")
+	}
 	return nil
+}
+
+// openQuarantined opens one object inside a scope's private vault.
+func openQuarantined(ctx context.Context, reg *scope.Registrar, it store.Item) (*fsops.File, func(), error) {
+	sc, err := execute.OpenScopeCtx(ctx, reg, it.ScopeID)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	parent, err := sc.Objects.ParentOf(it.ObjectName)
+	if err != nil {
+		sc.Close()
+		return nil, func() {}, err
+	}
+	f, err := fsops.OpenRegularAt(parent, sc.RootDev)
+	if err != nil {
+		parent.Close()
+		sc.Close()
+		return nil, func() {}, err
+	}
+	return f, func() { f.Close(); parent.Close(); sc.Close() }, nil
 }
 
 // SizeOf returns the file size of a candidate; used by callers that cap a plan

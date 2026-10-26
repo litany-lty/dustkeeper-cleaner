@@ -221,6 +221,20 @@ func (s *Store) ListItemsByState(ctx context.Context, scope domain.ScopeID, stat
 // ItemsDueForPurge lists quarantined objects whose retention has elapsed and
 // which have no operation in progress.
 func (s *Store) ItemsDueForPurge(ctx context.Context, scope domain.ScopeID, nowNS int64, limit int) ([]Item, error) {
+	return s.PurgeQueuePage(ctx, scope, nowNS, 0, "", limit)
+}
+
+// PurgeQueuePage returns one page of due objects using a keyset cursor.
+//
+// Why a cursor instead of LIMIT alone: the caller cannot filter "has an active
+// auto-purge grant" in SQL without duplicating the authority rules, so it used to
+// read page one, find every object in it unprocessable, and give up. If the first
+// page was always the same, the authorised objects behind it were never reached in
+// any run. The cursor lets the caller walk the whole queue within one bounded run
+// and stop only when the queue is exhausted or its own allowance is spent.
+func (s *Store) PurgeQueuePage(ctx context.Context, scope domain.ScopeID, nowNS int64,
+	afterDue int64, afterItem string, limit int) ([]Item, error) {
+
 	if limit <= 0 {
 		limit = 100
 	}
@@ -228,7 +242,9 @@ func (s *Store) ItemsDueForPurge(ctx context.Context, scope domain.ScopeID, nowN
  FROM items i
  WHERE i.scope_id=? AND i.state='quarantined' AND i.pending_op_id IS NULL
    AND i.purge_not_before_ns IS NOT NULL AND i.purge_not_before_ns <= ?
- ORDER BY i.purge_not_before_ns LIMIT ?`, string(scope), nowNS, limit)
+   AND (i.purge_not_before_ns > ? OR (i.purge_not_before_ns = ? AND i.item_id > ?))
+ ORDER BY i.purge_not_before_ns, i.item_id LIMIT ?`,
+		string(scope), nowNS, afterDue, afterDue, afterItem, limit)
 	if err != nil {
 		return nil, err
 	}

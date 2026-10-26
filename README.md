@@ -106,10 +106,29 @@ dustkeeper run
 
 ```sh
 go build ./cmd/dustkeeper
-go test ./...
+go test ./...             # 包内测试 + 集成测试；test/eval 默认跳过
 go test -race ./...
-./build/build.sh        # 产物与 SHA256SUMS 写入 dist/
+./build/build.sh          # 开发构建：能建的都建，建不了的跳过并说明
+./build/build.sh --release # 发布构建：缺一个目标就失败
 ```
+
+`build.sh` 有两档，因为"安静地跳过"和"照样发布"不能是同一个结果：
+
+- **开发**：缺交叉 C 编译器时跳过该目标，并打印需要设的变量名。
+- **发布**（`--release` 或 `RELEASE=1`）：`darwin-arm64`、`darwin-amd64`、`linux-amd64`、`linux-arm64` 四个目标必须全部产出，每个产物必须非空、在 macOS 上签名可验、被 `SHA256SUMS` 覆盖并且该文件自身能通过 `-c` 校验。签名失败、校验工具失败、目标缺失、产物为空，任一都退出 1。校验文件只列本轮产出的文件，`dist/` 里的旧产物不会混进来。
+
+二进制通过 cgo 链接 SQLite，交叉编译需要目标平台的 C 编译器（`CC_<os>_<arch>`）。**Linux 的 libc 策略是固定的**：静态链接 musl，`CC_linux_*` 指向 `x86_64-linux-musl-gcc` / `aarch64-linux-musl-gcc`；不产出 glibc 版本，所以每个发布只有一种 libc 说法。Windows 不是目标：本实现依赖 `flock`、`renameatx_np`/`renameat2`、`F_FULLFSYNC` 这些 unix 原语。
+
+### 平台支持
+
+| 平台 | 构建 | 测试 | 判定 |
+|---|---|---|---|
+| darwin/arm64 | 是 | 全量 `go test ./...` + 端到端闭环 | 受支持 |
+| darwin/amd64 (`CC_darwin_amd64`) | 是 | 未在目标机器上跑过 | **实验性** |
+| linux/amd64 (`CC_linux_amd64`) | 是（musl 静态） | 未在目标机器上跑过 | **实验性** |
+| linux/arm64 (`CC_linux_arm64`) | 是（musl 静态） | 未在目标机器上跑过 | **实验性** |
+
+"实验性"是准确说法：这些目标能编译、能通过 `SHA256SUMS` 校验，但没有在真机上跑过"注册 → 计划 → 隔离 → 不覆盖恢复 → 到期清空 → 重启对账"。验收记录见 `docs/compliance.md`。
 
 10 万文件的内存基准（会真的创建文件，默认不跑）：
 
@@ -122,7 +141,19 @@ DUSTKEEPER_BENCH=1 go test ./test/bench -run TestScan -v
 fuzz 目标：`FuzzMatchName`、`FuzzHasDirPrefix`、`FuzzSplitRelative`、`FuzzValidateName`、
 `FuzzParseDraft`、`FuzzParseRule`。种子每次 `go test` 都跑；深挖用 `-fuzz`。
 
-二进制通过 cgo 链接 SQLite；交叉编译需要目标平台的 C 编译器（见 `build/build.sh` 里的 `CC_<os>_<arch>`）。
+### 真实模型评测（不进单测）
+
+`internal/rules` 的中文语料测试只证明"这些答案能被 DSL 表达"，它不调用模型。语义那一半在 `test/eval`：
+
+```sh
+DUSTKEEPER_EVAL_BASE_URL=https://host/v1/chat/completions \
+DUSTKEEPER_EVAL_MODEL=some-model \
+DUSTKEEPER_EVAL_API_KEY=... \
+DUSTKEEPER_EVAL_OUT=/tmp/eval.jsonl \
+go test ./test/eval -v -count=1
+```
+
+每条语料写成一行 JSON：provider、model、prompt digest、输入、原始输出、宿主决定、是否与预期一致。没有 `DUSTKEEPER_EVAL_BASE_URL` 时它 `t.Skip`，所以网络不是 `go test ./...` 的前提。
 
 ## 协议
 
