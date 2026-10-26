@@ -1,0 +1,14 @@
+# Build output. Binaries are published as release assets, not committed.
+/dist/
+
+# Local editor / tooling state (WorkBuddy project memory, not part of the source).
+/.workbuddy/
+
+# Go test and coverage artefacts.
+*.test
+*.out
+coverage.*
+*.prof
+
+# macOS metadata.
+.DS_Store

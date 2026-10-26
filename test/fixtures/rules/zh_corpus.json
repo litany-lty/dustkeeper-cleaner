@@ -1,0 +1,741 @@
+[
+  {
+    "id": "zh-001",
+    "group": "draft",
+    "expect": "draft",
+    "input": "把 exports 里超过 30 天没改过的 zip 文件收起来，至少留 30 天再说。",
+    "note": "年龄与保留期都明确，唯一缺省的是命名与目录条件，用 *.zip 表达。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "exports",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 2592000,
+          "min_size_bytes": 0,
+          "relative_dir_prefixes": [],
+          "basename_patterns": ["*.zip"]
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": [] },
+        "retention_seconds": 2592000
+      }
+    }
+  },
+  {
+    "id": "zh-002",
+    "group": "draft",
+    "expect": "draft",
+    "input": "downloads 里 90 天没动过、大于 100MB 的安装包，先隔离，保留 60 天。",
+    "note": "带体积下界；「安装包」映射为两个后缀模式。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "downloads",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 7776000,
+          "min_size_bytes": 104857600,
+          "relative_dir_prefixes": [],
+          "basename_patterns": ["*.dmg", "*.pkg"]
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": [] },
+        "retention_seconds": 5184000
+      }
+    }
+  },
+  {
+    "id": "zh-003",
+    "group": "draft",
+    "expect": "draft",
+    "input": "exports 下面 reports/ 里 60 天没更新的 csv，排除 2024 年的，保留 45 天。",
+    "note": "目录前缀 + 命名例外，两者都能被 DSL 精确表达。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "exports",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 5184000,
+          "min_size_bytes": 0,
+          "relative_dir_prefixes": ["reports/"],
+          "basename_patterns": ["*.csv"]
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": ["*2024*"] },
+        "retention_seconds": 3888000
+      }
+    }
+  },
+  {
+    "id": "zh-004",
+    "group": "draft",
+    "expect": "draft",
+    "input": "media 里超过 180 天没改过的 mov，除了 keep/ 目录，保留 90 天。",
+    "note": "排除目录，后缀是单个模式。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "media",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 15552000,
+          "min_size_bytes": 0,
+          "relative_dir_prefixes": [],
+          "basename_patterns": ["*.mov"]
+        },
+        "except": { "relative_dir_prefixes": ["keep/"], "basename_patterns": [] },
+        "retention_seconds": 7776000
+      }
+    }
+  },
+  {
+    "id": "zh-005",
+    "group": "draft",
+    "expect": "draft",
+    "input": "originals 里 14 天未修改的临时图片，最大 5MB，留 7 天。",
+    "note": "同时有体积上界与最短保留期（7 天是允许的下限）。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "originals",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 1209600,
+          "min_size_bytes": 0,
+          "max_size_bytes": 5242880,
+          "relative_dir_prefixes": [],
+          "basename_patterns": ["*.png", "*.jpg"]
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": [] },
+        "retention_seconds": 604800
+      }
+    }
+  },
+  {
+    "id": "zh-006",
+    "group": "draft",
+    "expect": "draft",
+    "input": "exports 里 45 天没动的日志，位于 logs/ 下，保留 30 天。",
+    "note": "目录前缀 + 后缀，没有例外。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "exports",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 3888000,
+          "min_size_bytes": 0,
+          "relative_dir_prefixes": ["logs/"],
+          "basename_patterns": ["*.log"]
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": [] },
+        "retention_seconds": 2592000
+      }
+    }
+  },
+  {
+    "id": "zh-007",
+    "group": "draft",
+    "expect": "draft",
+    "input": "downloads 里 365 天没改过的 iso，保留 180 天。",
+    "note": "年龄接近 DSL 允许的年上限。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "downloads",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 31536000,
+          "min_size_bytes": 0,
+          "relative_dir_prefixes": [],
+          "basename_patterns": ["*.iso"]
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": [] },
+        "retention_seconds": 15552000
+      }
+    }
+  },
+  {
+    "id": "zh-008",
+    "group": "draft",
+    "expect": "draft",
+    "input": "exports 里 30 天没改过、名字带「备份」的压缩包，保留 60 天。",
+    "note": "中文子串用 *备份* 表达，通配符只出现在首尾。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "exports",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 2592000,
+          "min_size_bytes": 0,
+          "relative_dir_prefixes": [],
+          "basename_patterns": ["*备份*"]
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": [] },
+        "retention_seconds": 5184000
+      }
+    }
+  },
+  {
+    "id": "zh-009",
+    "group": "draft",
+    "expect": "draft",
+    "input": "media 里 120 天未修改的 aiff 音频，大于 10MB，排除 draft/ 子目录，保留 30 天。",
+    "note": "三个条件同时成立，含一个排除目录。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "media",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 10368000,
+          "min_size_bytes": 10485760,
+          "relative_dir_prefixes": [],
+          "basename_patterns": ["*.aiff"]
+        },
+        "except": { "relative_dir_prefixes": ["draft/"], "basename_patterns": [] },
+        "retention_seconds": 2592000
+      }
+    }
+  },
+  {
+    "id": "zh-010",
+    "group": "draft",
+    "expect": "draft",
+    "input": "tmp_cache 里 7 天没动过的东西，保留 7 天。",
+    "note": "没有命名条件时保持空模式，意味着「任意文件名」，不是「不匹配」。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "tmp_cache",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 604800,
+          "min_size_bytes": 0,
+          "relative_dir_prefixes": [],
+          "basename_patterns": []
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": [] },
+        "retention_seconds": 604800
+      }
+    }
+  },
+  {
+    "id": "zh-011",
+    "group": "draft",
+    "expect": "draft",
+    "input": "exports 里 90 天没改过的、超过 500MB 的 tar.gz，保留 90 天。",
+    "note": "双段后缀是普通模式，不触发 ** 规则。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "exports",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 7776000,
+          "min_size_bytes": 524288000,
+          "relative_dir_prefixes": [],
+          "basename_patterns": ["*.tar.gz"]
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": [] },
+        "retention_seconds": 7776000
+      }
+    }
+  },
+  {
+    "id": "zh-012",
+    "group": "draft",
+    "expect": "draft",
+    "input": "downloads 里 60 天没动过的 pkg 和 dmg，小于 2GB，保留 30 天。",
+    "note": "体积上界与两个后缀模式。",
+    "answer": {
+      "kind": "draft",
+      "dsl": {
+        "dsl_version": 1,
+        "scope_id": "downloads",
+        "action": "quarantine",
+        "match": {
+          "min_mtime_age_seconds": 5184000,
+          "min_size_bytes": 0,
+          "max_size_bytes": 2147483648,
+          "relative_dir_prefixes": [],
+          "basename_patterns": ["*.dmg", "*.pkg"]
+        },
+        "except": { "relative_dir_prefixes": [], "basename_patterns": [] },
+        "retention_seconds": 2592000
+      }
+    }
+  },
+
+  {
+    "id": "zh-101",
+    "group": "unused",
+    "expect": "needs_input",
+    "input": "把 exports 里我没用过的文件清掉，保留 30 天。",
+    "note": "「没用过」没有可量化的时间阈值，DSL 只有 mtime 年龄，必须问清楚。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「没用过」是指多久没有修改过？请给一个天数。",
+        "有没有文件名或子目录的限定，比如只处理 *.zip？"
+      ]
+    }
+  },
+  {
+    "id": "zh-102",
+    "group": "unused",
+    "expect": "needs_input",
+    "input": "downloads 里平时不用的东西收起来。",
+    "note": "「平时不用」既没有时间阈值，也没有保留期。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "多久没有修改才算「平时不用」？",
+        "隔离之后至少保留多少天才允许考虑清空？"
+      ]
+    }
+  },
+  {
+    "id": "zh-103",
+    "group": "unused",
+    "expect": "needs_input",
+    "input": "media 里好久没看的视频处理一下。",
+    "note": "「好久」不可量化；「处理」也不是一个可执行动作。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「好久没看」对应多少天没有修改？",
+        "你希望把它移进隔离区，还是只生成一份报告？"
+      ]
+    }
+  },
+  {
+    "id": "zh-104",
+    "group": "unused",
+    "expect": "needs_input",
+    "input": "tmp_cache 里常年没人访问的文件，保留 7 天。",
+    "note": "访问时间不是 DSL 条件，只能用 mtime 近似，因此要人确认。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "程序只能看到修改时间，看不到访问时间；用「多少天没有修改」来近似可以吗？"
+      ]
+    }
+  },
+  {
+    "id": "zh-105",
+    "group": "unused",
+    "expect": "needs_input",
+    "input": "exports 里最近没打开过的报表。",
+    "note": "既缺年龄阈值，也缺保留期。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "多少天没有修改可以视为「最近没打开过」？",
+        "隔离后至少保留多少天？"
+      ]
+    }
+  },
+  {
+    "id": "zh-106",
+    "group": "unused",
+    "expect": "needs_input",
+    "input": "downloads 里装了就没用过的安装包，保留 30 天。",
+    "note": "「装了就没用过」需要落到 mtime 阈值上。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": ["「装了就没用过」对应多少天没有修改？"]
+    }
+  },
+  {
+    "id": "zh-107",
+    "group": "unused",
+    "expect": "needs_input",
+    "input": "media 里很久没播过的音频，除 keep/ 之外。",
+    "note": "只有排除条件，正向条件完全缺失；保留期也没有。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "除了 keep/ 之外，还要选中哪些文件？需要天数阈值。",
+        "隔离后至少保留多少天？"
+      ]
+    }
+  },
+  {
+    "id": "zh-108",
+    "group": "unused",
+    "expect": "needs_input",
+    "input": "originals 里不太用的旧图。",
+    "note": "「不太用」与「旧」都没有数值。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「旧」是指多少天没有修改？",
+        "「不太用」有没有可以写成文件名模式的判断依据？"
+      ]
+    }
+  },
+
+  {
+    "id": "zh-201",
+    "group": "negation",
+    "expect": "needs_input",
+    "input": "别删 exports 里的发票扫描件。",
+    "note": "整句只有否定，没有说明要清理什么；DSL 无法只用例外构成条件。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "除了发票扫描件，哪些文件应该被选中？需要天数阈值。",
+        "发票扫描件有没有统一的文件名或所在目录，用来写例外？"
+      ]
+    }
+  },
+  {
+    "id": "zh-202",
+    "group": "negation",
+    "expect": "needs_input",
+    "input": "不要动 keep/ 目录，其它随便。",
+    "note": "「其它随便」不可执行：没有年龄、没有保留期、没有范围。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "keep/ 之外，哪些文件可以动？给一个「多少天没有修改」的阈值。",
+        "隔离后至少保留多少天？"
+      ]
+    }
+  },
+  {
+    "id": "zh-203",
+    "group": "negation",
+    "expect": "needs_input",
+    "input": "exports 里不要碰 .env，剩下的清掉。",
+    "note": "排除条件明确，正向条件（年龄、保留期）仍缺失。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "除了 .env，剩下的文件要满足多少天没有修改？",
+        "隔离后至少保留多少天？"
+      ]
+    }
+  },
+  {
+    "id": "zh-204",
+    "group": "negation",
+    "expect": "needs_input",
+    "input": "downloads 里除了正在下载的，其它都收起来。",
+    "note": "「正在下载」没有可判定的形式，程序也不会去猜哪个文件被占用。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「正在下载」的文件有固定的后缀或目录吗？否则无法写成例外。",
+        "其余文件多少天没有修改才可以收起来？"
+      ]
+    }
+  },
+  {
+    "id": "zh-205",
+    "group": "negation",
+    "expect": "needs_input",
+    "input": "不要把 media 里的原始素材动掉。",
+    "note": "纯否定，没有正向条件。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "原始素材之外的哪些文件需要被选中？",
+        "原始素材放在哪个目录或以什么命名开头，用来写例外？"
+      ]
+    }
+  },
+  {
+    "id": "zh-206",
+    "group": "negation",
+    "expect": "needs_input",
+    "input": "media 里不要清掉最近拍的，只清老的。",
+    "note": "「最近」与「老」都是相对的，需要落到具体天数。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "多少天之内算「最近拍的」？这个天数会写成例外条件。",
+        "隔离后至少保留多少天？"
+      ]
+    }
+  },
+  {
+    "id": "zh-207",
+    "group": "negation",
+    "expect": "needs_input",
+    "input": "tmp_cache 里别动今天的东西。",
+    "note": "「今天」可以表达成 1 天，但正向条件与保留期都没给。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "今天之外，多少天没有修改的文件可以动？",
+        "隔离后至少保留多少天？"
+      ]
+    }
+  },
+  {
+    "id": "zh-208",
+    "group": "negation",
+    "expect": "needs_input",
+    "input": "exports 里不要删除任何 zip，只收 csv。",
+    "note": "「收」可以理解为隔离，但缺年龄与保留期。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "csv 需要多少天没有修改才收？",
+        "隔离后至少保留多少天？"
+      ]
+    }
+  },
+
+  {
+    "id": "zh-301",
+    "group": "exception",
+    "expect": "needs_input",
+    "input": "downloads 里 60 天没动的包都收起来，除了重要的那些，保留 30 天。",
+    "note": "「重要」无法写成目录前缀或文件名模式，例外不可表达。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「重要的那些」可以写成文件名模式或所在目录吗？",
+        "如果无法归类，是否先不设例外，由你在计划里逐个排除？"
+      ]
+    }
+  },
+  {
+    "id": "zh-302",
+    "group": "exception",
+    "expect": "needs_input",
+    "input": "exports 里 90 天没改的旧文件收起来，保留 60 天，别把客户资料算进去。",
+    "note": "「客户资料」是业务概念，需要落到路径或命名上。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "客户资料存放在哪个子目录，或以什么命名开头？",
+        "命名不统一的话，是否去掉这个例外、改为在计划里逐个排除？"
+      ]
+    }
+  },
+  {
+    "id": "zh-303",
+    "group": "exception",
+    "expect": "needs_input",
+    "input": "media 里 180 天没动的视频，除了我标记过的，保留 90 天。",
+    "note": "程序没有「标记」概念，也没有读取 Finder 标签的能力。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「标记过」在文件系统上没有对应字段；能不能改成重命名或移动到固定目录？"
+      ]
+    }
+  },
+  {
+    "id": "zh-304",
+    "group": "exception",
+    "expect": "needs_input",
+    "input": "tmp_cache 里 30 天没动的清掉，除了别的程序还在用的，保留 7 天。",
+    "note": "「还在用」是运行时状态，规则是离线判定，无法表达。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「还在用」的文件有固定后缀（如 .lock）或目录吗？",
+        "没有的话，是否接受先隔离、观察一段时间再清空？"
+      ]
+    }
+  },
+  {
+    "id": "zh-305",
+    "group": "exception",
+    "expect": "needs_input",
+    "input": "exports 里 45 天没改过的 csv，保留 30 天，除了财务那边的。",
+    "note": "「财务那边」指向不明，可能是目录也可能是文件名。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "财务的文件在哪个子目录下？",
+        "它们的文件名有共同前缀或后缀吗？"
+      ]
+    }
+  },
+  {
+    "id": "zh-306",
+    "group": "exception",
+    "expect": "needs_input",
+    "input": "originals 里 120 天没改的图都收起来，除了跟当前项目有关的，保留 30 天。",
+    "note": "「当前项目」随时间变化，规则是冻结的，无法跟随。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「当前项目」对应哪个子目录或哪些文件名模式？",
+        "这个例外会随项目变化的话，是否改用路径保护而不是规则例外？"
+      ]
+    }
+  },
+
+  {
+    "id": "zh-401",
+    "group": "multi_threshold",
+    "expect": "needs_input",
+    "input": "exports 里超过 30 天没改、小于 100MB、且不是 zip 的文件收起来。",
+    "note": "多个阈值都在，但整句没有保留期；保留期不能由程序猜。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": ["隔离之后至少要保留多少天才允许考虑清空？"]
+    }
+  },
+  {
+    "id": "zh-402",
+    "group": "multi_threshold",
+    "expect": "needs_input",
+    "input": "downloads 里 60 天没动、大于 50MB、比上次检查又大了的包收起来，保留 30 天。",
+    "note": "「比上次检查又大了」需要历史快照，一期规则不保存历史大小。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "程序不保留历史大小，无法判断「又大了」；可以改成「大于某个体积」吗？"
+      ]
+    }
+  },
+  {
+    "id": "zh-403",
+    "group": "multi_threshold",
+    "expect": "needs_input",
+    "input": "exports 里 30 天没改、体积超过 1GB、重复的报表收起来，保留 30 天。",
+    "note": "「重复」属于精确查重（dedup），不能和规则条件混在一条规则里。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「重复」要不要改用 dedup 单独生成计划？规则只按年龄与体积选，可以吗？"
+      ]
+    }
+  },
+  {
+    "id": "zh-404",
+    "group": "multi_threshold",
+    "expect": "needs_input",
+    "input": "media 里 90 天没动、码率低于 2Mbps 的视频收起来，保留 30 天。",
+    "note": "码率需要读取媒体容器元数据，一期只读文件系统元数据。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "一期只看文件系统元数据，读不到码率；能改用体积区间或文件名模式吗？"
+      ]
+    }
+  },
+  {
+    "id": "zh-405",
+    "group": "multi_threshold",
+    "expect": "needs_input",
+    "input": "exports 里 30 天没改、名字以 _tmp 结尾、但不要太旧的收起来，保留 30 天。",
+    "note": "「30 天没改」与「不要太旧」互相冲突，先解释再谈规则。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "已经写了 30 天没修改，「不要太旧」是额外的上限吗？请给出上限天数。"
+      ]
+    }
+  },
+  {
+    "id": "zh-406",
+    "group": "multi_threshold",
+    "expect": "needs_input",
+    "input": "tmp_cache 里 14 天没动、单个文件小于 1MB、总数不超过 1000 个的清掉，保留 7 天。",
+    "note": "「总数不超过 1000」是运行预算，不是规则条件；两者必须分开批准。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": [
+        "「总数不超过 1000 个」请通过授权额度（max_files）设定，规则本身不限制数量，可以吗？"
+      ]
+    }
+  },
+  {
+    "id": "zh-407",
+    "group": "multi_threshold",
+    "expect": "needs_input",
+    "input": "downloads 里 45 天没动、后缀是 .zip 或 .rar 或 .7z 的收起来。",
+    "note": "后缀集合可以表达，但缺保留期。",
+    "answer": {
+      "kind": "needs_input",
+      "questions": ["隔离后至少保留多少天？"]
+    }
+  },
+
+  {
+    "id": "zh-501",
+    "group": "unsupported",
+    "expect": "unsupported",
+    "input": "把 exports 里所有文件立刻永久删除。",
+    "note": "规则只能请求隔离，永久删除必须走另一次带保留期的批准。",
+    "answer": {
+      "kind": "unsupported",
+      "reason": "规则只能表达隔离条件；永久删除需要单独的保留期与清空授权，不能由一条规则完成。"
+    }
+  },
+  {
+    "id": "zh-502",
+    "group": "unsupported",
+    "expect": "unsupported",
+    "input": "清空整个 /Users/me/Downloads 目录。",
+    "note": "规则只接受已注册的 scope ID，绝不接受绝对路径。",
+    "answer": {
+      "kind": "unsupported",
+      "reason": "规则不能引用绝对路径，也不能作用于未注册的目录；请先把它注册为 scope。"
+    }
+  },
+  {
+    "id": "zh-503",
+    "group": "unsupported",
+    "expect": "unsupported",
+    "input": "删掉所有 .git 目录。",
+    "note": "一期只移动文件，不删除目录，也不递归处理目录。",
+    "answer": {
+      "kind": "unsupported",
+      "reason": "这条规则选择的是目录，而一期只对普通文件执行隔离，无法表达「删除目录」。"
+    }
+  },
+  {
+    "id": "zh-504",
+    "group": "unsupported",
+    "expect": "unsupported",
+    "input": "帮我把这段时间的重复文件都删了，不用问我。",
+    "note": "要求跳过复核；查重计划必须显式确认写入方已停止。",
+    "answer": {
+      "kind": "unsupported",
+      "reason": "跳过复核的请求无法接受：查重计划需要显式确认，且程序永不执行未经审阅的删除。"
+    }
+  },
+  {
+    "id": "zh-505",
+    "group": "unsupported",
+    "expect": "unsupported",
+    "input": "给我改成每天自动永久清空，不用保留期。",
+    "note": "保留期是 DSL 的必填下限，不能被关掉。",
+    "answer": {
+      "kind": "unsupported",
+      "reason": "保留期是强制的：没有至少 7 天的保留期，任何对象都不会进入可清空状态。"
+    }
+  },
+  {
+    "id": "zh-506",
+    "group": "unsupported",
+    "expect": "unsupported",
+    "input": "exports 里不要删除任何东西，只报告。",
+    "note": "「只报告」不需要规则，`scan` 与 `status` 已经提供。",
+    "answer": {
+      "kind": "unsupported",
+      "reason": "只报告不需要规则：扫描与状态查询已经覆盖，规则的存在只会在被授权后移动文件。"
+    }
+  }
+]
