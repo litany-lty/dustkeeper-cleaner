@@ -234,6 +234,12 @@ func (a FileIdentity) IsZero() bool { return a.Inode == 0 && a.Device == 0 && a.
 
 // ChangeToken detects that the object behind a path changed. atime is excluded:
 // reading a file to hash it changes it.
+//
+// Native inode/file flags are deliberately not here. They are only available
+// from an open descriptor, and a token can be produced from a directory entry,
+// so carrying them in the token created two different answers for one file
+// depending on who asked. They live in MetadataEvidence instead, which is only
+// ever produced from a descriptor.
 type ChangeToken struct {
 	Size         int64  `json:"size"`
 	MTimeNS      int64  `json:"mtime_ns"`
@@ -242,7 +248,6 @@ type ChangeToken struct {
 	Mode         uint32 `json:"mode"`
 	UID          uint32 `json:"uid"`
 	GID          uint32 `json:"gid"`
-	Flags        uint64 `json:"flags"`
 	MetadataHash Digest `json:"metadata_hash,omitempty"`
 }
 

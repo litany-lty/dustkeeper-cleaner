@@ -17,6 +17,10 @@ import (
 // object; anything larger is not one, and reading it would only waste memory.
 const maxMarkerBytes = 64 << 10
 
+// maxNonceBytes bounds the creation-evidence read. The value is an ID, not a
+// document.
+const maxNonceBytes = 256
+
 // VaultExpect says what the private management directory of one scope must be.
 //
 // The same struct is used when the directory is created and on every later open,
@@ -43,6 +47,14 @@ type VaultExpect struct {
 	// anything else. It is set by every caller that could change a business file,
 	// which is what makes two state directories mutually exclusive over one tree.
 	Lock bool
+	// ScopeID, RootInode, VolumeID and ScopeKind are what the vault binding must
+	// name. They are empty only while the vault is being created, and the binding
+	// is compared against them on every later open: a management directory that
+	// belongs to a different scope row is not a directory this run may use.
+	ScopeID   string
+	RootInode uint64
+	VolumeID  string
+	ScopeKind string
 }
 
 // For returns the fsops contract for one object inside the vault.
@@ -56,6 +68,29 @@ func (v VaultExpect) For(isDir bool) fsops.PrivateExpect {
 	}
 	return e
 }
+
+// VaultBindV1 is the record that ties one objects directory to one scope row.
+//
+// It is a separate file from the owner marker on purpose. The marker answers
+// "which instance owns this tree" and is read by registration's ancestor probe;
+// the binding answers "which scope row describes this directory", which is the
+// question a swapped or restored directory fails. Keeping them apart means the
+// ancestor probe never has to understand a scope row it cannot see.
+type VaultBindV1 struct {
+	FormatVersion   int    `json:"format_version"`
+	ScopeID         string `json:"scope_id"`
+	RootInode       uint64 `json:"root_inode"`
+	VolumeID        string `json:"volume_id"`
+	ScopeKind       string `json:"kind"`
+	ObjectsNonce    string `json:"objects_nonce"`
+	ObjectsIdentity string `json:"objects_identity"`
+	AnchorTag       string `json:"anchor_tag"`
+	AnchorIdentity  string `json:"anchor_identity"`
+}
+
+// anchorTagOffset is where the anchor's identifying value lives. Offset zero is
+// where every barrier writes its marker, so the tag sits past it.
+const anchorTagOffset = 4096
 
 // VaultHandles are the opened and validated private objects of a mutable scope.
 // Close releases them in the order they were opened.
@@ -181,11 +216,47 @@ func OpenVault(root *fsops.Root, expect VaultExpect) (*VaultHandles, error) {
 			"the durability anchor is on a different device than the objects directory"))
 	}
 
-	identity, err := VaultIdentity(h.Objects)
+	bind, err := readBind(h.Vault, expect)
 	if err != nil {
 		return fail(err)
 	}
-	if expect.Identity != "" && expect.Identity != identity { // The registered vault was replaced. Re-registering is the only way to
+
+	// The nonce lives inside the objects directory, so it is the one fact that a
+	// replacement cannot carry over: deleting and recreating the directory, or
+	// restoring it from a snapshot taken before the nonce existed, loses it.
+	nonce, err := h.Objects.ReadFileAt(domain.VaultNonceName, maxNonceBytes)
+	if err != nil {
+		return fail(errs.Newf(errs.CodeScopeChanged,
+			"the objects directory carries no creation evidence: %v", err))
+	}
+	if string(nonce) != bind.ObjectsNonce {
+		return fail(errs.New(errs.CodeScopeChanged,
+			"the objects directory was not created by this vault"))
+	}
+
+	anchorID, _, err := h.Anchor.Stat()
+	if err != nil {
+		return fail(errs.Wrap(errs.CodeAccessDenied, err))
+	}
+	tag, err := fsops.ReadTag(h.Anchor.FD(), anchorTagOffset, maxNonceBytes)
+	if err != nil {
+		return fail(errs.Wrap(errs.CodeAccessDenied, err))
+	}
+	if string(tag) != bind.AnchorTag || AnchorIdentity(anchorID, string(tag)) != bind.AnchorIdentity {
+		return fail(errs.New(errs.CodeScopeChanged,
+			"the durability anchor is not the one this vault was registered with"))
+	}
+
+	identity, err := VaultIdentity(h.Objects, string(nonce))
+	if err != nil {
+		return fail(err)
+	}
+	if identity != bind.ObjectsIdentity {
+		return fail(errs.New(errs.CodeScopeChanged,
+			"the objects directory is not the one this vault was bound to"))
+	}
+	if expect.Identity != "" && expect.Identity != identity {
+		// The scope row names a different vault. Re-registering is the only way to
 		// accept the new object directory, because every retained object is
 		// addressed by the old one.
 		return fail(errs.Newf(errs.CodeScopeChanged,
@@ -222,25 +293,114 @@ func verifyMarker(vault *fsops.Dir, expect VaultExpect) error {
 		return errs.Newf(errs.CodeScopeOverlap,
 			"this tree is managed by another Dustkeeper instance (%s)", m.InstanceID)
 	}
+	// The marker names the scope, root and kind it was written for. Comparing
+	// them is what turns "a marker exists" into "this marker describes this
+	// tree": a marker copied from another scope has the right shape and the
+	// wrong subject.
+	switch {
+	case expect.ScopeID != "" && m.ScopeID != expect.ScopeID:
+		return errs.Newf(errs.CodeScopeChanged,
+			"the owner marker names scope %q, this scope is %q", m.ScopeID, expect.ScopeID)
+	case expect.VolumeID != "" && m.VolumeID != expect.VolumeID:
+		return errs.Newf(errs.CodeScopeChanged,
+			"the owner marker was written on volume %q, this volume is %q", m.VolumeID, expect.VolumeID)
+	case expect.RootInode != 0 && m.RootInode != expect.RootInode:
+		return errs.New(errs.CodeScopeChanged,
+			"the owner marker was written for a different root directory")
+	case expect.ScopeKind != "" && m.Kind != expect.ScopeKind:
+		return errs.Newf(errs.CodeScopeChanged,
+			"the owner marker was written for a %q scope, this scope is %q", m.Kind, expect.ScopeKind)
+	}
 	return nil
+}
+
+// readBind loads and checks the vault binding against the scope contract.
+func readBind(vault *fsops.Dir, expect VaultExpect) (VaultBindV1, error) {
+	var b VaultBindV1
+	if _, _, err := vault.StatEntryPrivate("vault-bind.json", expect.For(false)); err != nil {
+		return b, refuse("vault binding", err)
+	}
+	body, err := vault.ReadFileAt("vault-bind.json", maxMarkerBytes)
+	if err != nil {
+		return b, refuse("vault binding", err)
+	}
+	if err := json.Unmarshal(body, &b); err != nil {
+		return b, errs.Newf(errs.CodeScopeChanged, "the vault binding is unreadable: %v", err)
+	}
+	if b.FormatVersion != 1 {
+		return b, errs.Newf(errs.CodeScopeChanged,
+			"the vault binding has format version %d, this build understands 1", b.FormatVersion)
+	}
+	if b.ObjectsNonce == "" || b.ObjectsIdentity == "" || b.AnchorIdentity == "" {
+		return b, errs.New(errs.CodeScopeChanged, "the vault binding records no identity")
+	}
+	switch {
+	case expect.ScopeID != "" && b.ScopeID != expect.ScopeID:
+		return b, errs.Newf(errs.CodeScopeChanged,
+			"this management directory belongs to scope %q, not %q", b.ScopeID, expect.ScopeID)
+	case expect.VolumeID != "" && b.VolumeID != expect.VolumeID:
+		return b, errs.Newf(errs.CodeScopeChanged,
+			"this management directory was created on volume %q, not %q", b.VolumeID, expect.VolumeID)
+	case expect.RootInode != 0 && b.RootInode != expect.RootInode:
+		return b, errs.New(errs.CodeScopeChanged,
+			"this management directory was created inside a different root directory")
+	case expect.ScopeKind != "" && b.ScopeKind != expect.ScopeKind:
+		return b, errs.Newf(errs.CodeScopeChanged,
+			"this management directory was created for a %q scope, not %q", b.ScopeKind, expect.ScopeKind)
+	}
+	return b, nil
 }
 
 // VaultIdentity derives the digest that identifies one objects directory.
 //
 // It is a function rather than a copy of the expression at each call site so
 // that registration and every later open hash exactly the same facts.
-func VaultIdentity(objects *fsops.Dir) (string, error) {
+func VaultIdentity(objects *fsops.Dir, nonce string) (string, error) {
 	id, _, err := objects.Stat()
 	if err != nil {
 		return "", errs.Wrap(errs.CodeAccessDenied, err)
 	}
-	return FormatVaultIdentity(id), nil
+	birth, birthOK, generation, generationOK := fsops.CreationEvidence(objects.DirFD())
+	payload := fmt.Sprintf("%s|%d|%d|%s|%s", id.VolumeID, id.Device, id.Inode,
+		optionalInt(birth, birthOK), optionalUint(generation, generationOK))
+	sum := sha256.Sum256([]byte(payload))
+	return "vault:" + hex.EncodeToString(sum[:]), nil
 }
 
-// FormatVaultIdentity is VaultIdentity without the open handle.
-func FormatVaultIdentity(id domain.FileIdentity) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d", id.VolumeID, id.Device, id.Inode)))
+// FormatVaultIdentity digests the facts that identify one management object.
+//
+// The device and inode alone cannot distinguish a replacement: a filesystem may
+// hand the same inode number to the directory that replaced the deleted one.
+// The nonce carried inside the objects directory closes that, and VaultIdentity
+// folds in the birth time and generation as well when the platform has them.
+func FormatVaultIdentity(id domain.FileIdentity, nonce string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d|%s", id.VolumeID, id.Device, id.Inode, nonce)))
 	return "vault:" + hex.EncodeToString(sum[:])
+}
+
+// AnchorIdentity names the durability anchor.
+//
+// Device and inode are not enough on their own: a deleted and recreated anchor
+// can be handed the same inode number, and then a barrier would be issued on a
+// file this vault never installed. The tag written past the barrier area is what
+// closes that, because a replacement does not have it.
+func AnchorIdentity(id domain.FileIdentity, tag string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("anchor|%s|%d|%d|%s", id.VolumeID, id.Device, id.Inode, tag)))
+	return "anchor:" + hex.EncodeToString(sum[:])
+}
+
+func optionalInt(v int64, ok bool) string {
+	if !ok {
+		return "none"
+	}
+	return fmt.Sprintf("%d", v)
+}
+
+func optionalUint(v uint64, ok bool) string {
+	if !ok {
+		return "none"
+	}
+	return fmt.Sprintf("%d", v)
 }
 
 // CurrentOwnerUID is the uid that must own every management object.

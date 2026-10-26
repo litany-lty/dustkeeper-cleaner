@@ -235,6 +235,22 @@ func (r *Root) Identity() (domain.RootIdentity, error) {
 	}, nil
 }
 
+// CreationEvidence returns the stable creation facts of an open descriptor.
+//
+// Whether either fact exists depends on the platform and the filesystem, and a
+// caller that treats "unavailable" as "unchanged" gets exactly the inode-reuse
+// acceptance R01 describes. Both are reported separately so the caller can
+// record which of them it actually had.
+func CreationEvidence(fd int) (birthNS int64, birthOK bool, generation uint64, generationOK bool) {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return 0, false, 0, false
+	}
+	birthNS, birthOK = birthTimeOfFD(fd)
+	generation, generationOK = generationOf(&st)
+	return birthNS, birthOK, generation, generationOK
+}
+
 // Dir is an open directory inside a root.
 type Dir struct {
 	f      *os.File
@@ -383,12 +399,7 @@ func (f *File) Stat() (domain.FileIdentity, domain.ChangeToken, error) {
 	if err := unix.Fstat(f.fd, &st); err != nil {
 		return domain.FileIdentity{}, domain.ChangeToken{}, fmt.Errorf("fsops: stat file: %w", err)
 	}
-	tok := tokenOf(&st, "")
-	// The native inode flags are not in the portable stat contract, so they are
-	// filled in here rather than by tokenOf. Leaving them out would make every
-	// metadata digest claim "no flags" on a platform that has them.
-	tok.Flags = tokenFlags(f.fd, &st)
-	return identityOf(&st), tok, nil
+	return identityOf(&st), tokenOf(&st, ""), nil
 }
 
 // Read reads from the descriptor.
@@ -437,13 +448,11 @@ func OpenRegularAt(p *Parent, rootDev uint64) (*File, error) {
 		unix.Close(fd)
 		return nil, fmt.Errorf("%w: %q is %s", ErrNotRegular, p.name, kindOf(&st))
 	}
-	tok := tokenOf(&st, "")
-	tok.Flags = tokenFlags(fd, &st)
 	return &File{
 		f:        os.NewFile(uintptr(fd), p.name),
 		fd:       fd,
 		Identity: identityOf(&st),
-		Token:    tok,
+		Token:    tokenOf(&st, ""),
 	}, nil
 }
 

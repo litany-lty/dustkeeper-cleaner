@@ -24,4 +24,16 @@ const (
 	// inside the management directory so that a second installation cannot act on
 	// the same tree even though its own instance lock is free.
 	VaultScopeLock = "scope.lock"
+	// VaultNonceName is the random per-vault value stored inside the objects
+	// directory. It is the creation evidence that survives inode reuse: a
+	// directory that was deleted and recreated cannot carry the old value, and a
+	// copy of the directory carries a different inode and birth time.
+	VaultNonceName = ".dk-vault-nonce"
+	// VaultNonce is VaultNonceName inside the objects directory.
+	VaultNonce = VaultObjects + "/" + VaultNonceName
+	// VaultBind records which scope row this vault belongs to, which objects
+	// directory it was created for, and which anchor it flushes through. A
+	// management directory detached from its scope row looks exactly like a
+	// valid one until this record is compared.
+	VaultBind = VaultDirName + "/vault-bind.json"
 )

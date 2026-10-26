@@ -15,6 +15,9 @@ import (
 // private-object contract and must not be used for business actions.
 var ErrNotPrivate = errors.New("fsops: management object is not private")
 
+// OwnerAny is the explicit "any owner" value. A zero OwnerUID means root.
+const OwnerAny = ^uint32(0)
+
 // PrivateExpect is the contract every object inside a private management
 // directory has to satisfy before it may carry business meaning.
 //
@@ -26,9 +29,12 @@ var ErrNotPrivate = errors.New("fsops: management object is not private")
 // business file. Those are all detectable before any business change, and the
 // answer is to refuse rather than to "repair" silently.
 type PrivateExpect struct {
-	// OwnerUID is the only uid allowed to own the object. Zero means "the
-	// effective uid of this process", which is resolved by the caller because
-	// fsops does not import os/user.
+	// OwnerUID is the only uid allowed to own the object, compared exactly.
+	//
+	// Zero is not "unset": it is root. Treating it as unset meant that a
+	// management object chowned to another uid was accepted whenever Dustkeeper
+	// ran as root, which is the configuration where it matters most. Callers that
+	// legitimately have no opinion pass OwnerAny instead of zero.
 	OwnerUID uint32
 	// MaxPerm is the widest permission accepted. Any bit outside it means the
 	// object is reachable by someone other than its owner.
@@ -47,7 +53,7 @@ func (e PrivateExpect) VerifyToken(what string, tok domain.ChangeToken, dev uint
 	if e.RootDev != 0 && dev != e.RootDev {
 		return fmt.Errorf("%w: %s is on device %d, want %d", ErrNotPrivate, what, dev, e.RootDev)
 	}
-	if e.OwnerUID != 0 && tok.UID != e.OwnerUID {
+	if e.OwnerUID != OwnerAny && tok.UID != e.OwnerUID {
 		return fmt.Errorf("%w: %s is owned by uid %d, want %d", ErrNotPrivate, what, tok.UID, e.OwnerUID)
 	}
 	// Mode carries the file-type bits on both platforms; only the permission
@@ -176,7 +182,7 @@ func (d *Dir) LockFile(name string) (*File, error) {
 		return nil, err
 	}
 	fd, err := unix.Openat(d.fd, name,
-		unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+		unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return nil, fmt.Errorf("%w: %q", ErrSymlink, name)
@@ -234,6 +240,30 @@ func deviceOfFD(fd int) (uint64, error) {
 	return devOf(&st), nil
 }
 
+// WriteTag writes a small identifying value at a fixed offset inside an open
+// private file.
+//
+// The durability anchor cannot carry its identity at offset zero: every barrier
+// overwrites that area with a fresh marker. A tag further in survives, and a
+// replaced anchor - the case R01 accepts today, because a recreated file can be
+// handed the same inode number - has nothing at that offset.
+func WriteTag(fd int, offset int64, tag []byte) error {
+	if _, err := unix.Pwrite(fd, tag, offset); err != nil {
+		return fmt.Errorf("fsops: write tag at %d: %w", offset, err)
+	}
+	return nil
+}
+
+// ReadTag reads a bounded tag from a fixed offset inside an open private file.
+func ReadTag(fd int, offset int64, limit int) ([]byte, error) {
+	buf := make([]byte, limit)
+	n, err := unix.Pread(fd, buf, offset)
+	if err != nil {
+		return nil, fmt.Errorf("fsops: read tag at %d: %w", offset, err)
+	}
+	return buf[:n], nil
+}
+
 // ReadFileAt reads one small regular file inside d through a descriptor opened
 // with O_NOFOLLOW.
 //
@@ -244,7 +274,11 @@ func (d *Dir) ReadFileAt(name string, limit int64) ([]byte, error) {
 	if err := ValidateName(name); err != nil {
 		return nil, err
 	}
-	fd, err := unix.Openat(d.fd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	// O_NONBLOCK is what keeps a mis-typed management object from hanging the
+	// process: opening a FIFO for reading waits for a writer, and the wait happens
+	// before any type check could refuse it. Non-blocking open returns at once,
+	// and for a regular file the flag has no effect on reads.
+	fd, err := unix.Openat(d.fd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return nil, fmt.Errorf("%w: %q", ErrSymlink, name)

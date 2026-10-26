@@ -129,6 +129,61 @@ func TestDuplicateIsPurgedWhenTheKeeperIsIntact(t *testing.T) {
 	}
 }
 
+// A18: an untouched keeper carrying a non-zero inode flag must still be purged.
+//
+// The scanned token is produced from a directory entry; the verified token is
+// produced from the open descriptor. If the two are not the same fact, a file
+// nobody touched looks modified and the duplicate is held forever.
+func TestKeeperWithAnInodeFlagIsStillPurged(t *testing.T) {
+	e := newEnv(t)
+	sc := e.addScope("dups", domain.KindAssisted)
+	e.writeFile("dups", "keeper.bin", "identical-payload", 40*24*time.Hour)
+	e.writeFile("dups", "copy.bin", "identical-payload", 40*24*time.Hour)
+
+	keeper := filepath.Join(e.base, "trees", "dups", "keeper.bin")
+	copyPath := filepath.Join(e.base, "trees", "dups", "copy.bin")
+	flags := markInodeFlag(t, keeper)
+	t.Logf("inode flags on the keeper: %#x", flags)
+	markInodeFlag(t, copyPath)
+
+	e.scan(sc.ID)
+	res, err := e.det.Detect(context.Background(), e.scopeCtx(sc.ID), nil)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if res.PlannableGroups != 1 {
+		t.Fatalf("the flagged pair was not planned as one group: %+v", res.Notes)
+	}
+	p, items, err := e.det.CreatePlan(context.Background(), e.scopeCtx(sc.ID), res.Groups)
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	if _, err := e.apply(sc, p, p.Digest); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected one isolated copy, got %d", len(items))
+	}
+	it, err := e.st.GetItem(context.Background(), items[0].ID)
+	if err != nil {
+		t.Fatalf("get item: %v", err)
+	}
+	e.clock.Advance(31 * 24 * time.Hour)
+
+	out, err := e.purgeAttempt(t, duplicateFixture{
+		scope:     sc,
+		item:      it,
+		keeperRel: "keeper.bin",
+		keeperRaw: keeper,
+	})
+	if err != nil {
+		t.Fatalf("a flagged but untouched keeper blocked the purge: %v", err)
+	}
+	if out.Completed != 1 {
+		t.Fatalf("the duplicate was not purged: %+v", out)
+	}
+}
+
 // V15: the keeper's permissions changed. The bytes are identical, so a hash-only
 // check would have let the purge through; equivalence is not only about bytes.
 func TestDuplicateIsHeldWhenTheKeeperPermissionsChange(t *testing.T) {

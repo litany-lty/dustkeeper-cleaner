@@ -243,35 +243,47 @@ func TestIdentityAndToken(t *testing.T) {
 // filesystem. On a case-insensitive APFS volume "Case.TXT" and "case.txt" are
 // the same object, which is why protection checks resolve kernel identities
 // instead of comparing strings.
+//
+// The question is asked of the leaf, not of the parent. OpenParent opens the
+// directory that contains the name, so it succeeds for any spelling on any
+// filesystem; a test that treats "the parent opened" as "the name exists"
+// reports an alias and then fails on the lookup. That was the Ubuntu failure:
+// the branch that was supposed to say "this filesystem is case sensitive" sat
+// in the wrong place.
 func TestAPFSNameAlias(t *testing.T) {
 	r, dir := newRoot(t)
 	writeFile(t, dir, "Case.TXT", "same object")
 
 	p1, err := r.OpenParent([]byte("Case.TXT"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open the exact name: %v", err)
 	}
 	defer p1.Close()
-	p2, err := r.OpenParent([]byte("case.txt"))
-	if err != nil {
-		t.Logf("case variant is a distinct name on this filesystem: %v", err)
-		return
-	}
-	defer p2.Close()
-
 	id1, _, err := p1.StatAtNoFollow()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("the file this test just created cannot be looked up: %v", err)
 	}
+
+	p2, err := r.OpenParent([]byte("case.txt"))
+	if err != nil {
+		t.Fatalf("open the variant's parent: %v", err)
+	}
+	defer p2.Close()
 	id2, _, err := p2.StatAtNoFollow()
 	if err != nil {
-		t.Fatalf("alias lookup failed: %v", err)
+		if errors.Is(err, unix.ENOENT) {
+			// Correct behaviour for a case-sensitive filesystem: the two spellings
+			// are two names, and only one of them exists.
+			t.Logf("case-sensitive filesystem: %q does not exist, so names are compared exactly", "case.txt")
+			return
+		}
+		t.Fatalf("lookup of the variant failed unexpectedly: %v", err)
 	}
-	if id1.Equal(id2) {
-		t.Logf("filesystem treats names as aliases: both resolve to inode %d", id1.Inode)
-	} else {
-		t.Logf("filesystem treats names as distinct: %d vs %d", id1.Inode, id2.Inode)
+	if !id1.Equal(id2) {
+		t.Fatalf("both spellings resolve, but to different objects (%d vs %d); "+
+			"a case-insensitive filesystem must resolve them to one inode", id1.Inode, id2.Inode)
 	}
+	t.Logf("case-insensitive filesystem: both spellings resolve to inode %d", id1.Inode)
 }
 
 // TestMkdirAllIsBounded ensures the vault helper refuses to escape the root and

@@ -44,6 +44,10 @@ const (
 	// StatusUnknownPayload means an entry in the objects directory that is not a
 	// plain object file.
 	StatusUnknownPayload = "unknown_payload"
+	// StatusUnverified means the objects directory could not be read, so this
+	// inventory cannot say whether the object is there. It is deliberately not
+	// "missing": an access error proves only that the check did not happen.
+	StatusUnverified = "unverified"
 )
 
 // maxManifestBytes bounds one manifest read. A manifest is a small JSON object.
@@ -66,18 +70,22 @@ type Entry struct {
 
 // Report is the inventory of one management directory.
 type Report struct {
-	Root       string   `json:"root"`
-	InstanceID string   `json:"owner_instance,omitempty"`
-	ScopeID    string   `json:"owner_scope,omitempty"`
-	Manifests  int      `json:"manifests"`
-	Objects    int      `json:"objects"`
-	Complete   int      `json:"complete"`
-	Missing    int      `json:"manifest_without_object"`
-	Orphans    int      `json:"orphan_objects"`
-	Conflicts  int      `json:"conflicts"`
-	Unknown    int      `json:"unknown_payloads"`
-	Entries    []Entry  `json:"entries"`
-	Notes      []string `json:"notes,omitempty"`
+	Root       string `json:"root"`
+	InstanceID string `json:"owner_instance,omitempty"`
+	ScopeID    string `json:"owner_scope,omitempty"`
+	Manifests  int    `json:"manifests"`
+	Objects    int    `json:"objects"`
+	Complete   int    `json:"complete"`
+	Missing    int    `json:"manifest_without_object"`
+	Orphans    int    `json:"orphan_objects"`
+	Unverified int    `json:"unverified"`
+	// ObjectState is read, missing or unreadable. Only read supports any claim
+	// that a particular object is not there.
+	ObjectState string   `json:"object_state"`
+	Conflicts   int      `json:"conflicts"`
+	Unknown     int      `json:"unknown_payloads"`
+	Entries     []Entry  `json:"entries"`
+	Notes       []string `json:"notes,omitempty"`
 }
 
 // Inspect inventories the private directory inside rootPath.
@@ -112,10 +120,19 @@ func Inspect(rootPath string) (Report, error) {
 	rep.Notes = append(rep.Notes, notes...)
 	rep.Manifests = len(manifests)
 
-	objects, unknown, notes := readObjects(root)
-	rep.Notes = append(rep.Notes, notes...)
+	inv := readObjects(root)
+	rep.Notes = append(rep.Notes, inv.notes...)
+	objects, unknown := inv.entries, inv.unknown
 	rep.Objects = len(objects)
 	rep.Unknown = len(unknown)
+	rep.ObjectState = inv.state
+	if inv.state == objectStateRead {
+		rep.Notes = append(rep.Notes,
+			"a manifest_and_object entry means the two names exist; the inventory compares no hash and no identity")
+	} else {
+		rep.Notes = append(rep.Notes,
+			"the objects directory was not read: absence of an object is not established")
+	}
 
 	for _, name := range unknown {
 		rep.Entries = append(rep.Entries, Entry{
@@ -144,7 +161,12 @@ func Inspect(rootPath string) (Report, error) {
 			e.Notes = append(e.Notes, m.problem)
 			rep.Conflicts++
 		}
-		if obj, ok := objects[m.manifest.ObjectID]; ok {
+		if inv.state != objectStateRead {
+			if e.Status == "" {
+				e.Status = StatusUnverified
+				rep.Unverified++
+			}
+		} else if obj, ok := objects[m.manifest.ObjectID]; ok {
 			e.ObjectSize = obj.size
 			delete(objects, m.manifest.ObjectID)
 			if e.Status == "" {
@@ -167,6 +189,9 @@ func Inspect(rootPath string) (Report, error) {
 		rep.Entries = append(rep.Entries, e)
 	}
 
+	if inv.state != objectStateRead {
+		return rep, nil
+	}
 	orphanNames := make([]string, 0, len(objects))
 	for name := range objects {
 		orphanNames = append(orphanNames, name)
@@ -265,19 +290,52 @@ type objectEntry struct {
 	err  string
 }
 
+// The three states an objects directory can be in. Only objectStateRead supports
+// a statement about a particular object being absent.
+const (
+	objectStateRead       = "read"
+	objectStateMissing    = "missing"
+	objectStateUnreadable = "unreadable"
+)
+
+type objectInventory struct {
+	entries map[string]objectEntry
+	unknown []string
+	notes   []string
+	state   string
+}
+
 // readObjects lists the objects directory. It never opens a payload for reading:
 // the inventory only needs to know what is there.
-func readObjects(root *fsops.Root) (map[string]objectEntry, []string, []string) {
-	out := map[string]objectEntry{}
+func readObjects(root *fsops.Root) objectInventory {
+	inv := objectInventory{entries: map[string]objectEntry{}}
 	dir, err := root.OpenDir([]byte(domain.VaultObjects))
 	if err != nil {
-		return out, nil, []string{fmt.Sprintf("the objects directory is missing: %v", err)}
+		// A missing directory and an unreadable one are different facts. Saying
+		// "the object is gone" because permission was denied would turn an
+		// unavailable check into a conclusion about the data.
+		if errors.Is(err, unix.ENOENT) {
+			inv.state = objectStateMissing
+			inv.notes = []string{"the objects directory does not exist"}
+			return inv
+		}
+		inv.state = objectStateUnreadable
+		inv.notes = []string{fmt.Sprintf("the objects directory cannot be opened: %v", err)}
+		return inv
 	}
 	defer dir.Close()
 
 	names, notes := listDir(dir)
+	inv.notes = append(inv.notes, notes...)
+	inv.state = objectStateRead
+
+	out := inv.entries
 	var unknown []string
 	for _, name := range names {
+		if name == domain.VaultNonceName {
+			// The vault's own creation evidence, not a payload.
+			continue
+		}
 		id, tok, err := dir.StatEntry(name)
 		if err != nil {
 			if errors.Is(err, unix.ENOENT) {
@@ -293,7 +351,8 @@ func readObjects(root *fsops.Root) (map[string]objectEntry, []string, []string) 
 		}
 		out[name] = objectEntry{size: tok.Size}
 	}
-	return out, unknown, notes
+	inv.unknown = unknown
+	return inv
 }
 
 // listDir returns the entry names of a directory, sorted.

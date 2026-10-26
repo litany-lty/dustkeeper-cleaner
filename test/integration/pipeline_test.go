@@ -242,9 +242,9 @@ func TestAutoPurgeIsNotRetroactive(t *testing.T) {
 	}
 
 	out2, err := e.exec.Purge(context.Background(), sctx, it, execute.PurgeOptions{
-		Automatic:    true,
-		Budget:       domain.NewBudget(300, 1<<30, 10, 1<<30, 0),
-		Trust:        trustOK,
+		Automatic: true,
+		Budget:    domain.NewBudget(300, 1<<30, 10, 1<<30, 0),
+		Trust:     trustOK,
 	})
 	if err == nil {
 		t.Fatalf("purge accepted an object with no bound grant: %+v", out2)
@@ -276,8 +276,8 @@ func TestManualPurgeRemovesOnlyListedObjects(t *testing.T) {
 		t.Fatalf("an object was due before its retention elapsed: %d", len(early))
 	}
 	if _, err := e.exec.Purge(context.Background(), sctx, res.Items[0], execute.PurgeOptions{
-		Budget:       domain.NewBudget(300, 1<<30, 10, 1<<30, 0),
-		Trust:        trustOK,
+		Budget: domain.NewBudget(300, 1<<30, 10, 1<<30, 0),
+		Trust:  trustOK,
 	}); err == nil {
 		t.Fatal("purge ran before the retention window closed")
 	} else if errs.CodeOf(err) == errs.CodeOK {

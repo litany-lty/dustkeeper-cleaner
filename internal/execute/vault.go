@@ -81,6 +81,10 @@ func OpenScopeCtx(ctx context.Context, reg *scope.Registrar, id domain.ScopeID) 
 		InstanceID: reg.InstanceID,
 		Identity:   want,
 		Lock:       true,
+		ScopeID:    string(id),
+		RootInode:  vs.RootID.Persistent.Inode,
+		VolumeID:   vs.RootID.Persistent.VolumeID,
+		ScopeKind:  c.Scope.Kind,
 	})
 	if err != nil {
 		c.Root.Close()

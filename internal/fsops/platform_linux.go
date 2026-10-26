@@ -150,7 +150,6 @@ func tokenOf(st *unix.Stat_t, metadataHash domain.Digest) domain.ChangeToken {
 		Mode:         st.Mode,
 		UID:          st.Uid,
 		GID:          st.Gid,
-		Flags:        0,
 		MetadataHash: metadataHash,
 	}
 }
@@ -169,15 +168,6 @@ func fileFlags(fd int) (uint64, string) {
 		return 0, "flags_unreadable"
 	}
 	return uint64(uint32(flags)), ""
-}
-
-// tokenFlags is the flags half of a change token for an open regular file.
-func tokenFlags(fd int, _ *unix.Stat_t) uint64 {
-	flags, unsupported := fileFlags(fd)
-	if unsupported != "" {
-		return 0
-	}
-	return flags
 }
 
 // birthTimeNS is the birth time carried by a plain stat, which the Linux stat

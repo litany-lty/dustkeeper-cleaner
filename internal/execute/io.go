@@ -133,9 +133,14 @@ func MetadataOf(f *fsops.File) (fsops.MetadataEvidence, error) {
 }
 
 // MetadataDigest hashes the evidence that must match between two copies.
+//
+// Every field here comes from one place: the open descriptor. The flags are read
+// from the metadata evidence, not from the change token, because a token can be
+// built from a directory entry and a directory entry has no inode flags. Mixing
+// the two made an untouched file look modified on Linux (R09 B).
 func MetadataDigest(ev fsops.MetadataEvidence, token domain.ChangeToken) domain.Digest {
 	payload := fmt.Sprintf("xattr=%s;count=%d;flags=%d;mode=%d;uid=%d;gid=%d;mtime=%d",
-		ev.XattrDigest, ev.XattrCount, token.Flags, token.Mode, token.UID, token.GID, token.MTimeNS)
+		ev.XattrDigest, ev.XattrCount, ev.Flags, token.Mode, token.UID, token.GID, token.MTimeNS)
 	return domain.DigestOf("dustkeeper/metadata/v1", []byte(payload))
 }
 

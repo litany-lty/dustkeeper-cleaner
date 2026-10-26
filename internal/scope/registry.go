@@ -384,7 +384,15 @@ func (r *Registrar) createVault(root *fsops.Root, sc store.Scope, identity domai
 	}
 	defer tmp.Close()
 
-	expect := VaultExpect{OwnerUID: CurrentOwnerUID(), RootDev: root.Dev()}
+	expect := VaultExpect{
+		OwnerUID:   CurrentOwnerUID(),
+		RootDev:    root.Dev(),
+		InstanceID: r.InstanceID,
+		ScopeID:    string(sc.ID),
+		RootInode:  identity.Persistent.Inode,
+		VolumeID:   identity.Persistent.VolumeID,
+		ScopeKind:  sc.Kind,
+	}
 	for _, d := range []struct {
 		dir  *fsops.Dir
 		name string
@@ -419,11 +427,7 @@ func (r *Registrar) createVault(root *fsops.Root, sc store.Scope, identity domai
 	case errors.Is(installErr, fsops.ErrExists):
 		// A marker is already present. It is verified, not trusted: a stale or
 		// tampered marker is exactly the case R01 refuses to act on.
-		if err := verifyMarker(vault, VaultExpect{
-			OwnerUID:   expect.OwnerUID,
-			RootDev:    expect.RootDev,
-			InstanceID: r.InstanceID,
-		}); err != nil {
+		if err := verifyMarker(vault, expect); err != nil {
 			return "", err
 		}
 	case installErr != nil && created:
@@ -432,6 +436,34 @@ func (r *Registrar) createVault(root *fsops.Root, sc store.Scope, identity domai
 		return "", errs.Wrap(errs.CodeDurabilityFailed, installErr)
 	default:
 		return "", errs.Wrap(errs.CodeStateWriteFailed, installErr)
+	}
+
+	// The objects directory carries a random value for its whole life. It is the
+	// one fact a replacement cannot reproduce: deleting and recreating the
+	// directory loses it, and an inode number handed to the new directory by the
+	// filesystem says nothing about who created it.
+	objects, err := root.OpenDir([]byte(domain.VaultObjects))
+	if err != nil {
+		return "", errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	defer objects.Close()
+	if err := objects.VerifyPrivate(expect.For(true)); err != nil {
+		return "", refuse("objects directory", err)
+	}
+	if created, ierr := fsops.InstallPrivate(tmp, objects, domain.VaultNonceName,
+		[]byte(domain.NewID("vault")), 0o600); ierr != nil {
+		if !errors.Is(ierr, fsops.ErrExists) {
+			if created {
+				return "", errs.Wrap(errs.CodeDurabilityFailed, ierr)
+			}
+			return "", errs.Wrap(errs.CodeStateWriteFailed, ierr)
+		}
+		// Already there: re-registration of the same tree reuses its evidence
+		// instead of minting a second one.
+	}
+	nonce, err := objects.ReadFileAt(domain.VaultNonceName, maxNonceBytes)
+	if err != nil {
+		return "", errs.Wrap(errs.CodeAccessDenied, err)
 	}
 
 	// The anchor gets the same treatment: exclusive create, no link, private
@@ -444,14 +476,71 @@ func (r *Registrar) createVault(root *fsops.Root, sc store.Scope, identity domai
 		}
 		return "", errs.Wrap(errs.CodeStateWriteFailed, anchorErr)
 	}
+	anchor, err := root.OpenFileRW([]byte(domain.VaultAnchor))
+	if err != nil {
+		return "", errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	// The contract is checked before anything is written. A pre-placed hard link
+	// to a business file satisfies "regular file, no symlink", so a tag written
+	// first would land inside that file.
+	if err := anchor.VerifyPrivate("durability anchor", expect.For(false)); err != nil {
+		anchor.Close()
+		return "", refuse("durability anchor", err)
+	}
+	anchorID, _, err := anchor.Stat()
+	if err != nil {
+		anchor.Close()
+		return "", errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	// The tag identifies the anchor without occupying the area the barrier
+	// writes. It is written once, at creation.
+	anchorTag := ""
+	if tag, terr := fsops.ReadTag(anchor.FD(), anchorTagOffset, maxNonceBytes); terr == nil && len(tag) > 0 {
+		anchorTag = string(tag)
+	} else {
+		anchorTag = domain.NewID("anchor")
+		if werr := fsops.WriteTag(anchor.FD(), anchorTagOffset, []byte(anchorTag)); werr != nil {
+			anchor.Close()
+			return "", errs.Wrap(errs.CodeDurabilityFailed, werr)
+		}
+		if serr := fsops.DurableFile(anchor.FD()); serr != nil {
+			anchor.Close()
+			return "", errs.Wrap(errs.CodeDurabilityFailed, serr)
+		}
+	}
+	anchor.Close()
 
-	handles, err := OpenVault(root, VaultExpect{
-		OwnerUID:   expect.OwnerUID,
-		RootDev:    expect.RootDev,
-		InstanceID: r.InstanceID,
-		Creating:   true,
-		Lock:       true,
+	vaultID, err := VaultIdentity(objects, string(nonce))
+	if err != nil {
+		return "", err
+	}
+	bindBody, err := json.Marshal(VaultBindV1{
+		FormatVersion:   1,
+		ScopeID:         string(sc.ID),
+		RootInode:       identity.Persistent.Inode,
+		VolumeID:        identity.Persistent.VolumeID,
+		ScopeKind:       sc.Kind,
+		ObjectsNonce:    string(nonce),
+		ObjectsIdentity: vaultID,
+		AnchorTag:       anchorTag,
+		AnchorIdentity:  AnchorIdentity(anchorID, anchorTag),
 	})
+	if err != nil {
+		return "", errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	if created, ierr := fsops.InstallPrivate(tmp, vault, "vault-bind.json", bindBody, 0o600); ierr != nil {
+		if !errors.Is(ierr, fsops.ErrExists) {
+			if created {
+				return "", errs.Wrap(errs.CodeDurabilityFailed, ierr)
+			}
+			return "", errs.Wrap(errs.CodeStateWriteFailed, ierr)
+		}
+	}
+
+	expect.Creating = true
+	expect.Identity = vaultID
+	expect.Lock = true
+	handles, err := OpenVault(root, expect)
 	if err != nil {
 		return "", err
 	}

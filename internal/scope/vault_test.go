@@ -2,6 +2,7 @@ package scope
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -116,12 +117,19 @@ func openVaultFor(t *testing.T, reg *Registrar, id domain.ScopeID) (*VaultHandle
 	if sc.VaultIdentityJSON != nil {
 		want = *sc.VaultIdentityJSON
 	}
+	// The helper carries the same contract the executor passes. A helper that
+	// passed fewer facts would let a test pass while the real entry point
+	// refused, which is the drift the review keeps finding.
 	return OpenVault(vs.Root, VaultExpect{
 		OwnerUID:   CurrentOwnerUID(),
 		RootDev:    vs.Root.Dev(),
 		InstanceID: reg.InstanceID,
 		Identity:   want,
 		Lock:       true,
+		ScopeID:    string(id),
+		RootInode:  vs.RootID.Persistent.Inode,
+		VolumeID:   vs.RootID.Persistent.VolumeID,
+		ScopeKind:  sc.Kind,
 	})
 }
 
@@ -156,8 +164,11 @@ func TestReplacedObjectsDirectoryIsRefused(t *testing.T) {
 	dir := makeTree(t, base, "docs")
 	mustRegister(t, reg, dir, "docs")
 
+	// A replacement is the whole directory, including the creation evidence it
+	// carries. Removing only part of it would leave the test asserting against a
+	// directory nobody would actually end up with.
 	objects := filepath.Join(dir, domain.VaultDirName, "objects")
-	if err := os.Remove(objects); err != nil {
+	if err := os.RemoveAll(objects); err != nil {
 		t.Fatalf("remove objects: %v", err)
 	}
 	if err := os.Mkdir(objects, 0o700); err != nil {
@@ -166,6 +177,78 @@ func TestReplacedObjectsDirectoryIsRefused(t *testing.T) {
 
 	if _, err := openVaultFor(t, reg, "docs"); err == nil {
 		t.Fatal("a replaced objects directory was accepted")
+	} else if code := errs.CodeOf(err); code != errs.CodeScopeChanged {
+		t.Fatalf("code = %s, want %s (%v)", code, errs.CodeScopeChanged, err)
+	}
+}
+
+// A01: the directory is the same inode and device, but the creation evidence
+// inside it is not the value this vault minted. Inode reuse after a delete and
+// recreate is exactly this shape, and it is the reason the nonce exists at all.
+func TestVaultWithADifferentCreationNonceIsRefused(t *testing.T) {
+	reg, base := newRegistry(t)
+	dir := makeTree(t, base, "docs")
+	mustRegister(t, reg, dir, "docs")
+
+	nonce := filepath.Join(dir, domain.VaultDirName, "objects", domain.VaultNonceName)
+	if err := os.WriteFile(nonce, []byte("vault_someone_elses_creation"), 0o600); err != nil {
+		t.Fatalf("rewrite nonce: %v", err)
+	}
+
+	if _, err := openVaultFor(t, reg, "docs"); err == nil {
+		t.Fatal("a different creation nonce was accepted")
+	} else if code := errs.CodeOf(err); code != errs.CodeScopeChanged {
+		t.Fatalf("code = %s, want %s (%v)", code, errs.CodeScopeChanged, err)
+	}
+}
+
+// A01: a marker copied from another scope has the right shape and the wrong
+// subject. The scope, root and kind it names are part of the contract.
+func TestVaultWhoseMarkerNamesAnotherScopeIsRefused(t *testing.T) {
+	reg, base := newRegistry(t)
+	dir := makeTree(t, base, "docs")
+	mustRegister(t, reg, dir, "docs")
+
+	marker := filepath.Join(dir, domain.VaultDirName, "owner.json")
+	var m OwnerMarker
+	body := readAll(t, marker)
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("decode marker: %v", err)
+	}
+	m.ScopeID = "somewhere-else"
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("encode marker: %v", err)
+	}
+	if err := os.WriteFile(marker, out, 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	if _, err := openVaultFor(t, reg, "docs"); err == nil {
+		t.Fatal("a marker naming a different scope was accepted")
+	} else if code := errs.CodeOf(err); code != errs.CodeScopeChanged {
+		t.Fatalf("code = %s, want %s (%v)", code, errs.CodeScopeChanged, err)
+	}
+}
+
+// A01: the anchor is rewritten by every barrier, so its bytes cannot identify
+// it. A replaced anchor is a different file, and a barrier on it would flush
+// something other than the objects it is supposed to make durable.
+func TestVaultWhoseAnchorWasReplacedIsRefused(t *testing.T) {
+	reg, base := newRegistry(t)
+	dir := makeTree(t, base, "docs")
+	mustRegister(t, reg, dir, "docs")
+
+	anchor := filepath.Join(dir, domain.VaultAnchor)
+	if err := os.Remove(anchor); err != nil {
+		t.Fatalf("remove anchor: %v", err)
+	}
+	if err := os.WriteFile(anchor, nil, 0o600); err != nil {
+		t.Fatalf("recreate anchor: %v", err)
+	}
+
+	if _, err := openVaultFor(t, reg, "docs"); err == nil {
+		t.Fatal("a replaced durability anchor was accepted")
 	} else if code := errs.CodeOf(err); code != errs.CodeScopeChanged {
 		t.Fatalf("code = %s, want %s (%v)", code, errs.CodeScopeChanged, err)
 	}

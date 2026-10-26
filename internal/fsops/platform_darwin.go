@@ -130,7 +130,6 @@ func tokenOf(st *unix.Stat_t, metadataHash domain.Digest) domain.ChangeToken {
 		Mode:         uint32(st.Mode),
 		UID:          st.Uid,
 		GID:          st.Gid,
-		Flags:        uint64(st.Flags),
 		MetadataHash: metadataHash,
 	}
 }
@@ -201,9 +200,6 @@ func fileFlags(fd int) (uint64, string) {
 	}
 	return uint64(st.Flags), ""
 }
-
-// tokenFlags is the flags half of a change token for an open regular file.
-func tokenFlags(fd int, st *unix.Stat_t) uint64 { return uint64(st.Flags) }
 
 // syscallName keeps error text readable in reports without leaking numbers.
 func syscallName(err error) string {

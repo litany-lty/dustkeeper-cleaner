@@ -65,9 +65,9 @@ func TestPurgeFreezesWhenAliasCannotBeResolved(t *testing.T) {
 		t.Fatalf("purge plan: %v", err)
 	}
 	out, err := e.exec.Purge(context.Background(), sctx, due[0], execute.PurgeOptions{
-		Plan:         &p,
-		Budget:       domain.NewBudget(300, 1<<30, 10, 1<<30, 0),
-		Trust:        trustOK,
+		Plan:   &p,
+		Budget: domain.NewBudget(300, 1<<30, 10, 1<<30, 0),
+		Trust:  trustOK,
 	})
 	if err == nil {
 		t.Fatalf("purge ran while a protection could not be resolved: %+v", out)

@@ -219,7 +219,8 @@ func Wrapf(code Code, cause error, format string, args ...any) error {
 	}
 }
 
-func (e *Error) Error() string {	if e == nil {
+func (e *Error) Error() string {
+	if e == nil {
 		return ""
 	}
 	if e.Message == "" {
