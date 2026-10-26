@@ -125,15 +125,23 @@ func (g *Guard) Assess(ctx context.Context) (Verdict, error) {
 
 // Assert returns nil only when a purge may proceed. It fails closed when the
 // ledger cannot be read.
+//
+// An untrusted answer is written down before it is returned. Returning an error
+// alone leaves the next run free to start from a clean baseline, which is how an
+// anomaly was laundered: the run that noticed it was the only one that knew.
 func (g *Guard) Assert(ctx context.Context) error {
 	v, err := g.Assess(ctx)
 	if err != nil {
 		return err
 	}
-	if !v.Trusted {
-		return errs.New(errs.CodeClockUntrusted, v.Reason)
+	if v.Trusted {
+		return nil
 	}
-	return nil
+	if err := g.Store.LatchClock(ctx, g.Clock.Wall().UnixNano(), v.Reason); err != nil {
+		return errs.Wrapf(errs.CodeClockUntrusted, err,
+			"%s; the latch could not be recorded, so purging stays suspended", v.Reason)
+	}
+	return errs.New(errs.CodeClockUntrusted, v.Reason)
 }
 
 // RecordRun stores the outcome of the run.

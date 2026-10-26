@@ -508,19 +508,8 @@ func purgeApply(ctx context.Context, a *app, args []string) (output, error) {
 		if err := checkPlanUsable(p, a.clock.Wall().UnixNano(), a.store, ctx); err != nil {
 			return output{}, err
 		}
-		members, err := a.store.ListPurgeMembers(ctx, p.ID)
+		items, err := plan.LoadMembers(ctx, a.store, p, domain.Digest(*digest))
 		if err != nil {
-			return output{}, err
-		}
-		if len(members) == 0 {
-			return output{}, errs.New(errs.CodePlanStale, "this purge plan has no members")
-		}
-
-		items := make([]store.Item, 0, len(members))
-		for _, m := range members {
-			items = append(items, m.Item)
-		}
-		if err := plan.VerifyPlanDigest(p, items, domain.Digest(*digest)); err != nil {
 			return output{}, err
 		}
 

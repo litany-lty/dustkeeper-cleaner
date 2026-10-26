@@ -365,6 +365,41 @@ func itemDocOf(it store.Item) (PlanItemDoc, error) {
 
 // VerifyPlanDigest recomputes the plan digest and compares it with the stored and
 // approved values. A mismatch means the plan was modified outside this program.
+// LoadMembers returns a plan's members in the shape the digest was computed
+// from, and verifies the approved digest against them.
+//
+// A purge plan keeps its members in purge_members, not in items.plan_id. Two CLI
+// routes loaded members themselves, and the generic `plan apply` loaded the
+// wrong table: for a purge plan it found no items and refused before reaching
+// the executor, while `purge plan apply` worked. Loading by kind, in one place,
+// is what keeps the two routes from disagreeing again.
+func LoadMembers(ctx context.Context, st *store.Store, p store.Plan, approved domain.Digest) ([]store.Item, error) {
+	var items []store.Item
+	switch p.Kind {
+	case domain.PlanManualPurge, domain.PlanScheduledPurge:
+		members, err := st.ListPurgeMembers(ctx, p.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range members {
+			items = append(items, m.Item)
+		}
+	default:
+		list, err := st.ListItemsByPlan(ctx, p.ID)
+		if err != nil {
+			return nil, err
+		}
+		items = list
+	}
+	if len(items) == 0 {
+		return nil, errs.Newf(errs.CodePlanStale, "plan %s has no members", p.ID)
+	}
+	if err := VerifyPlanDigest(p, items, approved); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 func VerifyPlanDigest(p store.Plan, items []store.Item, approved domain.Digest) error {
 	if approved != "" && approved != p.Digest {
 		return errs.Newf(errs.CodeDigestMismatch,

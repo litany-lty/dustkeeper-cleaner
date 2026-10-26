@@ -37,20 +37,25 @@ type Runner struct {
 
 // ScopeRun reports what happened to one scope.
 type ScopeRun struct {
-	Scope            domain.ScopeID `json:"scope_id"`
-	Skipped          string         `json:"skipped,omitempty"`
-	Scanned          int            `json:"scanned_files"`
-	ScanComplete     bool           `json:"scan_epoch_complete"`
-	ScanInterrupted  bool           `json:"scan_interrupted"`
-	DeepScanRequired bool           `json:"deep_scan_required"`
-	Quarantined      int            `json:"quarantined"`
-	QuarantinedBytes int64          `json:"quarantined_logical_bytes"`
-	Purged           int            `json:"purged"`
-	PurgedBytes      int64          `json:"purged_logical_bytes"`
-	DueNotAuthorised int            `json:"due_but_not_authorised"`
-	IdentityWeak     string         `json:"root_identity_weak,omitempty"`
-	Control          string         `json:"control,omitempty"`
-	Message          string         `json:"message,omitempty"`
+	Scope   domain.ScopeID `json:"scope_id"`
+	Skipped string         `json:"skipped,omitempty"`
+	// PurgeSkipped and QuarantineSkipped are separate because the two phases no
+	// longer share one gate: disk pressure stops new quarantine but must not
+	// stop a purge that is already due and authorised.
+	PurgeSkipped      string `json:"purge_skipped,omitempty"`
+	QuarantineSkipped string `json:"quarantine_skipped,omitempty"`
+	Scanned           int    `json:"scanned_files"`
+	ScanComplete      bool   `json:"scan_epoch_complete"`
+	ScanInterrupted   bool   `json:"scan_interrupted"`
+	DeepScanRequired  bool   `json:"deep_scan_required"`
+	Quarantined       int    `json:"quarantined"`
+	QuarantinedBytes  int64  `json:"quarantined_logical_bytes"`
+	Purged            int    `json:"purged"`
+	PurgedBytes       int64  `json:"purged_logical_bytes"`
+	DueNotAuthorised  int    `json:"due_but_not_authorised"`
+	IdentityWeak      string `json:"root_identity_weak,omitempty"`
+	Control           string `json:"control,omitempty"`
+	Message           string `json:"message,omitempty"`
 }
 
 // Report is the machine-readable result of `run`.
@@ -69,6 +74,15 @@ type Report struct {
 	PressureNote    string          `json:"disk_pressure_note,omitempty"`
 	Control         string          `json:"control"`
 	UntouchedScopes int             `json:"scopes_not_reached"`
+	// ClockReassessed says the verdict changed between the start and the end of
+	// the run. It is reported so that "the clock looked fine at 09:00" cannot be
+	// read as "the clock was fine all morning".
+	ClockReassessed bool `json:"clock_reassessed"`
+	// Failures lists the scopes whose work did not finish because of a real
+	// error. A budget stop is not one: it is reported as control plus a note, so
+	// that a scheduler can tell "ran out of its slice" from "could not write".
+	Failures    []string  `json:"failures,omitempty"`
+	FailureCode errs.Code `json:"failure_code,omitempty"`
 }
 
 // Run executes one pass.
@@ -134,6 +148,11 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		result, runErr := r.runScope(ctx, sc, runLedger, qLedger, pLedger, guard, verdict)
 		if runErr != nil {
 			result.Message = runErr.Error()
+			rep.Failures = append(rep.Failures, string(sc.ID)+": "+runErr.Error())
+			if rep.FailureCode == "" {
+				rep.FailureCode = errs.CodeOf(runErr)
+			}
+			rep.Control = strongerControl(rep.Control, controlOfError(runErr))
 		}
 		rep.Scopes = append(rep.Scopes, result)
 		rep.Quarantined += result.Quarantined
@@ -150,9 +169,22 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		rep.DiskPressure = true
 		rep.PressureNote = note
 	}
+	// Re-assess before recording. The verdict captured at the start describes the
+	// start; a clock that jumped during the run is exactly the case the start
+	// verdict cannot see, and recording the start verdict would write the
+	// anomalous wall clock into the trusted baseline.
+	final, ferr := guard.Assess(ctx)
+	if ferr != nil {
+		return rep, ferr
+	}
+	if final.Trusted != verdict.Trusted || final.Reason != verdict.Reason {
+		rep.ClockTrusted = final.Trusted
+		rep.ClockNote = final.Reason
+		rep.ClockReassessed = true
+	}
 	// Recording the run is deliberately last: a run that could not finish its
 	// bookkeeping must not advance the trusted clock baseline.
-	if err := guard.RecordRun(ctx, verdict); err != nil {
+	if err := guard.RecordRun(ctx, final); err != nil {
 		return rep, err
 	}
 	_ = r.advanceCursor(ordered)
@@ -175,19 +207,31 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, runLedger *domain
 		return sr, err
 	}
 
-	// Purging a due object is a new permanent action and needs four things at
-	// once: a coherent clock, room on the volume, an unspent action ledger, and
-	// root evidence strong enough to prove this is still the authorised tree.
-	if !verdict.Trusted {
-		sr.Skipped = "clock is not trustworthy: " + verdict.Reason
-	} else if sctx.IdentityWeak != "" {
+	// One decision, two consequences.
+	//
+	// A suspect clock or thin root evidence stops both new permanent deletion and
+	// new quarantine: an object created under a clock that cannot be proven has a
+	// retention window nobody can defend later. Disk pressure is a different
+	// thing - it stops new quarantine, because quarantining copies bytes onto a
+	// full volume, and it does not stop a purge, because the purge is precisely
+	// what frees the space.
+	pressure, pressureNote := r.diskPressure()
+	blocked := ""
+	switch {
+	case !verdict.Trusted:
+		blocked = "clock is not trustworthy: " + verdict.Reason
+	case sctx.IdentityWeak != "":
 		// R02: thin root evidence is enough to keep observing but not enough to
-		// delete permanently. Nothing is lost by waiting; re-registering restores
-		// the automatic path.
-		sr.Skipped = "root identity evidence is too thin for automatic deletion: " + sctx.IdentityWeak
+		// start an automatic action. Nothing is lost by waiting; re-registering
+		// restores the automatic path.
+		blocked = "root identity evidence is too thin for automatic actions: " + sctx.IdentityWeak
 		sr.IdentityWeak = sctx.IdentityWeak
-	} else if pressure, note := r.diskPressure(); pressure {
-		sr.Skipped = "disk pressure: " + note
+	}
+
+	if blocked != "" {
+		sr.Skipped = blocked
+		sr.PurgeSkipped = blocked
+		sr.QuarantineSkipped = blocked
 	} else {
 		purged, bytes, due, control, perr := r.purgeDue(ctx, sctx, runLedger, pLedger, guard)
 		sr.Purged, sr.PurgedBytes, sr.DueNotAuthorised = purged, bytes, due
@@ -210,11 +254,19 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, runLedger *domain
 	sr.ScanInterrupted = scanState.Interrupted
 	sr.DeepScanRequired = scanState.DeepScanRequired
 
-	// No new mutation while the wall clock is suspect. Scanning is read-only and
-	// keeps its observations fresh, but moving files would create objects whose
-	// retention start time cannot be proven later.
-	if !verdict.Trusted {
-		sr.Message = "no file was moved: the wall clock is not trustworthy"
+	if blocked != "" {
+		sr.Message = "no file was moved: " + blocked
+		return sr, nil
+	}
+	if pressure {
+		sr.QuarantineSkipped = "disk pressure: " + pressureNote
+		sr.Message = "new quarantine paused: " + pressureNote
+		return sr, nil
+	}
+	// The scan may have spent the time slice. Starting a quarantine after it has
+	// would be a new business action past the deadline.
+	if runLedger.TimeUp(r.Clock.Mono()) {
+		sr.QuarantineSkipped = "run time slice spent during the scan"
 		return sr, nil
 	}
 
@@ -252,8 +304,18 @@ func (r *Runner) purgeDue(ctx context.Context, sc *execute.ScopeCtx, runLedger *
 		afterItem  string
 	)
 
+	// The run ledger is a ceiling for the whole run; a grant is a ceiling for one
+	// approval. Both apply, and the smaller one wins. Spending ten because the
+	// configuration allows ten, when the user approved one for this grant, is how
+	// "the approved maximum" turned into a number nobody enforced.
+	quotas := map[domain.GrantID]grantQuota{}
+	spent := map[domain.GrantID]*grantSpend{}
+
 collect:
 	for len(authorised) < cfg.MaxAutoPurgeFiles {
+		if runLedger.TimeUp(r.Clock.Mono()) {
+			break
+		}
 		page, err := r.Store.PurgeQueuePage(ctx, sc.Scope.ID, nowNS, afterDue, afterItem, pageSize)
 		if err != nil {
 			return 0, 0, refused, domain.ControlStopRun, err
@@ -264,7 +326,8 @@ collect:
 		for _, it := range page {
 			afterDue = purgeDueKey(it)
 			afterItem = string(it.ID)
-			if !r.mayPurgeAutomatically(ctx, it) {
+			quota, ok := r.automaticAuthority(ctx, it, quotas)
+			if !ok {
 				refused++
 				continue
 			}
@@ -272,6 +335,22 @@ collect:
 			if totalBytes+size > cfg.MaxAutoPurgeBytes {
 				refused++
 				continue
+			}
+			if gid := grantIDOf(it); gid != "" {
+				used := spent[gid]
+				if used == nil {
+					used = &grantSpend{}
+					spent[gid] = used
+				}
+				if used.files+1 > quota.files || used.bytes+size > quota.bytes {
+					// This grant has spent what it approved. Another object under
+					// the same grant waits for the next run, when a new plan is
+					// approved against the same ceiling.
+					refused++
+					continue
+				}
+				used.files++
+				used.bytes += size
 			}
 			if !ledger.CanReserve(size) {
 				// The run's purge allowance is spent. Stop looking: the ledger
@@ -319,19 +398,56 @@ collect:
 	return res.Completed, bytes, refused, res.Control, nil
 }
 
-// mayPurgeAutomatically re-checks the standing authority for one object.
-func (r *Runner) mayPurgeAutomatically(ctx context.Context, it store.Item) bool {
+// grantQuota is the ceiling one approval carries.
+type grantQuota struct {
+	files int
+	bytes int64
+}
+
+// grantSpend is what this run has already spent under one approval.
+type grantSpend struct {
+	files int
+	bytes int64
+}
+
+// grantIDOf returns the grant an item was authorised by, or "" when it has none.
+func grantIDOf(it store.Item) domain.GrantID {
+	if it.AutoPurgeGrantID == nil {
+		return ""
+	}
+	return *it.AutoPurgeGrantID
+}
+
+// automaticAuthority re-checks the standing authority for one object and returns
+// the ceilings that authority carries.
+//
+// Reading the binding here is the point: the purge path used to check only that
+// a grant existed, not what it approved, so the number the user saw in the
+// approval prompt never reached the executor.
+func (r *Runner) automaticAuthority(ctx context.Context, it store.Item,
+	cache map[domain.GrantID]grantQuota) (grantQuota, bool) {
+
 	if it.AutoPurgeGrantID == nil || it.SourceKind != domain.SourceScheduledRule {
-		return false
+		return grantQuota{}, false
 	}
-	g, err := r.Store.GetGrant(ctx, *it.AutoPurgeGrantID)
-	if err != nil || g.Status != domain.GrantActive {
-		return false
+	id := *it.AutoPurgeGrantID
+	if q, ok := cache[id]; ok {
+		return q, q.files > 0 && q.bytes > 0
 	}
-	if g.Capability != domain.CapAutoPurge {
-		return false
+	g, err := r.Store.GetGrant(ctx, id)
+	if err != nil || g.Status != domain.GrantActive || g.Capability != domain.CapAutoPurge {
+		cache[id] = grantQuota{}
+		return grantQuota{}, false
 	}
-	return true
+	var b plan.GrantBindingV1
+	if err := json.Unmarshal([]byte(g.BindingJSON), &b); err != nil {
+		// An unreadable binding is not an unlimited approval.
+		cache[id] = grantQuota{}
+		return grantQuota{}, false
+	}
+	q := grantQuota{files: b.ApprovedMaxFiles, bytes: b.ApprovedMaxLogicalBytes}
+	cache[id] = q
+	return q, q.files > 0 && q.bytes > 0
 }
 
 // ScanState reports how complete one scanning batch was.
@@ -428,6 +544,11 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 		}
 		if control == domain.ControlStopScope || control == domain.ControlStopRun {
 			return total, bytes, control, nil
+		}
+		// Planning and applying one rule is a new business action. Past the soft
+		// deadline it does not start, and the rules after it do not either.
+		if runLedger.TimeUp(r.Clock.Mono()) {
+			return total, bytes, strongerControl(control, domain.ControlStopScope), nil
 		}
 		if rule.Status != domain.RuleActive {
 			continue

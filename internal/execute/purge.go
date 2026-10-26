@@ -135,6 +135,11 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		return res, errs.New(errs.CodeBudgetExhausted,
 			"the purge allowance for this run does not permit another action; nothing was read")
 	}
+	// The soft deadline is checked before the expensive read, not after it.
+	if opt.Budget != nil && opt.Budget.TimeUp(e.Clock) {
+		return res, errs.New(errs.CodeBudgetExhausted,
+			"the run's time slice was spent before this object was re-verified")
+	}
 	if opt.Budget != nil && opt.Budget.RemainingRead() < obj.Token.Size {
 		return res, errs.New(errs.CodeBudgetExhausted, "not enough read budget to re-verify this object")
 	}
@@ -179,6 +184,19 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 	// an atomicity the syscall does not offer.
 	if err := ConfirmUnchanged(obj, ev); err != nil {
 		return res, err
+	}
+
+	// Both limits are re-checked at the last possible moment, because both can
+	// expire during the read: a clock that jumped while the object was being
+	// verified, and a time slice that ran out. The first check happened before any
+	// content was read; this one is immediately before the intent that authorises
+	// the unlink.
+	if err := opt.Trust(ctx); err != nil {
+		return res, err
+	}
+	if opt.Budget != nil && opt.Budget.TimeUp(e.Clock) {
+		return res, errs.New(errs.CodeBudgetExhausted,
+			"the run's time slice ran out while this object was being verified; nothing was removed")
 	}
 
 	opID := domain.OperationID(domain.NewID("op"))

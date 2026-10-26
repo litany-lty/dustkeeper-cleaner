@@ -227,18 +227,12 @@ func planApply(ctx context.Context, a *app, args []string) (output, error) {
 		if err != nil {
 			return output{}, err
 		}
-		items, err := a.store.ListItemsByPlan(ctx, p.ID)
-		if err != nil {
-			return output{}, err
-		}
 		if err := checkPlanUsable(p, a.clock.Wall().UnixNano(), a.store, ctx); err != nil {
 			return output{}, err
 		}
-		if err := plan.VerifyPlanDigest(p, items, domain.Digest(*digest)); err != nil {
+		items, err := plan.LoadMembers(ctx, a.store, p, domain.Digest(*digest))
+		if err != nil {
 			return output{}, err
-		}
-		if len(items) == 0 {
-			return output{}, errs.New(errs.CodePlanStale, "this plan has no items")
 		}
 
 		sc, err := a.store.GetScope(ctx, items[0].ScopeID)

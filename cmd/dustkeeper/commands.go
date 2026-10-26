@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"dustkeeper/internal/clocktrust"
 	"dustkeeper/internal/config"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
@@ -178,15 +179,33 @@ func cmdDoctor(ctx context.Context, a *app, args []string) (output, error) {
 			fmt.Sprintf("%d operation(s) need reconciliation", len(pending)))
 	}
 
-	// 5. Clock sanity against the last recorded run.
+	// 5. Clock sanity, in two parts: the latch a previous run recorded, and the
+	// distance to the last run.
+	//
+	// The latch is read first because it is the authoritative fact. A run that
+	// could not prove the clock writes it down, and nothing but an explicit
+	// acknowledgement clears it; reporting "no previous run recorded" while a
+	// latch was set is how an operator was told the clock was fine when the
+	// purge path was still refusing every object.
 	nowNS := a.clock.Wall().UnixNano()
+	latchAt, latchReason, latchErr := a.store.ClockLatch(ctx)
 	lastStr, _ := a.store.MetaGet(ctx, "last_run_ns")
 	clockOK := true
 	clockDetail := "no previous run recorded"
+	switch {
+	case latchErr != nil:
+		clockOK = false
+		clockDetail = "the clock latch could not be read: " + latchErr.Error()
+	case latchAt > 0:
+		clockOK = false
+		clockDetail = "purging is suspended until the clock is acknowledged: " + latchReason
+	}
 	if lastStr != "" {
 		if last, perr := strconv.ParseInt(lastStr, 10, 64); perr == nil {
 			delta := nowNS - last
-			clockDetail = "last run " + humanDuration(time.Duration(delta))
+			if clockOK {
+				clockDetail = "last run " + humanDuration(time.Duration(delta))
+			}
 			if delta < -int64(5*time.Minute) {
 				clockOK = false
 				clockDetail = "the wall clock is more than 5 minutes behind the last run"
@@ -201,11 +220,22 @@ func cmdDoctor(ctx context.Context, a *app, args []string) (output, error) {
 		}
 	}
 	if *ackClock {
-		if err := a.store.MetaSet(ctx, "clock_ack_ns", strconv.FormatInt(nowNS, 10)); err != nil {
+		// The acknowledgement is a transaction, not a timestamp: it clears the
+		// latch, restarts the retention window of every object whose start time
+		// cannot be proven, and records what it did. Writing clock_ack_ns alone -
+		// which is what this command used to do - left the latch in place while
+		// telling the operator the clock was fine.
+		report, err := clocktrust.Acknowledge(ctx, a.store, a.clock)
+		if err != nil {
 			return output{}, err
 		}
 		clockOK = true
-		clockDetail = "clock acknowledged now; future purges may proceed until the next anomaly"
+		clockDetail = fmt.Sprintf(
+			"clock acknowledged; %d object(s) received a full new retention window measured from now",
+			report.ExtendedObjects)
+		if report.PreviousLatch != "" {
+			clockDetail += "; cleared latch: " + report.PreviousLatch
+		}
 	}
 	add("clock", clockOK, errs.CodeClockUntrusted, clockDetail)
 
@@ -564,15 +594,42 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 			res.Message = rep.ClockNote
 		}
 		for _, s := range rep.Scopes {
-			res.Human = append(res.Human, fmt.Sprintf("  %-18s %s scanned=%d complete=%v quarantined=%d purged=%d %s",
-				s.Scope, "", s.Scanned, s.ScanComplete, s.Quarantined, s.Purged, s.Skipped))
+			res.Human = append(res.Human, fmt.Sprintf("  %-18s scanned=%d complete=%v quarantined=%d purged=%d",
+				s.Scope, s.Scanned, s.ScanComplete, s.Quarantined, s.Purged))
+			// The two phases have separate reasons now, so they get separate
+			// lines: "disk pressure" explains a missing quarantine and must not
+			// look like it also stopped a purge that actually ran.
+			for _, note := range []struct{ phase, why string }{
+				{"purge", s.PurgeSkipped},
+				{"quarantine", s.QuarantineSkipped},
+				{"scope", s.Skipped},
+			} {
+				if note.why != "" {
+					res.Human = append(res.Human,
+						fmt.Sprintf("      %s skipped: %s", note.phase, note.why))
+				}
+			}
 		}
 		return res, nil
 	})
 	if err != nil {
 		return out, err
 	}
-	if !rep.ClockTrusted {
+	// The exit status follows the run's own conclusion. Wrapping a stopped run in
+	// a nil error turned every stopped scope into exit 0, which is what the
+	// scheduler reads as "everything is fine".
+	switch {
+	case rep.FailureCode != "":
+		out.Code = rep.FailureCode
+		out.Status = string(errs.StatusOf(rep.FailureCode))
+		out.Message = rep.Failures[0]
+		out.Next = []string{"dustkeeper status --json", "dustkeeper recover reconcile --dry-run"}
+	case rep.Control == domain.ControlStopScope:
+		out.Code = errs.CodePartial
+		out.Status = string(errs.StatusPartial)
+		out.Message = "at least one scope stopped before it finished; see the per-scope control in the report"
+		out.Next = []string{"dustkeeper status --json"}
+	case !rep.ClockTrusted:
 		out.Code = errs.CodeClockUntrusted
 		out.Status = string(errs.StatusOf(errs.CodeClockUntrusted))
 		out.Next = []string{"dustkeeper doctor --acknowledge-clock"}

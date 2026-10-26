@@ -186,6 +186,10 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 		return res, errs.New(errs.CodeBudgetExhausted,
 			"the quarantine allowance for this run does not permit another action")
 	}
+	if budget != nil && budget.TimeUp(e.Clock) {
+		return res, errs.New(errs.CodeBudgetExhausted,
+			"the run's time slice was spent before this file was read")
+	}
 
 	opt := e.VerifyOpt(src.Token.Size)
 	opt.Budget = budget
@@ -197,6 +201,13 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 				"%q changed while it was being verified; plan again", it.RawRelative)
 		}
 		return res, err
+	}
+	// Checking the deadline again here, before the manifest is written, keeps the
+	// abandonment clean: nothing durable exists yet, so there is no orphan
+	// manifest for the next run to reconcile.
+	if budget != nil && budget.TimeUp(e.Clock) {
+		return res, errs.New(errs.CodeBudgetExhausted,
+			"the run's time slice ran out while this file was being verified; nothing was moved")
 	}
 	preHash := preEv.Content
 	metaHash := preEv.Metadata
