@@ -127,18 +127,38 @@ func (d *Detector) Detect(ctx context.Context, source *execute.ScopeCtx, keeperS
 		return res, err
 	}
 
-	// 2. Hash every file in a size group that has more than one member.
+	// 2-3. Hash one size group at a time, compare it, and let it go.
 	//
-	// A group with exactly one in-scope member still has to be hashed when a
-	// reference scope is being searched: one copy here and one copy there is a
-	// duplicate, and the old code dropped that case before the reference query
-	// even ran.
-	byHash := map[string][]Candidate{}
-	for size, group := range bySize {
+	// These two stages used to be whole-tree: every candidate was hashed before
+	// any group was compared, so at the moment of peak use the process held
+	// three complete copies of the index - bySize, byHash, and the groups found
+	// so far. On 100 000 files with 30% duplicates that peaked at 412 MiB to
+	// produce a plan of 30 000 groups: memory scaled with the tree instead of
+	// with the duplicates. Hashing and comparing one size group at a time keeps
+	// the working set proportional to the largest group, which is a property of
+	// the data rather than of the file count.
+	sizes := make([]int64, 0, len(bySize))
+	for size := range bySize {
+		sizes = append(sizes, size)
+	}
+	sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
+
+	for _, size := range sizes {
+		group := bySize[size]
+		// Release the size index as it is consumed. The candidate structs are
+		// held by this iteration's buckets and by the groups kept in the
+		// result, and nothing reads the size map again.
+		delete(bySize, size)
+
+		// A group with exactly one in-scope member still has to be hashed when a
+		// reference scope is being searched: one copy here and one copy there is
+		// a duplicate, and dropping that case before the reference query ran is
+		// what made one-to-one duplicates invisible.
 		if len(group) < 2 && keeperScope == nil {
 			continue
 		}
 		res.ContentGroups++
+		byHash := make(map[string][]Candidate, len(group))
 		for _, c := range group {
 			if d.Budget != nil && (d.Budget.TimeUp(d.Clock) || d.Budget.ReadUp()) {
 				res.Truncated = true
@@ -154,10 +174,19 @@ func (d *Detector) Detect(ctx context.Context, source *execute.ScopeCtx, keeperS
 			key := string(got)
 			byHash[key] = append(byHash[key], c)
 		}
-		_ = size
-	}
 
-	// 3. Byte comparison and metadata equivalence against the keeper.
+		if err := d.compareBuckets(ctx, source, keeperScope, byHash, &res); err != nil {
+			return res, err
+		}
+	}
+	return res, nil
+}
+
+// compareBuckets turns one size group's hash buckets into verified groups: byte
+// comparison first, then the metadata and keeper decisions.
+func (d *Detector) compareBuckets(ctx context.Context, source, keeperScope *execute.ScopeCtx,
+	byHash map[string][]Candidate, res *Result) error {
+
 	keys := make([]string, 0, len(byHash))
 	for k := range byHash {
 		keys = append(keys, k)
@@ -213,7 +242,7 @@ func (d *Detector) Detect(ctx context.Context, source *execute.ScopeCtx, keeperS
 		// question is answered, because in the one-to-one case the answer only
 		// becomes yes after the swap.
 		if keeperScope != nil {
-			d.preferReferenceKeeper(ctx, source, keeperScope, &g, &res)
+			d.preferReferenceKeeper(ctx, source, keeperScope, &g, res)
 		}
 		if len(g.Others) == 0 {
 			continue
@@ -228,8 +257,13 @@ func (d *Detector) Detect(ctx context.Context, source *execute.ScopeCtx, keeperS
 		for range g.Others {
 			res.Candidates++
 		}
+		// Logical bytes: the size of the copies a plan would remove. It was
+		// declared and reported by the CLI but never assigned, so every duplicate
+		// plan claimed `logical_bytes: 0` - a sum that is supposed to answer
+		// "how much would this free?".
+		res.LogicalBytes += g.Size * int64(len(g.Others))
 	}
-	return res, nil
+	return nil
 }
 
 // hashCandidate opens the file, proves it is still the indexed object, and

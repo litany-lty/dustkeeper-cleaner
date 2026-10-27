@@ -185,14 +185,17 @@ ContractJSON: `{"purpose":"miscapture_compensation"}`,
 # 第二轮复核（`dustkeeper-code-review-and-next-plan-20261026.md`）整改对照
 
 > 核对方式：先写能在旧版证明问题的失败测试，再修；结论只跟测试和实跑走。
-> 全量结果（2026-10-26，darwin/arm64, APFS）：
+> 全量结果（2026-10-27，darwin/arm64, APFS + Linux 容器）：
 >
 > ```
 > go build ./...                干净
 > go vet ./...                  干净
-> go test ./... -count=1        全部通过（含 test/release、test/eval）
-> ./build/build.sh              dev：darwin-arm64 产出 + SHA256SUMS
+> go test ./... -count=1        全部通过（含 test/bench 跳过、test/release、test/eval）
+> go test -race ./... -count=1  全部通过
+> ./build/test-linux.sh         全部通过（Docker golang:1.26-bookworm + ext4 loop，privileged）
+> ./build/build.sh              dev：darwin-arm64 产出 + SHA256SUMS + build-facts.txt，smoke=ok
 > ./build/build.sh --release    缺三个交叉目标 → 退出 1
+> bench 10 万 / 100 万          docs/evidence/performance-{100k,1m}.md（由运行生成）
 > ```
 
 ## 7.1 逐项状态
@@ -213,9 +216,9 @@ ContractJSON: `{"purpose":"miscapture_compensation"}`,
 | R10 | 后台自动清空被零额度拦住 | 实现待补测 | `domain.ActionLedger` 分为 Q/P 两个独立账本，`runner.go` 用 `MaxAutoPurgeFiles/Bytes` 建 P 账本；`TestZeroBudgetForbidsTheAction`、`TestBudgetExhaustionLeavesTheRestAlone`。**缺**：双授权 → 到期 → 后台确实清空的端到端断言 |
 | R11 | 扫描中断被当成完成 | 关闭（A19/A20） | `scan_queue` 增加 `failed`、`attempts`、`claim_seq`、`last_error`（migration 003），`scopes.scan_interrupts` 记录连续未完成轮次。失败的目录不再标 done：它留在队列里，`ScanQueueStateOf` 把它计入 pending，所以既不能完成 epoch，也不能退休自己的 observation。领取按 least-recently-claimed 排序，中断时把同批未被打开的目录 `ReleaseClaimed` 回 pending（`claim_seq=NULL`），超大目录因此不能每轮重新抢在最前。用例：`TestAFailedDirectoryCannotCompleteTheEpochOrRetireItsOwnObservations`（A19）、`TestAnInterruptedDirectoryDoesNotStarveTheOnesBehindIt`（A20）。顺带修掉 `OpenDir("")` 用 dup 共享文件偏移、第二次列举根目录返回空列表的缺陷（`fsops.Root.openRoot`，重开并核对 dev/ino）。**缺**：`internal/scan` 仍无包内单元测试，证据都在 `test/integration` |
 | R12 | 自然语言能力与安全落地 | 关闭（5 项里 5 项；A22 真实模型报告仍缺） | 见 §7.2；`TestEveryDocumentedFieldIsRequired`、`TestRequiredFieldsRejectNull`、`TestEmptyCollectionsAreNotMissingFields`、`TestFieldsMustHaveTheDocumentedShape`、`TestMaxSizeBytesMustBePresentButMayBeNull`、`TestParseDraftRejectsCaseVariantsOfItsOwnKeys`、`TestParseRejectsTwoSpellingsOfOneField`、`TestParseAcceptsTheExactFieldNames`、`TestModelDraftsGoThroughTheSameFieldContract`、`TestDraftVariantsAreJudgedByFieldPresence`、`TestDraftRequestCarriesTheAllowedScopes`、`TestDraftRequestBodyMatchesTheSnapshot`、`TestNormalCommandsNeverCallTheModel`、`test/eval`（`TestTheSemanticGateCatchesWhatTheReviewNames` 等） |
-| R13 | 脱离数据库的救援入口 | P1 关闭 / P2 未做 | `internal/rescue`（只读盘点，先于 `openStore`）、`cmd_object.go` 的 `recover inspect --root`；`TestManifestInventoryWorksWithoutTheDatabase`、`TestManifestInventoryNeedsNoStateDirectory`、`TestManifestInventoryListsUnexplainedEntries`、`TestManifestInventoryRefusesAnUnmanagedDirectory`。**未做**：run_id/op_id 结构化诊断、日志大小上限与轮转（全仓仍无 `log/slog`） |
-| R14 | 性能证据 | 未做 | 见 §7.3 |
-| R15 | 发布脚本与平台声明 | 关闭 | `build/build.sh` 区分 dev/release、声明四个必须产出的目标、签名与校验失败即退出、固定 musl 静态策略、`release-manifest.txt`；`TestReleaseFailsWhenACrossTargetHasNoCompiler`、`TestReleaseFailsWhenSigningFails`、`TestReleaseFailsWhenTheChecksumToolFails`、`TestReleaseFailsWhenATargetProducesNoArtifact`、`TestChecksumsCoverOnlyThisBuild`、`TestReleaseSucceedsWhenEverythingIsPresent`、`TestDevelopmentBuildMaySkipTargets`；`--label` 贯通与显式 00:00 由 `TestScheduleRenderHonoursMidnightAndLabel`、`TestScheduleRenderKeepsTheDocumentedDefault`、`TestLabelDrivesTheFileNames`、`TestExplicitMidnightIsHonoured` 覆盖 |
+| R13 | 脱离数据库的救援入口与运行诊断 | 关闭（P1 + P2，A23 覆盖） | **不可读≠不存在**：`rescue.Inspect` 现在按目录状态给结论——`object_state=read` 才能说"某个对象不在"；`missing`（整个 objects 目录 ENOENT）是对全体的确证；`unreadable` 只产出 `unverified`（原来会产出 `manifest_without_object`，把"没看成"说成"没了"）。单条目 stat 失败也从 `conflict` 改判 `unverified`。CLI 输出 `objects directory: <state>` 与 `unverified` 计数，`unverified>0` 时退出 6 并给出 `next_steps`。**诊断**：`internal/diag` 写 `<state>/logs/dustkeeper.jsonl`（2 MiB × 3 轮转、单字段 4 KiB 截断、0600、UTC RFC3339Nano），`phase=begin|result|run|scope|op` 五类记录，字段含 run_id / command / instance / scope_id / plan_id / object_id / op_id / item_id / action / outcome / code / status / exit / retryable / control / next_steps / message 与本轮读取字节、动作、待处理计数；`recovery.Result` 增加 `op_id` 并逐条入日志。用例：`TestAnUnreadableObjectsDirectoryDoesNotClaimTheObjectsAreGone`、`TestAMissingObjectsDirectoryIsReportedAsMissingNotUnverified`、`TestRecoverInspectReportsAnUnreadableObjectsDirectory`、`TestRecoverInspectOnAReadableDirectorySucceeds`、`TestTheLogRecordsTheRunAndItsConclusion`、`TestTheLogNeverCarriesTheModelKeyOrFileContents`、`TestEveryRecordUsesTheDocumentedKeys`、`TestARecordCarriesTheDiagnosticFields`、`TestTheLogRotatesAndStaysBounded`、`TestAnOversizedFieldIsTruncatedNotDropped`、`TestANilLoggerIsSafe`、`TestTheLogFileIsNotWorldReadable`。**仍缺**：执行期 Q/P intent 的 op_id 没有逐条进日志（只有对账结果有），`internal/rescue` 无包内单测 |
+| R14 | 性能证据 | 部分关闭（扫描有界已证，去重内存未关） | 证据文件由运行生成，不手写：`docs/evidence/performance-100k.md`（10 万、30% 重复）与 `docs/evidence/performance-1m.md`（100 万、0% 重复），各带 JSON sidecar 与树形/大小分布/fan-out。10 万（30% 重复）：扫描 100 000 文件 / 1 051 目录、wall 38.5 s（CPU 1.7+3.4 s），epoch 完整、队列 pending 0、observation 行数 100 000、峰值 RSS 30.0 MiB、库 59.0 MiB（619 B/文件），逻辑重复字节 52.3 MiB；中断续跑 8 批累计扫描 1.00× 树大小、最长单批 5.2 s、各批峰值 31.0 MiB。100 万（0% 重复）：扫描 1 000 000 文件、wall 79.9 s（CPU 6.9+14.6 s）、峰值 RSS 30.8 MiB、库 588.5 MiB（617 B/文件）；续跑 17 批、1.00×、最长单批 7.8 s。**未关闭**：`dedup` 峰值 RSS 389 MiB（4.1 KB/文件；100 万、0% 重复时 1 158 MiB / 1.2 KB/文件）随文件数线性增长，超出 256 MiB 扫描门槛——已改为按大小分组流式处理（不再同时持有 bySize/byHash/结果三份索引），但结果集本身仍是每重复组两个候选，需分页/逐组落盘才能达标。顺带修掉一处一直错报的数字：`dedup.Result.LogicalBytes` 声明了、CLI 也在报，但从未赋值，所以每个重复计划都写 `logical_bytes: 0`——"这个计划能省多少"被回答成 0。扫描 wall 时间也被**每目录一次提交**主导（2 万文件 31.5 s、10 万文件 38.5 s，目录数同为 1 051，约 30–37 ms/目录；`synchronous=EXTRA` 下每目录 claim 与 done 各一次提交/fsync，文件数从 2 万涨到 10 万只多 7 s）。这两条按 §6.4-10 记为未关闭 |
+| R15 | 发布脚本与平台声明 | 关闭（真实 musl + 产物检查 + 冒烟） | `build/build.sh` 对每个 linux 目标做**双重证明**：编译器 `-v` 输出里必须有 musl 证据（`musl-gcc.specs` / musl 头路径），制品再用 `build/verify-artifact`（`debug/elf`：Machine、ET_EXEC/ET_DYN、PT_INTERP、`ImportedLibraries`）判 `linkage=static`；缺任一证据即退出 1，`ALLOW_UNPROVED_LIBC=1` 只允许 dev 记 `linkage=unproved` 且不写发布 manifest。`build-facts.txt` 逐目标记录 `format/arch/linkage/toolchain/compiler_version/sysroot/musl_evidence/build_env/artifact/smoke`，发布 manifest 由 facts 生成并在写盘前校验每个 linux 目标都是 `linkage=static`。本机冒烟用 `<binary> version`（不是 `--version`），非本机目标记 `smoke=not-runnable-here`。容器内真实构建 linux/arm64 静态制品：`readelf` 事实 `interp=none needed=0`，`smoke=ok`。用例：`TestAPureGoLinuxBinaryIsRecognisedAsStatic`、`TestTheWrongArchitectureIsRefused`、`TestATextFileIsNotAnArtifact`、`TestTheDarwinPathReadsARealMachO`、`TestReleaseFailsWhenTheLinuxToolchainIsNotMusl`、`TestDevelopmentBuildRefusesToChecksumAnUnprovedArtifact`、`TestReleaseFailsWhenTheArtifactIsNotStatic`、`TestADeveloperCanBuildAnUnprovedLinuxArtifactExplicitly`、`TestReleaseSucceedsWhenEverythingIsPresent`；`--label` 贯通与显式 00:00 由 `TestScheduleRenderHonoursMidnightAndLabel`、`TestScheduleRenderKeepsTheDocumentedDefault`、`TestLabelDrivesTheFileNames`、`TestExplicitMidnightIsHonoured` 覆盖。**仍缺**：linux/amd64、darwin/amd64 未在真机执行，只记 `not-runnable-here` |
 
 ## 7.2 R12 的五项整改
 
@@ -232,8 +235,47 @@ ContractJSON: `{"purpose":"miscapture_compensation"}`,
 
 ## 7.3 仍未关闭
 
-- **R14 性能证据**：`test/bench` 只有 `TestScanMemoryIsBounded` 一条，尚未"先记完整 epoch 与有效记录数，再记 RSS/耗时"，10 万门槛仍是 256 MiB，`dedup` 的 bySize/byHash 仍是一次性分组。这一项没有任何新证据，按 §6.4-10 不能算关闭。
-- **R13 P2 运行可观测性**：结构化诊断（run_id/op_id）、最终汇总、日志上限与轮转都没做，全仓仍没有一行日志写入。
+- **R14 去重内存**：按大小分组流式处理后仍是"每重复组两个候选"常驻内存，10 万文件／30% 重复实测峰值
+  442 MiB（4.4 KB/文件），未达 256 MiB。要达标必须把分组结果分页落盘（SQLite 索引或逐组写计划），
+  本轮只做到"不再同时持有三份全量索引"，因此 R14 记为部分关闭。
+- **R14 扫描吞吐**：扫描 wall 时间由每目录一次提交主导（2 万与 10 万文件都约 32 s，1 051 个目录），
+  `synchronous=EXTRA` 下每个目录 claim 与 done 各一次 fsync。功能上正确（epoch 完整性未受影响），
+  但对"很多小目录"的树是明显浪费；批量化提交需要重新论证崩溃边界，本轮未动。
 - **A22 真实模型评测报告**：门禁与报告格式已就位，缺真实 provider 的一次运行与逐条复核标记。
-- **R03/R04/R05/R06/R07/R10 的专门失败测试**：代码已改、全量测试通过，但缺"能在旧版复现问题"的独立用例。按 §6.4-1 的标准，它们只能算"实现待补测"，不能算关闭。
-- **真实平台闭环**：只有 darwin/arm64 跑过"注册 → 计划 → 隔离 → 不覆盖恢复 → 到期清空 → 重启对账"。linux-amd64、linux-arm64、darwin-amd64 只做过交叉编译，没有在目标机器上执行过，文档与 README 已按"实验性"标注。
+- **A06/A07（R04 残余）**：`plan apply` 与 `purge apply` 现在共用 `plan.LoadMembers`，purge 计划成员
+  加载有服务层用例（`TestAPurgePlanCanBeLoadedForApproval`），但"同一 purge 计划从两条 CLI apply 结果
+  一致"与"第一规则 held 后第二规则无新 intent、扫描状态写失败后其他 scope 无新 intent"仍**没有**可执行
+  断言：CLI 走系统时钟，而隔离保留期只能在受控时钟下推进，端到端构造需要把 fake clock 注进 CLI。
+  在两平台 CLI 层补齐之前，R04 保持"实现待补测"。
+- **R03/R05/R06/R07/R10 的专门失败测试**：代码已改、全量测试通过，但缺"能在旧版复现问题"的独立用例。
+  按 §6.4-1 的标准，它们只能算"实现待补测"，不能算关闭。
+- **真实平台闭环**：只有 darwin/arm64 跑过"注册 → 计划 → 隔离 → 不覆盖恢复 → 到期清空 → 重启对账"。
+  linux-amd64、linux-arm64、darwin-amd64 只做过交叉编译与产物事实检查，没有在目标机器上执行过，
+  `build-facts.txt` 里如实记 `smoke=not-runnable-here`，文档与 README 按"实验性"标注。
+- **`internal/rescue`、`scan`、`execute`、`recovery`、`run` 仍无包内单测**：`internal/diag` 与
+  `internal/rescue` 的行为证据都在 `test/integration` 与 `cmd/dustkeeper`，这是刻意的（测真实入口），
+  但 §7.1 的 T04/T06/T07 要求仍然没有逐一满足。
+
+## 7.4 B5 批次（R13/R14/R15）的可复核入口
+
+```sh
+# 诊断日志：字段、上限、轮转、不泄密
+go test ./internal/diag ./cmd/dustkeeper -run 'Log|Record' -count=1 -v
+
+# 救援与"不可读≠不存在"
+go test ./internal/rescue ./test/integration -run 'Inventory|Unreadable|MissingObjects' -count=1 -v
+
+# 发布产物：真实 musl 证据、静态链接、冒烟
+go test ./test/release -count=1 -v
+./build/build.sh                     # dev：本机目标 + build-facts.txt
+./build/build.sh --release           # 缺目标/缺证据 → 退出 1
+
+# 性能证据（会真的建树，默认不跑）
+DUSTKEEPER_BENCH=1 DUSTKEEPER_BENCH_FILES=100000 \
+  DUSTKEEPER_BENCH_OUT=docs/evidence/performance-100k.md \
+  go test ./test/bench -run TestLargeTreeScanEvidence -count=1 -v
+```
+
+`docs/evidence/*.md` 由上面的命令生成（文件头写明 "generated by test/bench; do not edit by hand"），
+同目录的 `.json` 是同一份数据，便于脚本比对。
+

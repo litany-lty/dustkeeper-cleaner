@@ -56,6 +56,25 @@ dustkeeper init
 | 数据库 | `<state>/state.db` | 同左 |
 | 日志目录 | `<state>/logs` | 同左 |
 
+日志目录里是 `dustkeeper.jsonl`（当前文件）与 `dustkeeper.jsonl.1..3`（轮转后的历史）。一个大小上限
+2 MiB、最多保留 3 个历史文件，单条记录的字符串字段超过 4 KiB 会被截断并标记 `...[truncated]`；文件权限
+0600。写入发生在**持实例锁的命令**内（`begin` 阶段一条，`result` 阶段一条，`run`/`reconcile` 另加
+每 scope、每操作各一条），`help`/`version` 这类只读命令不写日志。
+
+每条记录是一行 JSON，可直接 `jq`：
+
+```sh
+# 昨天的失败，以及程序建议下一步做什么
+jq -c 'select(.phase=="result" and .exit!=0) | {command,code,message,next_steps}' \
+  "$STATE/logs/dustkeeper.jsonl"
+
+# 某次 run 的结论与各 scope 的停止原因
+jq -c 'select(.phase=="run" or .phase=="scope") | {phase,run_id,scope_id,control,message}' \
+  "$STATE/logs/dustkeeper.jsonl"
+```
+
+日志里不含文件内容、清单正文、模型提示词与密钥：它记录的是"发生了什么"，不是"数据是什么"。
+
 `DUSTKEEPER_CONFIG_DIR` / `DUSTKEEPER_STATE_DIR` 可以覆盖以上路径。**同一台机器上跑多个实例时**必须分别
 设置——但请注意 owner marker 仍然会阻止两个状态库管理同一棵目录树。
 

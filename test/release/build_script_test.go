@@ -49,11 +49,37 @@ if [ "${1:-}" = "build" ]; then
 	if [ "${STUB_SKIP_ARTIFACT:-0}" = "1" ]; then
 		exit 0
 	fi
-	printf 'stub binary %s %s\n' "${GOOS:-}" "${GOARCH:-}" >"$out"
+	# An artifact that runs, so the smoke step has something to execute.
+	{
+		printf '#!/bin/sh\n'
+		printf 'echo "dustkeeper stub %s"\n' "${GOOS:-}-${GOARCH:-}"
+	} >"$out"
+	chmod 755 "$out"
 	exit 0
 fi
 echo "stub go: unsupported invocation: $*" >&2
 exit 2
+`
+
+// stubCC answers the two questions the libc policy asks a compiler: which triple it
+// targets, and which version it is.
+const stubCC = `#!/bin/sh
+case "${1:-}" in
+-dumpmachine) echo "${STUB_CC_TRIPLE:-x86_64-linux-musl}" ;;
+--version) echo "stub cc 1.0, musl-flavoured for tests" ;;
+*) exit 0 ;;
+esac
+`
+
+// stubVerify stands in for build/verify-artifact. The script's own tests are about
+// the gate's control flow, not about ELF parsing (that lives in
+// build/verify-artifact's tests), so the facts it reports are configurable.
+const stubVerify = `#!/bin/sh
+if [ "${STUB_VERIFY_FAIL:-0}" = "1" ]; then
+	echo "stub verify: the artifact needs a program interpreter" >&2
+	exit 3
+fi
+echo "format=${STUB_VERIFY_FORMAT:-elf} machine=amd64 linkage=${STUB_VERIFY_LINKAGE:-static} interp=none needed=0"
 `
 
 const stubCodesign = `#!/bin/sh
@@ -102,6 +128,8 @@ func newScriptDir(t *testing.T) *scriptDir {
 	mustWrite(t, filepath.Join(bin, "go"), stubGo, 0o755)
 	mustWrite(t, filepath.Join(bin, "codesign"), stubCodesign, 0o755)
 	mustWrite(t, filepath.Join(bin, "shasum"), stubShasum, 0o755)
+	mustWrite(t, filepath.Join(bin, "stub-cc"), stubCC, 0o755)
+	mustWrite(t, filepath.Join(bin, "stub-verify"), stubVerify, 0o755)
 
 	return &scriptDir{root: root, out: filepath.Join(root, "dist"), bin: bin}
 }
@@ -127,6 +155,9 @@ func (s *scriptDir) run(t *testing.T, extra map[string]string, args ...string) (
 		"TMPDIR=" + os.Getenv("TMPDIR"),
 		"STUB_HOST_OS=darwin",
 		"STUB_HOST_ARCH=arm64",
+		// A prebuilt verifier: the script would otherwise compile
+		// ./build/verify-artifact with the stub "go", which cannot compile anything.
+		"VERIFY_ARTIFACT=" + filepath.Join(s.bin, "stub-verify"),
 	}
 	for k, v := range extra {
 		env = append(env, k+"="+v)
@@ -158,7 +189,7 @@ func asExitError(err error, target **exec.ExitError) bool {
 }
 
 // crossCompilers is the environment a maintainer would have on a macOS host when
-// every declared target is buildable.
+// every declared target is buildable, with a musl-targeting compiler for Linux.
 func crossCompilers() map[string]string {
 	return map[string]string{
 		"CC_darwin_amd64": "stub-cc",
@@ -263,6 +294,116 @@ func TestReleaseSucceedsWhenEverythingIsPresent(t *testing.T) {
 	}
 	if !strings.Contains(string(manifest), "linux_libc=musl-static") {
 		t.Errorf("the release manifest does not record the libc policy:\n%s", manifest)
+	}
+	for _, want := range []string{
+		"linux_libc_proof=",
+		"target=linux-amd64",
+		"target=linux-arm64",
+		"toolchain=x86_64-linux-musl",
+		"compiler_version=",
+		"smoke=ok",
+	} {
+		if !strings.Contains(string(manifest), want) {
+			t.Errorf("the release manifest has no %q:\n%s", want, manifest)
+		}
+	}
+}
+
+// The libc policy cannot be proved by "-static": that flag asks the linker for a
+// static link and says nothing about which libc was used. A glibc cross compiler
+// would produce a libc-static binary that this script would label musl-static, so
+// the compiler's own target triple is checked before anything is labelled.
+func TestReleaseFailsWhenTheLinuxToolchainIsNotMusl(t *testing.T) {
+	s := newScriptDir(t)
+
+	env := crossCompilers()
+	env["STUB_CC_TRIPLE"] = "x86_64-linux-gnu"
+	out, code := s.run(t, env, "--release")
+	if code == 0 {
+		t.Fatalf("a release built with a glibc cross compiler exited 0:\n%s", out)
+	}
+	if !strings.Contains(out, "not musl") || !strings.Contains(out, "linux-amd64") {
+		t.Errorf("the failure does not name the target and the reason:\n%s", out)
+	}
+	if !strings.Contains(out, "x86_64-linux-gnu") {
+		t.Errorf("the failure does not quote the compiler's own triple:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "release-manifest.txt")); err == nil {
+		t.Errorf("a release without a libc proof still wrote a manifest")
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "SHA256SUMS")); err == nil {
+		t.Errorf("a release without a libc proof still wrote SHA256SUMS")
+	}
+}
+
+// A development build may skip, but it must not quietly checksum an artifact whose
+// policy could not be proved: that is how an unlabelled glibc binary reaches a user.
+func TestDevelopmentBuildRefusesToChecksumAnUnprovedArtifact(t *testing.T) {
+	s := newScriptDir(t)
+
+	env := crossCompilers()
+	env["STUB_CC_TRIPLE"] = "x86_64-linux-gnu"
+	out, code := s.run(t, env)
+	if code != 0 {
+		t.Fatalf("a development build should report the problem, not fail: %s\n%s", out, out)
+	}
+	if !strings.Contains(out, "not musl") {
+		t.Errorf("the development build said nothing about the libc policy:\n%s", out)
+	}
+	if strings.Contains(s.sums(t), "linux-amd64") {
+		t.Errorf("an artifact built against glibc was checksummed:\n%s", s.sums(t))
+	}
+}
+
+// A developer on a glibc machine still needs a binary. The escape hatch exists so
+// that the alternative is not "edit the script": the artifact is built, but labelled
+// unproved, and a release refuses the same environment.
+func TestADeveloperCanBuildAnUnprovedLinuxArtifactExplicitly(t *testing.T) {
+	s := newScriptDir(t)
+
+	env := crossCompilers()
+	env["STUB_CC_TRIPLE"] = "x86_64-linux-gnu"
+	env["ALLOW_UNPROVED_LIBC"] = "1"
+
+	out, code := s.run(t, env)
+	if code != 0 {
+		t.Fatalf("an explicit unproved development build failed:\n%s", out)
+	}
+	if !strings.Contains(out, "linkage is unproved") {
+		t.Errorf("the build did not say the linkage is unproved:\n%s", out)
+	}
+
+	facts, err := os.ReadFile(filepath.Join(s.out, "build-facts.txt"))
+	if err != nil {
+		t.Fatalf("read facts: %v", err)
+	}
+	if !strings.Contains(string(facts), "target=linux-amd64 format=elf arch=amd64 linkage=unproved") {
+		t.Errorf("the facts do not record the unproved linkage:\n%s", facts)
+	}
+	if strings.Contains(string(facts), "linkage=static toolchain=x86_64-linux-gnu") {
+		t.Errorf("a glibc build was recorded as a static musl artifact:\n%s", facts)
+	}
+
+	// The same environment cannot produce a release, whatever the variable says.
+	if out, code := s.run(t, env, "--release"); code == 0 {
+		t.Fatalf("ALLOW_UNPROVED_LIBC produced a release:\n%s", out)
+	}
+}
+
+// The artifact itself has to be read, not inferred from the compiler. A binary with
+// a program interpreter is not the static build the policy promises, whatever the
+// compiler says it targets.
+func TestReleaseFailsWhenTheArtifactIsNotStatic(t *testing.T) {
+	s := newScriptDir(t)
+
+	env := crossCompilers()
+	env["STUB_VERIFY_FAIL"] = "1"
+	out, code := s.run(t, env, "--release")
+	if code == 0 {
+		t.Fatalf("a release with a dynamically linked artifact exited 0:\n%s", out)
+	}
+	if !strings.Contains(out, "not a static") {
+		t.Errorf("the failure does not say the artifact is not static:\n%s", out)
 	}
 }
 

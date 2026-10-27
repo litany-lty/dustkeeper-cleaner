@@ -464,12 +464,17 @@ func (r *Runner) automaticAuthority(ctx context.Context, it store.Item,
 // one: a failed directory was recorded as "done", so the run that failed it had
 // nothing to report and the next run had nothing to resume.
 type ScanState struct {
-	Complete         bool
-	Interrupted      bool
-	Incomplete       bool
-	FailedDirs       int
-	DeepScanRequired bool
-	Interrupts       int64
+	Complete         bool  `json:"complete"`
+	Interrupted      bool  `json:"interrupted"`
+	Incomplete       bool  `json:"incomplete"`
+	FailedDirs       int   `json:"failed_dirs"`
+	DeepScanRequired bool  `json:"deep_scan_required"`
+	Interrupts       int64 `json:"interrupts_consecutive"`
+	// Pending and Epoch are reported so that "did this pass finish the tree?"
+	// can be checked from the envelope alone: a complete epoch with pending work
+	// is a contradiction, and a reviewer should not need the database to see it.
+	Pending int64 `json:"queue_pending"`
+	Epoch   int64 `json:"epoch"`
 }
 
 // ScanScope runs one scanning batch and reports whether the epoch completed.
@@ -523,6 +528,8 @@ func ScanScope(ctx context.Context, st *store.Store, clock domain.Clock, batch i
 			FailedDirs:       int(state.Failed),
 			DeepScanRequired: state.Pending > 0,
 			Interrupts:       interrupts,
+			Pending:          state.Pending,
+			Epoch:            epoch,
 		}, nil
 	}
 	// Only a completed epoch may retire unseen entries.
@@ -532,7 +539,7 @@ func ScanScope(ctx context.Context, st *store.Store, clock domain.Clock, batch i
 	if err := st.ResetScanInterrupts(ctx, sc.Scope.ID); err != nil {
 		return stats, ScanState{}, err
 	}
-	return stats, ScanState{Complete: true}, nil
+	return stats, ScanState{Complete: true, Epoch: epoch}, nil
 }
 
 // CurrentEpoch resumes an unfinished scan epoch, or starts a new one.

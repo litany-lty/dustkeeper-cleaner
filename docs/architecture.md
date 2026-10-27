@@ -373,10 +373,17 @@ SQLite 本身用单写连接（`SetMaxOpenConns(1)`）、`journal_mode=DELETE`�
   （`scan.vaultName`）；这在一期是可接受的取舍（同卷保证排他 rename 可用），代价是清理整棵目录时会连同
   隔离区一起被带走。
 - `dedup` 的 keeper 选择是保守的：元数据不一致就报告"保留"，不做近似判定；跨 scope 提升 keeper 只在
-  提供 `--keeper-scope` 时发生。分组仍是一次性按 size/hash 读完，没有分页。
-- 没有运行日志子系统：`logs/` 目录会被创建和检查，但没有写入、没有 5 MiB × 5 轮转，也没有
-  run_id/op_id 结构化诊断（文档 §13.2 / R13 P2）。
+  提供 `--keeper-scope` 时发生。分组已改为**按大小分组流式处理**（一个 size 组哈希完就比对并释放），
+  因此工作集不再同时持有 bySize + byHash + 结果三份索引；但结果集本身仍是"每个重复组两个候选"，
+  峰值随文件数线性增长（10 万文件实测 442 MiB），**未达到 256 MiB 的扫描门槛**，见
+  [`docs/compliance.md`](compliance.md) §7.3 与 `docs/evidence/performance-100k.md`。
+- 运行日志在 `internal/diag`（`log/slog` + 自实现轮转）：`<state>/logs/dustkeeper.jsonl`，2 MiB × 3，
+  单字段 4 KiB 截断，文件 0600；记录 `phase=begin|result|run|scope|op`，字段含 run_id / scope_id /
+  plan_id / object_id / op_id / item_id / code / status / exit / retryable / control / next_steps，
+  以及本轮读取字节、动作数与待处理计数。文件内容、模型密钥不进入日志（`TestTheLogNeverCarriesTheModelKeyOrFileContents`
+  在真实命令上断言）。
 - `internal/scan`、`execute`、`recovery`、`dedup`、`run` 仍没有包内单测，主路径由 `test/integration`
-  覆盖；`test/bench` 只有一条内存门槛用例，R14 的"先记完整 epoch 与有效记录数"还没做。
+  覆盖；`test/bench` 已能产出完整的工作量与资源证据（`docs/evidence/performance-*.md`），但 `dedup`
+  的内存上限仍未解决（见上）。
 
 逐条的文档对照、仍缺的验收用例与"实现待补测"清单见 [`docs/compliance.md`](compliance.md)。

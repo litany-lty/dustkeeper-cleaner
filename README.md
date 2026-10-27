@@ -9,9 +9,9 @@
 一期实现是 Go + 原生 SQLite 的单个可执行文件，无常驻进程、无后台模型、不依赖 Python/Java。
 
 > **状态：一期收口中，尚未验收。** darwin/arm64 上"注册 → 计划 → 隔离 → 不覆盖恢复 → 到期清空 →
-> 重启对账"的闭环已经跑过；其余三个发布目标只交叉编译、未在真机执行，标为实验性。仍未关闭的项
-> （性能证据、运行日志、若干故障矩阵用例）逐条列在 [`docs/compliance.md`](docs/compliance.md) §7.3，
-> 不用"功能结构齐全"代替验收。
+> 重启对账"的闭环已经跑过；其余三个发布目标只交叉编译 + 产物事实检查（musl 来源、静态链接、架构），
+> 未在真机执行，标为实验性。仍未关闭的项（`dedup` 峰值内存、扫描每目录提交开销、若干故障矩阵用例）
+> 逐条列在 [`docs/compliance.md`](docs/compliance.md) §7.3，不用"功能结构齐全"代替验收。
 
 > 它不猜「哪个文件你没用」。它只执行你写下来、复核过、并按版本授权过的那一条规则。
 
@@ -135,13 +135,29 @@ go test -race ./...
 
 "实验性"是准确说法：这些目标能编译、能通过 `SHA256SUMS` 校验，但没有在真机上跑过"注册 → 计划 → 隔离 → 不覆盖恢复 → 到期清空 → 重启对账"。验收记录见 `docs/compliance.md`。
 
-10 万文件的内存基准（会真的创建文件，默认不跑）：
+性能证据（会真的创建文件，默认不跑）。它先核对"活儿干完了"，再报资源：
 
 ```sh
-DUSTKEEPER_BENCH=1 go test ./test/bench -run TestScan -v
+DUSTKEEPER_BENCH=1 DUSTKEEPER_BENCH_FILES=100000 \
+  DUSTKEEPER_BENCH_OUT=docs/evidence/performance-100k.md \
+  go test ./test/bench -run TestLargeTreeScanEvidence -count=1 -v
 ```
 
-实测（darwin/arm64，APFS）：10 万个文件扫描 4.9 s，峰值 RSS 30.4 MiB。扫描的内存不随文件数增长。
+实测（darwin/arm64，APFS，10 万文件／1 000 个叶子目录／30% 重复，见
+[`docs/evidence/performance-100k.md`](docs/evidence/performance-100k.md)）：
+
+| 阶段 | 结果 |
+|---|---|
+| 扫描 | 100 000 文件 / 1 051 目录，wall 38.5 s，epoch 完整，队列 pending 0，observation 100 000 行 |
+| 峰值 RSS | 30.0 MiB（门槛 256 MiB；100 万文件时仍是 30.8 MiB） |
+| 数据库 | 59.0 MiB，约 619 B/文件（100 万文件时 588.5 MiB） |
+| 中断续跑 | 8 批，累计扫描 1.00× 树大小（没有重复读），最长单批 5.2 s |
+| `dedup` | 30 000 组可规划、52.3 MiB 逻辑字节，峰值 RSS **389 MiB** —— 随文件数线性增长，**未达 256 MiB**，见 §7.3 |
+
+1 000 000 文件的那一轮（0% 重复，用于单独观察索引本身）见
+[`docs/evidence/performance-1m.md`](docs/evidence/performance-1m.md)。不设 `DUSTKEEPER_BENCH_OUT`
+时只打印数字、不落盘；`DUSTKEEPER_BENCH_MAX_RSS_MB` 改扫描门槛，`DUSTKEEPER_BENCH_DEDUP_MAX_RSS_MB`
+给 `dedup` 单独设一个门槛（默认只报告）。
 
 fuzz 目标：`FuzzMatchName`、`FuzzHasDirPrefix`、`FuzzSplitRelative`、`FuzzValidateName`、
 `FuzzParseDraft`、`FuzzParseRule`。种子每次 `go test` 都跑；深挖用 `-fuzz`。

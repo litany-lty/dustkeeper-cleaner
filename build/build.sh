@@ -19,8 +19,20 @@
 # Linux artifacts are statically linked against musl. Point CC_linux_amd64 /
 # CC_linux_arm64 at a musl cross compiler (x86_64-linux-musl-gcc,
 # aarch64-linux-musl-gcc). A glibc-linked build is not produced, so there is
-# exactly one libc story per release. The policy is enforced by passing
-# "-linkmode external -extldflags -static".
+# exactly one libc story per release.
+#
+# The policy is proved twice, because "-static" alone only asks the linker for a
+# static link and says nothing about which libc was used:
+#
+#   1. the compiler says which triple it targets (<cc> -dumpmachine must name musl),
+#      and its version is recorded next to the artifact;
+#   2. the artifact is opened and its headers read (build/verify-artifact): no
+#      PT_INTERP, no DT_NEEDED. A binary that passes both is self-contained. A
+#      binary that cannot be checked fails the release instead of being labelled.
+#
+# The release manifest is written from those recorded facts, not from a constant.
+# When the proof is missing there is no manifest to write, because the release has
+# already failed.
 #
 # Windows is not a target: the tree relies on unix syscalls (flock, renameatx_np /
 # renameat2, F_FULLFSYNC) that have no equivalent in this design. Saying so here
@@ -45,6 +57,15 @@ environment:
   VERSION=...          version stamped into the binary (default 1.0.0-phase1)
   CC_<os>_<arch>=...   C compiler for a cross target, e.g.
                        CC_linux_amd64=x86_64-linux-musl-gcc
+  VERIFY_ARTIFACT=...  use this artifact verifier instead of building
+                       build/verify-artifact (used by the script's own tests)
+  DUSTKEEPER_BUILD_ENV=...  how to describe the build environment in the release
+                       manifest, e.g. "docker:golang@sha256:..." for a pinned builder
+                       image. Recorded, not interpreted.
+  ALLOW_UNPROVED_LIBC=1  development only: build a Linux target even when the
+                       compiler does not target musl. The fact is recorded as
+                       linkage=unproved and the artifact is never labelled musl.
+                       A release ignores this variable and refuses instead.
   DEBUG=1              keep symbols (no -s -w)
   RELEASE=1            same as --release
 EOF
@@ -93,6 +114,28 @@ fi
 BUILT=""
 PROBLEMS=""
 FAILED=0
+
+# Facts are collected while building and become the release manifest. A manifest
+# assembled from constants at the end of the script is a wish, not a record.
+FACTS_FILE="$OUT/build-facts.txt"
+: >"$FACTS_FILE"
+record_fact() {
+	printf '%s\n' "$1" >>"$FACTS_FILE"
+}
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/dustkeeper-build.XXXXXX")
+trap 'rm -rf "$TMPD"' EXIT
+
+# The verifier reads the artifacts' headers. It is built once, before any target, so
+# a missing verifier is a build failure rather than four confusing ones.
+VERIFY=${VERIFY_ARTIFACT:-}
+if [ -z "$VERIFY" ]; then
+	VERIFY="$TMPD/verify-artifact"
+	if ! go build -trimpath -o "$VERIFY" ./build/verify-artifact; then
+		echo "error: could not build the artifact verifier; refusing to produce unchecked artifacts" >&2
+		exit 1
+	fi
+fi
 
 # record_problem remembers a target once, so the final report reads as a list.
 record_problem() {
@@ -153,6 +196,68 @@ build_one() {
 		return 0
 	fi
 
+	# Two independent facts about a Linux artifact: which libc the compiler targets,
+	# and what the artifact actually needs at run time. Neither one alone is proof.
+	if [ "$os" = "linux" ]; then
+		probe_cc=${cc:-cc}
+		triple=$("$probe_cc" -dumpmachine 2>/dev/null || echo unknown)
+		ccver=$("$probe_cc" --version 2>/dev/null | head -1 || echo unknown)
+		sysroot=$("$probe_cc" -print-sysroot 2>/dev/null || echo "")
+		# Which libc will this compiler actually link? A compiler's real target is
+		# what it says about its own spec and include search path, not what its
+		# filename is: Debian's musl-gcc reports "aarch64-linux-gnu" from
+		# -dumpmachine and is still musl, because it injects musl's specs, headers
+		# and libc.a. So the probe is a compile, and the evidence is the compiler's
+		# own account of the paths it uses.
+		probe_src="$TMPD/libc-probe.c"
+		printf 'int main(void){return 0;}\n' >"$probe_src"
+		probe_log="$TMPD/libc-probe.log"
+		"$probe_cc" -v -c "$probe_src" -o "$TMPD/libc-probe.o" >"$probe_log" 2>&1 || true
+		musl_evidence=$(grep -o '[^ "]*musl[^ "]*' "$probe_log" | head -1 || true)
+		proved=0
+		case "$triple" in
+		*musl*) proved=1 ;;
+		esac
+		if [ -n "$musl_evidence" ]; then
+			proved=1
+		fi
+		if [ "$proved" = 0 ]; then
+			# A glibc static binary is still a glibc binary: its static libc talks to
+			# the host's NSS and resolver at run time, which is why the linker warns
+			# about getaddrinfo. It must never be labelled musl-static.
+			#
+			# A development build may produce one anyway, but only when the operator
+			# asks for it with ALLOW_UNPROVED_LIBC=1, and the fact is recorded as
+			# unproved. A release refuses outright.
+			if [ "$MODE" = release ] || [ "${ALLOW_UNPROVED_LIBC:-0}" != "1" ]; then
+				complain "$target was built with $probe_cc, which targets '$triple', not musl"
+				record_problem "$target"
+				return 0
+			fi
+			if ! facts=$("$VERIFY" -file "$out" -format elf -machine "$arch" 2>&1); then
+				complain "$target is not a readable $arch ELF: $facts"
+				record_problem "$target"
+				return 0
+			fi
+			echo "dev: $target linkage is unproved (compiler targets '$triple'); this artifact is not a musl static build" >&2
+			record_fact "target=$target format=elf arch=$arch linkage=unproved toolchain=$triple compiler=$probe_cc compiler_version=\"$ccver\" build_env=${DUSTKEEPER_BUILD_ENV:-host} artifact=[$facts]"
+		else
+			if ! facts=$("$VERIFY" -file "$out" -format elf -machine "$arch" -require static 2>&1); then
+				complain "$target is not a static $arch ELF: $facts"
+				record_problem "$target"
+				return 0
+			fi
+			record_fact "target=$target format=elf arch=$arch linkage=static toolchain=$triple compiler=$probe_cc compiler_version=\"$ccver\" sysroot=${sysroot:-none} musl_evidence=$musl_evidence build_env=${DUSTKEEPER_BUILD_ENV:-host} artifact=[$facts]"
+		fi
+	else
+		if ! facts=$("$VERIFY" -file "$out" -format macho -machine "$arch" 2>&1); then
+			complain "$target is not a $arch Mach-O: $facts"
+			record_problem "$target"
+			return 0
+		fi
+		record_fact "target=$target format=macho arch=$arch linkage=linked artifact=[$facts]"
+	fi
+
 	if [ "$os" = "darwin" ]; then
 		if ! codesign --force --sign - "$out" >/dev/null 2>&1; then
 			complain "$target could not be signed"
@@ -164,6 +269,22 @@ build_one() {
 			record_problem "$target"
 			return 0
 		fi
+	fi
+
+	# Only the host's own target can be executed here. Running it is the one check
+	# that says the artifact starts at all; the other targets record that it did not
+	# run rather than pretending it did. The probe is the `version` subcommand: this
+	# program has no --version flag, and a probe the binary rejects would report a
+	# perfectly good artifact as broken.
+	if [ "$os" = "$(go env GOOS)" ] && [ "$arch" = "$(go env GOARCH)" ]; then
+		if ! smoke=$("$out" version 2>&1); then
+			complain "$target does not run on this host: $smoke"
+			record_problem "$target"
+			return 0
+		fi
+		record_fact "target=$target smoke=ok smoke_output=\"$(printf '%s' "$smoke" | head -1)\""
+	else
+		record_fact "target=$target smoke=not-runnable-here"
 	fi
 
 	BUILT="$BUILT $target"
@@ -245,15 +366,32 @@ if [ "$MODE" = release ]; then
 	fi
 
 	# Record what was produced, under which policy, on which host. "It built on my
-	# machine" is not a release note; this is.
+	# machine" is not a release note; this is. The libc line is written only after
+	# every Linux target has a recorded static-ELF proof: the label describes the
+	# artifacts in this build, it is not a constant.
+	unproved=""
+	for target in $RELEASE_TARGETS; do
+		case "$target" in
+		linux-*) grep -q "^target=$target .*linkage=static" "$FACTS_FILE" || unproved="$unproved $target" ;;
+		esac
+	done
+	if [ -n "$unproved" ]; then
+		echo "release is incomplete, libc policy unproved:$unproved" >&2
+		exit 1
+	fi
 	{
+		echo "# release manifest: one key=value per record"
+		echo "# artifact and toolchain facts below were read during this build"
 		echo "version=$VERSION"
 		echo "commit=$COMMIT"
 		echo "built=$STAMP"
 		echo "host=$(uname -s)-$(uname -m)"
+		echo "build_env=${DUSTKEEPER_BUILD_ENV:-host}"
 		echo "go=$(go version 2>/dev/null || echo unknown)"
 		echo "linux_libc=musl-static"
+		echo "linux_libc_proof=compiler -dumpmachine names musl; artifact has no PT_INTERP and no DT_NEEDED"
 		echo "targets=$RELEASE_TARGETS"
+		cat "$FACTS_FILE"
 	} >"$OUT/release-manifest.txt"
 fi
 
