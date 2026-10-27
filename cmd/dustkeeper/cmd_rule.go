@@ -19,7 +19,7 @@ import (
 func cmdRule(ctx context.Context, a *app, args []string) (output, error) {
 	if len(args) == 0 {
 		return output{}, errs.New(errs.CodeInvalidArgument,
-			"rule needs a subcommand: draft, import, show, validate, preview, activate, authorize, revoke, disable")
+			"rule needs a subcommand: draft, import, show, validate, preview, enable, activate, authorize, revoke, disable")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -33,6 +33,8 @@ func cmdRule(ctx context.Context, a *app, args []string) (output, error) {
 		return ruleValidate(ctx, a, rest)
 	case "preview":
 		return rulePreview(ctx, a, rest)
+	case "enable":
+		return ruleEnable(ctx, a, rest)
 	case "activate":
 		return ruleActivate(ctx, a, rest)
 	case "authorize":
@@ -424,6 +426,14 @@ func rulePreview(ctx context.Context, a *app, args []string) (output, error) {
 	out.Next = []string{
 		fmt.Sprintf("dustkeeper rule activate --id %s --revision %d --digest %s", r.ID, r.Revision, rbDigest),
 	}
+	if sc.Kind == domain.KindManagedDisposable {
+		// Activation still grants nothing. On a disposable scope the shortcut that
+		// does both is one command with one digest, so it is offered here instead
+		// of leaving the operator to discover it from the help text.
+		out.Next = append(out.Next, fmt.Sprintf(
+			"dustkeeper rule enable --id %s --revision %d --mode quarantine   (or --mode cleanup to approve permanent deletion too)",
+			r.ID, r.Revision))
+	}
 	return out, nil
 }
 
@@ -477,10 +487,7 @@ func ruleActivate(ctx context.Context, a *app, args []string) (output, error) {
 	if err != nil {
 		return output{}, errs.Wrap(errs.CodeStateWriteFailed, err)
 	}
-	if err := a.store.SetRuleReviewBinding(ctx, r.ID, r.Revision, string(rbJSON)); err != nil {
-		return output{}, err
-	}
-	if err := a.store.ActivateRule(ctx, r.ID, r.Revision); err != nil {
+	if err := a.store.ActivateRuleWithReviewBinding(ctx, r.ID, r.Revision, string(rbJSON)); err != nil {
 		return output{}, err
 	}
 
@@ -554,16 +561,14 @@ func ruleAuthorize(ctx context.Context, a *app, args []string) (output, error) {
 			"scope %s is %s; unattended permanent deletion requires managed_disposable", sc.ID, sc.Kind)
 	}
 
-	files, bytes := *maxFiles, *maxBytes
-	if files <= 0 {
-		files = a.cfg.Runtime.MaxAutoQuarantineFiles
-	}
-	if bytes <= 0 {
-		bytes = a.cfg.Runtime.MaxAutoQuarantineBytes
-	}
+	// The ceiling belongs to the action being approved. Reading the quarantine
+	// default for a purge approval would hand permanent deletion a number that
+	// was set for moving files into the vault.
+	files, bytes := a.ceilingFor(capability, *maxFiles, *maxBytes)
 	if files <= 0 || bytes <= 0 {
-		return output{}, errs.New(errs.CodeInvalidArgument,
-			"the configuration ceiling is zero, which forbids this action; pass --max-files and --max-bytes explicitly")
+		return output{}, errs.Newf(errs.CodeInvalidArgument,
+			"the %s ceiling is zero, which forbids this action; pass --max-files and --max-bytes explicitly or raise %s",
+			capability, ceilingKey(capability))
 	}
 
 	rb, _, err := plan.NewReviewBinding(sc, r.Digest)

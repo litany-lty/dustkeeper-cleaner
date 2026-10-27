@@ -129,33 +129,41 @@ func (s *Store) NextRuleRevision(ctx context.Context, id domain.RuleID) (int64, 
 // silently inherits the previous authority.
 func (s *Store) ActivateRule(ctx context.Context, id domain.RuleID, rev int64) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
-		var status string
-		err := tx.QueryRowContext(ctx,
-			"SELECT status FROM rules WHERE rule_id=? AND revision=?", string(id), rev).Scan(&status)
-		if errors.Is(err, sql.ErrNoRows) {
-			return errs.Newf(errs.CodeRuleNotFound, "rule %s revision %d is not stored", id, rev)
-		}
-		if err != nil {
-			return errs.Wrap(errs.CodeDBError, err)
-		}
-		if status == domain.RuleActive {
-			return nil
-		}
-
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE rules SET status='disabled' WHERE rule_id=? AND status='active'", string(id)); err != nil {
-			return errs.Wrap(errs.CodeStateWriteFailed, err)
-		}
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE grants SET status='needs_reapproval' WHERE rule_id=? AND status='active'", string(id)); err != nil {
-			return errs.Wrap(errs.CodeStateWriteFailed, err)
-		}
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE rules SET status='active' WHERE rule_id=? AND revision=?", string(id), rev); err != nil {
-			return errs.Wrap(errs.CodeStateWriteFailed, err)
-		}
-		return nil
+		return activateRuleTx(ctx, tx, id, rev)
 	})
+}
+
+// activateRuleTx is the activation step without its own transaction, so the
+// single-command activation and the atomic enable share one implementation. Two
+// copies of "make this revision active and freeze the others" would drift, and
+// the one that drifted would be the one nobody reviewed.
+func activateRuleTx(ctx context.Context, tx *sql.Tx, id domain.RuleID, rev int64) error {
+	var status string
+	err := tx.QueryRowContext(ctx,
+		"SELECT status FROM rules WHERE rule_id=? AND revision=?", string(id), rev).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errs.Newf(errs.CodeRuleNotFound, "rule %s revision %d is not stored", id, rev)
+	}
+	if err != nil {
+		return errs.Wrap(errs.CodeDBError, err)
+	}
+	if status == domain.RuleActive {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE rules SET status='disabled' WHERE rule_id=? AND status='active'", string(id)); err != nil {
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE grants SET status='needs_reapproval' WHERE rule_id=? AND status='active'", string(id)); err != nil {
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE rules SET status='active' WHERE rule_id=? AND revision=?", string(id), rev); err != nil {
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	return nil
 }
 
 // DisableRule turns off a rule and freezes its grants.
@@ -181,16 +189,39 @@ func (s *Store) DisableRule(ctx context.Context, id domain.RuleID, rev int64) er
 // matching digest, never by a background pass.
 func (s *Store) SetRuleReviewBinding(ctx context.Context, id domain.RuleID, rev int64, bindingJSON string) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx,
-			"UPDATE rules SET review_binding_json=? WHERE rule_id=? AND revision=?",
-			bindingJSON, string(id), rev)
-		if err != nil {
-			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		return setRuleReviewBindingTx(ctx, tx, id, rev, bindingJSON)
+	})
+}
+
+func setRuleReviewBindingTx(ctx context.Context, tx *sql.Tx, id domain.RuleID, rev int64, bindingJSON string) error {
+	res, err := tx.ExecContext(ctx,
+		"UPDATE rules SET review_binding_json=? WHERE rule_id=? AND revision=?",
+		bindingJSON, string(id), rev)
+	if err != nil {
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errs.Newf(errs.CodeRuleNotFound, "rule %s revision %d is not stored", id, rev)
+	}
+	return nil
+}
+
+// ActivateRuleWithReviewBinding records what the user approved and makes the
+// revision active in one transaction.
+//
+// Activating first and recording afterwards leaves a window where the active
+// revision has no approval behind it; recording first and activating afterwards
+// leaves the opposite. Neither half is a state anything else should observe, so
+// this command does not produce it. Activation still grants no capability: only
+// EnableRule (or an explicit authorize) does.
+func (s *Store) ActivateRuleWithReviewBinding(ctx context.Context, id domain.RuleID, rev int64, bindingJSON string) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		if bindingJSON != "" {
+			if err := setRuleReviewBindingTx(ctx, tx, id, rev, bindingJSON); err != nil {
+				return err
+			}
 		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return errs.Newf(errs.CodeRuleNotFound, "rule %s revision %d is not stored", id, rev)
-		}
-		return nil
+		return activateRuleTx(ctx, tx, id, rev)
 	})
 }
 
@@ -211,17 +242,21 @@ type Grant struct {
 // scope mutability, auto quarantine and auto purge.
 func (s *Store) InsertGrant(ctx context.Context, g Grant) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
+		return insertGrantTx(ctx, tx, g)
+	})
+}
+
+func insertGrantTx(ctx context.Context, tx *sql.Tx, g Grant) error {
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO grants(grant_id, scope_id, rule_id, rule_revision, capability,
                    binding_json, digest, status, approved_at_ns)
 VALUES(?,?,?,?,?,?,?,?,?)`,
-			string(g.ID), string(g.ScopeID), string(g.RuleID), g.RuleRevision,
-			g.Capability, g.BindingJSON, string(g.Digest), g.Status, g.ApprovedAtNS)
-		if err != nil {
-			return errs.Newf(errs.CodeStateWriteFailed, "insert grant: %v", err)
-		}
-		return nil
-	})
+		string(g.ID), string(g.ScopeID), string(g.RuleID), g.RuleRevision,
+		g.Capability, g.BindingJSON, string(g.Digest), g.Status, g.ApprovedAtNS)
+	if err != nil {
+		return errs.Newf(errs.CodeStateWriteFailed, "insert grant: %v", err)
+	}
+	return nil
 }
 
 const grantColumns = `grant_id, scope_id, rule_id, rule_revision, capability,

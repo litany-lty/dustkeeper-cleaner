@@ -484,6 +484,7 @@ Commands:
   scope add|list|show|pause|resume
                            register and manage scopes
   scan --scope ID          metadata-only scan and candidate index
+  rule enable              activate a revision and approve its capabilities once
   rule draft|import|show|validate|preview|activate|authorize|revoke|disable
                            rule lifecycle; activation is not permission
   plan create|show|apply   freeze and execute a quarantine plan
