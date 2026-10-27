@@ -61,6 +61,9 @@ func makeTree(t *testing.T, base, name string) string {
 // TestRegisterCreatesAVaultOnlyForMutableKinds is the "registering is not
 // authorising" rule expressed in the filesystem: a read-only scope gets no
 // management directory at all, so nothing can be moved into it by accident.
+//
+// `reference` is not in the table any more: the simplified build refuses to
+// create one, and the refusal is asserted after the loop.
 func TestRegisterCreatesAVaultOnlyForMutableKinds(t *testing.T) {
 	reg, base := newRegistry(t)
 
@@ -69,7 +72,6 @@ func TestRegisterCreatesAVaultOnlyForMutableKinds(t *testing.T) {
 		wantVault bool
 	}{
 		{"observe", false},
-		{"reference", false},
 		{"assisted", true},
 		{"managed_disposable", true},
 	} {
@@ -104,6 +106,18 @@ func TestRegisterCreatesAVaultOnlyForMutableKinds(t *testing.T) {
 		} else if statErr == nil {
 			t.Fatalf("%s: a read-only scope must not get a management directory", tc.kind)
 		}
+	}
+
+	// A reference scope is no longer created at all: it existed to hold the
+	// surviving copy for content comparison, and nothing reads that copy now. The
+	// refusal comes before any directory or row is written.
+	refDir := makeTree(t, base, "reference")
+	_, err := reg.Add(context.Background(), AddOptions{Path: refDir, Kind: "reference", Name: "reference"})
+	if errs.CodeOf(err) != errs.CodeInvalidArgument {
+		t.Fatalf("a reference scope was accepted: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(refDir, ".dustkeeper")); !os.IsNotExist(statErr) {
+		t.Fatalf("the refused registration left a management directory: %v", statErr)
 	}
 }
 

@@ -16,31 +16,6 @@ import (
 	"dustkeeper/internal/store"
 )
 
-// KeeperVerifier is implemented by the dedup package. It is an interface here so
-// that the executor does not depend on duplicate detection.
-//
-// It returns a proof rather than an error because the verification ends with a
-// full byte comparison, and a check that ends before the last possible moment is
-// not the strongest claim available: R09 A records that nothing re-read the
-// keeper afterwards. The proof keeps the very descriptor that was verified open,
-// so the final re-check is against that object and not against a path that may
-// since have been pointed somewhere else.
-type KeeperVerifier interface {
-	VerifyKeeper(ctx context.Context, it store.Item) (KeeperProof, error)
-}
-
-// KeeperProof is a keeper whose equivalence has been proven and whose handle is
-// still open.
-type KeeperProof interface {
-	// Confirm re-reads the keeper's identity, change token and metadata through
-	// the descriptor that was verified, and fails if any of them moved after the
-	// final comparison. It does not read content again: this narrows the window,
-	// it does not claim an atomic snapshot.
-	Confirm(ctx context.Context) error
-	// Close releases the keeper handle.
-	Close() error
-}
-
 // TrustFunc asserts that the wall clock may be used to prove that a retention
 // period elapsed. It returns nil only when it may.
 //
@@ -68,6 +43,13 @@ type PurgeOptions struct {
 func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt PurgeOptions) (domain.OperationResult, error) {
 	res := domain.OperationResult{Item: it.ID, State: it.State}
 
+	// The purge path is the last place an old duplicate could still be deleted.
+	// The detector is gone from the call graph, but its objects and plans are
+	// still in the database, so the refusal lives here rather than in the command
+	// that no longer exists.
+	if err := requireLifecycleItem(it); err != nil {
+		return res, err
+	}
 	if it.State != domain.StateQuarantined {
 		return res, errs.Newf(errs.CodePlanStale, "item %s is %s, not quarantined", it.ID, it.State)
 	}
@@ -184,22 +166,6 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		return res, errs.New(errs.CodeHeld, "the quarantined object's metadata changed")
 	}
 
-	// Exact duplicates must still have a living keeper.
-	var keeper KeeperProof
-	if it.Reason == domain.ReasonExactDuplicate {
-		if e.Keeper == nil {
-			return res, errs.New(errs.CodeHeld, "no keeper verifier is configured; refusing to purge a duplicate")
-		}
-		proof, kerr := e.Keeper.VerifyKeeper(ctx, it)
-		if kerr != nil {
-			return res, kerr
-		}
-		keeper = proof
-		if keeper != nil {
-			defer keeper.Close()
-		}
-	}
-
 	if opt.Budget != nil && !opt.Budget.CanReserve(obj.Token.Size) {
 		return res, errs.New(errs.CodeBudgetExhausted, "the action budget for this run is exhausted")
 	}
@@ -222,18 +188,6 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 	if opt.Budget != nil && opt.Budget.TimeUp(e.Clock) {
 		return res, errs.New(errs.CodeBudgetExhausted,
 			"the run's time slice ran out while this object was being verified; nothing was removed")
-	}
-
-	// The last check of the other side. The keeper's own proof ended with the byte
-	// comparison; between that comparison and this line its inode, size, mtime,
-	// permissions, link count or extended metadata could have moved, and the
-	// payload's own re-check would not notice. Both sides have now been re-read
-	// after the final comparison, and both handle-bound facts survive to the
-	// intent boundary below.
-	if keeper != nil {
-		if err := keeper.Confirm(ctx); err != nil {
-			return res, err
-		}
 	}
 
 	opID := domain.OperationID(domain.NewID("op"))
@@ -419,8 +373,14 @@ func (e *Executor) purgeBlockedByProtection(ctx context.Context, sc *ScopeCtx, i
 		return true, "the recorded path is still covered: " + why, nil
 	}
 	// A project tree protects everything inside it, including for a slot that
-	// currently holds nothing.
-	if inside, why, perr := e.projectProtected(sc, it.RawRelative); perr == nil && inside {
+	// currently holds nothing. A directory that cannot be inspected is not
+	// evidence that no marker is there: the walk returns an error for anything
+	// but ENOENT, and this path must not read that as "not protected". A purge is
+	// the one action that cannot be undone.
+	if inside, why, perr := e.projectProtected(sc, it.RawRelative); perr != nil {
+		return true, "", errs.Newf(errs.CodeProtectionAliasUnresolved,
+			"the directories above %q cannot all be inspected, so a project tree cannot be ruled out: %v", rel, perr)
+	} else if inside {
 		return true, why, nil
 	}
 	if guard.Empty() {

@@ -23,9 +23,11 @@ type Executor struct {
 	Config ConfigView
 	Gate   scope.PauseGate
 	Guard  *policy.Guard
-	// Keeper verifies that a duplicate's surviving copy is still intact. It is
-	// an interface so that duplicate detection stays out of this package.
-	Keeper KeeperVerifier
+	// QuarantineTrust asserts that the wall clock may be used to bound a new
+	// quarantine. It is mandatory, for the same reason PurgeOptions.Trust is: a
+	// nil function is "nobody checked", and a boolean would let a call site write
+	// "true" into the approval.
+	QuarantineTrust TrustFunc
 	// TmpBuf is reused across reads so a large plan does not allocate per item.
 	TmpBuf []byte
 }
@@ -93,7 +95,16 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	if err != nil {
 		return res, err
 	}
+	if err := requireLifecycleItem(it); err != nil {
+		return res, err
+	}
 	if err := e.validateItem(sc, p, it, binding); err != nil {
+		return res, err
+	}
+	// The clock is asserted at the entry to the action, not once per batch: a run
+	// that started with a trustworthy clock and lost it halfway must not accept
+	// one more object whose retention window nobody can defend later.
+	if err := e.requireQuarantineTrust(ctx); err != nil {
 		return res, err
 	}
 	// A paused or held scope accepts no new business operation. The plan may
@@ -164,7 +175,7 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	}
 	defer src.Close()
 
-	if ok, why := sameIdentityAndToken(src.Identity, src.Token, preID, preTok); !ok {
+	if ok, why := sameStableObject(src.Identity, src.Token, preID, preTok); !ok {
 		return res, errs.Newf(errs.CodePlanStale,
 			"%q changed after planning (%s); plan again", it.RawRelative, why)
 	}
@@ -172,6 +183,12 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 		res.Code = string(errs.CodeSkippedProtected)
 		res.Message = "file has more than one hard link"
 		return res, nil
+	}
+	// The volume that will hold the bytes is asked directly, through the verified
+	// objects descriptor. The runner's pre-check saves a scan; it is not the gate,
+	// because a manual apply never goes through the runner.
+	if err := e.checkQuarantineSpace(sc); err != nil {
+		return res, err
 	}
 
 	// Reserve both reads before starting: one hash now, one verification after
@@ -266,10 +283,40 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 		OccurredAtNS: e.Clock.Wall().UnixNano(),
 	}
 
+	// Last look before the intent. Everything that made this file eligible can
+	// have changed during the read that produced the manifest: the clock, the
+	// pause request, the protection set, the remaining allowance. The file has not
+	// moved, so the only thing to undo is the manifest this call wrote - and if
+	// even that fails, the manifest is left where a later run can see it rather
+	// than being half-removed.
+	if err := e.requireQuarantineTrust(ctx); err != nil {
+		return res, e.abandonPreparation(sc, it, err)
+	}
+	if budget != nil && budget.TimeUp(e.Clock) {
+		return res, e.abandonPreparation(sc, it, errs.New(errs.CodeBudgetExhausted,
+			"the run's time slice ran out before this file could be accepted; nothing was moved"))
+	}
+	if budget != nil && !budget.CanReserve(src.Token.Size) {
+		return res, e.abandonPreparation(sc, it, errs.New(errs.CodeBudgetExhausted,
+			"the quarantine allowance for this run does not permit another action"))
+	}
+	if ok, why, perr := e.protected(ctx, sc, it.RawRelative, preID); perr != nil {
+		return res, e.abandonPreparation(sc, it, perr)
+	} else if ok {
+		if err := e.abandonPreparation(sc, it, nil); err != nil {
+			return res, err
+		}
+		res.Code = string(errs.CodeSkippedProtected)
+		res.Message = why
+		res.Control = domain.ControlContinue
+		res.Evidence = domain.EvidenceNotStarted
+		return res, nil
+	}
+
 	// The pause check and the intent commit share one critical section, so a
 	// pause either lands before this item is accepted or after it converges.
 	if err := e.Gate.CheckAndCommit(func() error { return e.Store.BeginIntent(ctx, intent) }); err != nil {
-		return res, err
+		return res, e.abandonPreparation(sc, it, err)
 	}
 
 	// Last look before the rename. This narrows the window described in 2.4 but

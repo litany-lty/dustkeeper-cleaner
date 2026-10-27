@@ -41,6 +41,14 @@ func CreatePurgePlan(ctx context.Context, st *store.Store, sc store.Scope, items
 	docs := make([]PlanItemDoc, 0, len(items))
 	members := make([]store.PurgeMember, 0, len(items))
 	for i, it := range items {
+		// A purge plan is only ever about lifecycle objects. Historical duplicates
+		// are refused here as well as in the executor, so the refusal happens
+		// before an operator is shown a plan that would delete them; the item rows
+		// themselves are left untouched.
+		if it.Reason != domain.ReasonLifecycle {
+			return store.Plan{}, errs.Newf(errs.CodePlanStale,
+				"item %s is a %s object; this build purges lifecycle objects only", it.ID, it.Reason)
+		}
 		d, err := itemDocOf(it)
 		if err != nil {
 			return store.Plan{}, err

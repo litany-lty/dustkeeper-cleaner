@@ -40,8 +40,24 @@ type Store struct {
 
 // Open opens or creates the database at path and applies the pragmas and
 // migration the binary expects.
+//
+// An existing database is never migrated. The simplified scope is "this build
+// reads the schema it writes": an older or newer schema is refused before the
+// first write (CheckSupportedState), and the operator keeps the old binary and the
+// old state until they have a verified copy to move forward from. Migration code
+// still runs, but only for a database this call is creating.
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	existing, err := databaseExists(path)
+	if err != nil {
+		return nil, err
+	}
+	if existing {
+		// The pre-flight reads the header directly, so a file that is not ours is
+		// refused without SQLite touching it.
+		if err := CheckSupportedState(path); err != nil {
+			return nil, err
+		}
+	} else if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, errs.Wrap(errs.CodeAccessDenied, err)
 	}
 
@@ -58,6 +74,15 @@ func Open(path string) (*Store, error) {
 
 	s := &Store{db: db, path: path, now: func() int64 { return time.Now().UnixNano() }}
 
+	if existing {
+		// Opening an existing file is where SQLite rolls back a hot journal, so
+		// the version is re-read after that recovery and before the pragmas. The
+		// header check ran on the bytes that were on disk before it.
+		if err := s.requireCurrentSchema(); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	if err := s.applyPragmas(); err != nil {
 		db.Close()
 		return nil, err
@@ -66,9 +91,11 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if err := s.migrate(); err != nil {
-		db.Close()
-		return nil, err
+	if !existing {
+		if err := s.migrate(); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		// A permission fix-up failure is worth reporting but not fatal: the
@@ -76,6 +103,30 @@ func Open(path string) (*Store, error) {
 		_ = err
 	}
 	return s, nil
+}
+
+// requireCurrentSchema re-reads the schema version of a database that already
+// existed, after SQLite has had the chance to roll back a hot journal.
+//
+// It is deliberately narrower than the old migrate(): a version this build does
+// not implement is a refusal with the version and the path in the message, not a
+// migration.
+func (s *Store) requireCurrentSchema() error {
+	var version int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return errs.Wrap(errs.CodeDBError, err)
+	}
+	switch {
+	case version > migrations.CurrentVersion:
+		return errs.Newf(errs.CodeMigrationTooNew,
+			"database schema is version %d, this binary supports %d; refusing to open",
+			version, migrations.CurrentVersion)
+	case version < migrations.CurrentVersion:
+		return errs.Newf(errs.CodeMigrationTooOld,
+			"%s is schema version %d, this binary writes %d and does not migrate in place; keep the previous binary and a copy of this state directory",
+			s.path, version, migrations.CurrentVersion)
+	}
+	return nil
 }
 
 // applyPragmas sets the section 8.1 durability profile on the single write

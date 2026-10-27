@@ -9,8 +9,11 @@ package execute
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
@@ -188,6 +191,31 @@ func (c *ScopeCtx) WriteManifest(m ManifestV1) error {
 // manifestPath is used by reporting; it never drives an action.
 func manifestPath(root string, objectID string) string {
 	return filepath.Join(root, domain.VaultManifests, objectID+".json")
+}
+
+// RemoveManifest deletes one object's manifest and flushes the directory.
+//
+// It exists for exactly one situation: the executor wrote its own preparation
+// record and then refused the action, so the file never moved. Undoing that
+// preparation is what makes the refusal clean - the next attempt must not find a
+// manifest that describes a move which never happened. It never touches payload:
+// the argument is the manifest name derived from the item ID, not a path.
+func (c *ScopeCtx) RemoveManifest(objectID string) error {
+	if c == nil || c.Manifests == nil {
+		return errs.New(errs.CodeStateWriteFailed,
+			"no manifest directory is open, so the preparation record cannot be removed")
+	}
+	name := objectID + ".json"
+	if err := fsops.UnlinkAt(c.Manifests, name); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	if err := fsops.DurableDir(c.Manifests); err != nil {
+		return errs.Wrap(errs.CodeDurabilityFailed, err)
+	}
+	return nil
 }
 
 // PlanBindingOf decodes the stored item binding.

@@ -59,6 +59,15 @@ func (r *Registrar) Add(ctx context.Context, opt AddOptions) (store.Scope, error
 		return store.Scope{}, errs.Newf(errs.CodeInvalidArgument,
 			"scope kind must be one of observe, assisted, managed_disposable, reference; got %q", opt.Kind)
 	}
+	// A new reference scope is refused: its only use was to hold the surviving
+	// copy for content comparison, and that pipeline no longer exists. The refusal
+	// happens before a directory, a vault or a row is created, so a rejected
+	// request leaves the tree exactly as it was. Existing reference scopes keep
+	// loading and stay read-only; they are not reclassified.
+	if opt.Kind == domain.KindReference {
+		return store.Scope{}, errs.New(errs.CodeInvalidArgument,
+			"reference scopes are not created by this build; register the directory with --kind observe to inspect it")
+	}
 
 	resolved, err := resolveExistingDir(opt.Path)
 	if err != nil {

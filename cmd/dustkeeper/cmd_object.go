@@ -8,12 +8,10 @@ import (
 	"time"
 
 	"dustkeeper/internal/clocktrust"
-	"dustkeeper/internal/dedup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
 	"dustkeeper/internal/plan"
-	"dustkeeper/internal/recovery"
 	"dustkeeper/internal/rescue"
 	"dustkeeper/internal/store"
 )
@@ -49,37 +47,73 @@ func quarantineList(ctx context.Context, a *app, args []string) (output, error) 
 		ScopeID       string `json:"scope_id"`
 		RelativePath  string `json:"relative_path"`
 		ObjectName    string `json:"object_name"`
+		State         string `json:"state"`
 		Reason        string `json:"reason"`
 		Retention     int64  `json:"bound_retention_seconds"`
 		QuarantinedAt int64  `json:"quarantined_at_ns"`
 		DueAt         int64  `json:"due_at_ns"`
 		Due           bool   `json:"due"`
 		AutoPurgeOK   bool   `json:"auto_purge_granted"`
+		// Restorable and Blocked describe whether `quarantine restore` can act on
+		// this object and, when it cannot, why. They exist because "the list did not
+		// show my file" must never be the only answer: an object that is held or
+		// waiting for reconciliation is still on disk and still needs to be found.
+		Restorable bool   `json:"restorable"`
+		Blocked    string `json:"blocked_reason,omitempty"`
+		PendingOp  string `json:"pending_op_id,omitempty"`
 	}
 	var rows []row
 
+	// Every state in which an object may still be sitting in the vault. A
+	// quarantined object is the normal case; held and unknown are the ones an
+	// operator has to be told about; the three intent states are in flight and
+	// will be finished or reported by reconciliation.
+	states := []string{
+		domain.StateQuarantined, domain.StateHeld, domain.StateUnknown,
+		domain.StateQIntent, domain.StateRIntent, domain.StatePIntent,
+	}
+
 	collect := func(sc store.Scope) error {
-		items, err := a.store.ListItemsByState(ctx, sc.ID, domain.StateQuarantined, *limit)
-		if err != nil {
-			return err
-		}
-		for _, it := range items {
-			dueAt := int64(0)
-			if it.QuarantinedAtNS != nil && it.BoundRetentionSeconds > 0 {
-				dueAt = *it.QuarantinedAtNS + it.BoundRetentionSeconds*int64(time.Second)
+		for _, state := range states {
+			items, err := a.store.ListItemsByState(ctx, sc.ID, state, *limit)
+			if err != nil {
+				return err
 			}
-			rows = append(rows, row{
-				ItemID:        string(it.ID),
-				ScopeID:       string(it.ScopeID),
-				RelativePath:  string(it.RawRelative),
-				ObjectName:    it.ObjectName,
-				Reason:        it.Reason,
-				Retention:     it.BoundRetentionSeconds,
-				QuarantinedAt: ptrVal(it.QuarantinedAtNS),
-				DueAt:         dueAt,
-				Due:           dueAt > 0 && nowNS >= dueAt,
-				AutoPurgeOK:   it.AutoPurgeGrantID != nil,
-			})
+			for _, it := range items {
+				dueAt := int64(0)
+				if it.QuarantinedAtNS != nil && it.BoundRetentionSeconds > 0 {
+					dueAt = *it.QuarantinedAtNS + it.BoundRetentionSeconds*int64(time.Second)
+				}
+				r := row{
+					ItemID:        string(it.ID),
+					ScopeID:       string(it.ScopeID),
+					RelativePath:  string(it.RawRelative),
+					ObjectName:    it.ObjectName,
+					State:         it.State,
+					Reason:        it.Reason,
+					Retention:     it.BoundRetentionSeconds,
+					QuarantinedAt: ptrVal(it.QuarantinedAtNS),
+					DueAt:         dueAt,
+					Due:           dueAt > 0 && nowNS >= dueAt,
+					AutoPurgeOK:   it.AutoPurgeGrantID != nil,
+				}
+				if it.PendingOpID != nil {
+					r.PendingOp = string(*it.PendingOpID)
+				}
+				switch {
+				case it.PendingOpID != nil:
+					r.Blocked = "an operation is still pending; run `dustkeeper recover reconcile` first"
+				case it.CapturedIdentityJSON == nil || it.CapturedTokenJSON == nil:
+					r.Blocked = "no recorded post-move identity; the file is preserved but cannot be verified for a restore"
+				case it.State == domain.StateQuarantined || it.State == domain.StateHeld:
+					r.Restorable = true
+				case it.State == domain.StateUnknown:
+					r.Blocked = "the last operation was not proven; run `dustkeeper recover reconcile` first"
+				default:
+					r.Blocked = "the object is mid-operation; run `dustkeeper recover reconcile` first"
+				}
+				rows = append(rows, r)
+			}
 		}
 		return nil
 	}
@@ -107,19 +141,34 @@ func quarantineList(ctx context.Context, a *app, args []string) (output, error) 
 	out := ok()
 	out.Data = map[string]any{"objects": rows, "count": len(rows)}
 	if len(rows) == 0 {
-		out.Human = append(out.Human, "no quarantined objects")
+		out.Human = append(out.Human, "no objects in the vault")
 	}
+	restorable := 0
 	for _, r := range rows {
-		state := "recoverable"
-		if r.Due {
-			state = "due for purge"
+		state := r.State
+		if r.Restorable {
+			restorable++
+			if r.Due {
+				state = r.State + " / due"
+			} else {
+				state += " / restorable"
+			}
+		} else {
+			state += " / blocked"
 		}
-		out.Human = append(out.Human, fmt.Sprintf("%-28s %-10s %-20s %s",
+		out.Human = append(out.Human, fmt.Sprintf("%-28s %-24s %-20s %s",
 			r.ItemID, state, r.ScopeID, r.RelativePath))
+		if r.Blocked != "" {
+			out.Human = append(out.Human, "    blocked: "+r.Blocked)
+		}
 	}
 	if len(rows) > 0 {
 		out.Human = append(out.Human, "", "restore one with: dustkeeper quarantine restore --object <item-id>")
-		out.Next = []string{"dustkeeper quarantine restore --object <item-id>"}
+		if restorable > 0 {
+			out.Next = []string{"dustkeeper quarantine restore --object <item-id>"}
+		} else {
+			out.Next = []string{"dustkeeper recover inspect", "dustkeeper recover reconcile"}
+		}
 	}
 	return out, nil
 }
@@ -161,7 +210,7 @@ func quarantineRestore(ctx context.Context, a *app, args []string) (output, erro
 		}
 		defer sctx.Close()
 
-		exec := a.executor(a.detector())
+		exec := a.executor()
 		opt := execute.RestoreOptions{}
 		if *dest != "" {
 			opt.DestinationRelative = []byte(*dest)
@@ -524,7 +573,7 @@ func purgeApply(ctx context.Context, a *app, args []string) (output, error) {
 		}
 		defer sctx.Close()
 
-		exec := a.executor(a.detector())
+		exec := a.executor()
 		guard, err := guardFor(ctx, a.store, sctx)
 		if err != nil {
 			return output{}, err
@@ -578,7 +627,7 @@ func purgeApply(ctx context.Context, a *app, args []string) (output, error) {
 // cmdRecover routes recover inspect/reconcile.
 func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 	if len(args) == 0 {
-		return output{}, errs.New(errs.CodeInvalidArgument, "recover needs a subcommand: inspect, reconcile, adopt")
+		return output{}, errs.New(errs.CodeInvalidArgument, "recover needs a subcommand: inspect, reconcile")
 	}
 	switch args[0] {
 	case "inspect":
@@ -708,7 +757,7 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 				out.Code = errs.CodeRecoveryRequired
 				out.Status = string(errs.StatusOf(errs.CodeRecoveryRequired))
 				out.Message = "some operations were held; they stay visible and nothing was guessed"
-				out.Next = []string{"dustkeeper recover adopt --item <id> --decision restore|quarantine --reason <why>"}
+				out.Next = []string{"dustkeeper recover inspect"}
 			case rep.Parked > 0 || rep.Busy > 0 || rep.Blocked > 0:
 				// Still unfinished, still visible, and their pending markers are
 				// intact, so the next pass picks them up.
@@ -719,71 +768,8 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			}
 			return out, nil
 		})
-	case "adopt":
-		fs := flagset("recover adopt", a.stderr)
-		item := fs.String("item", "", "item ID to adopt")
-		decision := fs.String("decision", "", "restore or quarantine")
-		to := fs.String("to", "", "restore destination, relative to the scope root (default: the original path)")
-		reason := fs.String("reason", "", "why this decision is being taken (recorded verbatim)")
-		if err := parseFlags(fs, args[1:]); err != nil {
-			return output{}, err
-		}
-		if *item == "" {
-			return output{}, errs.New(errs.CodeInvalidArgument, "--item is required")
-		}
-		if *decision == "" {
-			return output{}, errs.New(errs.CodeInvalidArgument,
-				"--decision is required: restore puts the object back, quarantine accepts it as quarantined")
-		}
-		if *reason == "" {
-			// An adoption is a human decision about a file that could not be
-			// explained automatically. "Why" has to be part of the record.
-			return output{}, errs.New(errs.CodeInvalidArgument,
-				"--reason is required: the decision is recorded in the audit trail")
-		}
-		if err := a.openStore(); err != nil {
-			return output{}, err
-		}
-		return a.withInstance(func() (output, error) {
-			res, err := a.reconciler().Adopt(ctx, recovery.AdoptOptions{
-				ItemID:   domain.ItemID(*item),
-				Decision: *decision,
-				To:       []byte(*to),
-				Reason:   *reason,
-				Actor:    "operator",
-			})
-			if err != nil {
-				return output{}, err
-			}
-			out := ok()
-			out.ObjectID = string(res.Item)
-			out.Data = res
-			out.Human = []string{
-				fmt.Sprintf("adopted %s: %s -> %s (operation %s, converging %s)",
-					res.Item, res.PriorState, res.State, res.NewOpID, res.PriorOpID),
-			}
-			if res.Destination != "" {
-				out.Human = append(out.Human, "  destination: "+res.Destination)
-			}
-			if res.Detail != "" {
-				out.Human = append(out.Human, "  "+res.Detail)
-			}
-			return out, nil
-		})
 	}
 	return output{}, errs.Newf(errs.CodeInvalidArgument, "unknown recover subcommand %q", args[0])
-}
-
-// detector builds the duplicate detector. The executor uses it as its keeper
-// verifier, so a duplicate purge re-proves the surviving copy.
-func (a *app) detector() *dedup.Detector {
-	return &dedup.Detector{
-		Store:      a.store,
-		Registrar:  a.registrar(),
-		Clock:      a.clock,
-		Buffer:     make([]byte, a.cfg.Runtime.IOBufferBytes),
-		RatePerSec: a.cfg.Runtime.ReadRateBytesPerSecond,
-	}
 }
 
 func jsonUnmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }

@@ -367,8 +367,6 @@ func lookup(name string, args []string) (func(context.Context, *app, []string) (
 		return cmdRule, args, true
 	case "plan":
 		return cmdPlan, args, true
-	case "dedup":
-		return cmdDedup, args, true
 	case "quarantine":
 		return cmdQuarantine, args, true
 	case "protect":
@@ -489,13 +487,11 @@ Commands:
   rule draft|import|show|validate|preview|activate|authorize|revoke|disable
                            rule lifecycle; activation is not permission
   plan create|show|apply   freeze and execute a quarantine plan
-  dedup plan               exact duplicate detection and plan
   quarantine list|restore  inspect and restore isolated objects
   protect add|list|remove  manage path protections
   purge plan|show|apply    separate due-purge plan and execution
-  recover inspect|reconcile|adopt
-                           finish or explain interrupted operations; adopt
-                           converges an item the automatic path held
+  recover inspect|reconcile
+                           finish or explain interrupted operations
   status | events          run state and audit trail
   run                      reconcile, scan, apply granted work
   pause | resume           global safety pause marker

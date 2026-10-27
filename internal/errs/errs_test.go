@@ -22,7 +22,7 @@ var allCodes = []Code{
 	CodeRecoveryRequired, CodeRestoreConflict, CodeHeld, CodeClockUntrusted,
 	CodeProtectionAliasUnresolved, CodePaused, CodePauseRequested, CodeKeeperMissing,
 	CodeDurabilityFailed, CodeStateWriteFailed, CodeIOError, CodeDBError,
-	CodeMigrationTooNew, CodeDiskPressure,
+	CodeMigrationTooNew, CodeMigrationTooOld, CodeDiskPressure,
 	CodeModelUnavailable,
 	CodePartial,
 	CodeCancelled,
@@ -50,7 +50,7 @@ var documented = map[Code]int{
 	CodePauseRequested: 6, CodeKeeperMissing: 6,
 
 	CodeDurabilityFailed: 7, CodeStateWriteFailed: 7, CodeIOError: 7,
-	CodeDBError: 7, CodeMigrationTooNew: 7, CodeDiskPressure: 7,
+	CodeDBError: 7, CodeMigrationTooNew: 7, CodeMigrationTooOld: 7, CodeDiskPressure: 7,
 
 	CodeModelUnavailable: 8,
 	CodePartial:          9,

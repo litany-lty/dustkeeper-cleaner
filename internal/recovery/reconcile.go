@@ -41,6 +41,9 @@ type Result struct {
 	Action  string             `json:"action"`
 	Outcome string             `json:"outcome"`
 	Detail  string             `json:"detail,omitempty"`
+	// Scope names the scope that has to stop taking new actions when Outcome is
+	// "blocked". It is carried so the report can be read without a second lookup.
+	Scope string `json:"scope_id,omitempty"`
 }
 
 // Report summarises a reconciliation pass.
@@ -109,7 +112,11 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 				// pending marker so the next pass can still finish it.
 				_ = r.Store.SetScopeStatus(ctx, po.Item.ScopeID, domain.ScopeHeld)
 				rep.Blocked++
+				if !containsScope(rep.Scopes, string(po.Item.ScopeID)) {
+					rep.Scopes = append(rep.Scopes, string(po.Item.ScopeID))
+				}
 				rep.Results = append(rep.Results, Result{Item: po.Item.ID, OpID: po.OpID, Action: po.Action,
+					Scope: string(po.Item.ScopeID),
 					Outcome: "blocked", Detail: "the scope root could not be verified: " + err.Error()})
 				continue
 			}
@@ -129,6 +136,14 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 			rep.Parked++
 		case "unknown":
 			rep.Unknown++
+		case "blocked":
+			// Blocked is not a verdict and not a completion: the row was left as
+			// it was and the scope has to stop taking new actions until an
+			// operator decides what the record means.
+			rep.Blocked++
+			if res.Scope != "" && !containsScope(rep.Scopes, res.Scope) {
+				rep.Scopes = append(rep.Scopes, res.Scope)
+			}
 		}
 		rep.Results = append(rep.Results, res)
 	}
@@ -137,12 +152,34 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 
 func (r *Reconciler) reconcileOne(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
 	it := po.Item
-	out := Result{Item: it.ID, OpID: po.OpID, Action: po.Action}
+	out := Result{Item: it.ID, OpID: po.OpID, Action: po.Action, Scope: string(it.ScopeID)}
+
+	// Historical residue is identified before anything is dispatched, because
+	// every ordinary branch would make it worse.
+	//
+	// An `adopt` pending belongs to an operation this build does not implement.
+	// Passing it to the restore branch would converge it as a plain R, which
+	// means inventing a decision the operator never made - and the item would
+	// then be eligible for purge. It is left exactly as it is instead.
+	if po.Action == "adopt" {
+		return r.blockPending(ctx, po, out, "UNSUPPORTED_HISTORICAL_ACTION",
+			"this pending operation was started by an older build as an adoption; this build does not converge it, so the record and the object are left unchanged")
+	}
+
+	// A pending marker for an operation that already ended contradicts itself:
+	// one_terminal_per_op allows a single verdict, so writing another one either
+	// fails or rewrites history. Neither is a repair.
+	if terminal, err := r.Store.OpHasTerminalEvent(ctx, po.OpID); err != nil {
+		return r.parkAttempt(ctx, po, out, "TERMINAL_CHECK_FAILED", err.Error())
+	} else if terminal {
+		return r.blockPending(ctx, po, out, "TERMINAL_EVENT_LEFT_PENDING",
+			"the operation already has a terminal event while the item still names it as pending; nothing was written")
+	}
 
 	switch po.Action {
 	case "quarantine":
 		return r.reconcileQuarantine(ctx, sc, po)
-	case "restore", "compensate", "adopt":
+	case "restore", "compensate":
 		return r.reconcileRestore(ctx, sc, po)
 	case "purge":
 		return r.reconcilePurge(ctx, sc, po)
@@ -152,6 +189,38 @@ func (r *Reconciler) reconcileOne(ctx context.Context, sc *execute.ScopeCtx, po 
 	}
 }
 
+// blockPending leaves a pending operation untouched and reports why.
+//
+// Nothing is written to the operation or to the item: those rows are the only
+// record of what an older build did, and this build may not rewrite them into a
+// shape it can act on. The scope is marked held so that new automatic and manual
+// actions stop at it; reading the scope and restoring the healthy objects in it
+// keep working.
+func (r *Reconciler) blockPending(ctx context.Context, po store.PendingOp, out Result,
+	code, detail string) Result {
+
+	out.Outcome = "blocked"
+	if err := r.Store.SetScopeStatus(ctx, po.Item.ScopeID, domain.ScopeHeld); err != nil {
+		// The block is the point, so a failure to record it cannot be reported as
+		// success. The pending marker is still there, which is what the shared
+		// gate reads.
+		out.Detail = code + ": " + detail + "; the scope could not be marked held: " + err.Error()
+		return out
+	}
+	out.Detail = code + ": " + detail
+	return out
+}
+
+// containsScope reports whether a scope is already listed.
+func containsScope(list []string, id string) bool {
+	for _, s := range list {
+		if s == id {
+			return true
+		}
+	}
+	return false
+}
+
 // retryableCode reports whether a failure is an environment problem that may
 // clear on its own.
 //
@@ -159,9 +228,9 @@ func (r *Reconciler) reconcileOne(ctx context.Context, sc *execute.ScopeCtx, po 
 // retryable failure keeps the pending marker, the original contract and the
 // attempt count: the object may still be finished, and the next pass picks it up.
 // Anything else is a verdict and becomes a terminal hold, which is visible and
-// which `recover adopt` can converge. What must never happen - and what this
+// which `recover inspect` explains. What must never happen - and what this
 // replaced - is a bare state write that clears the pending marker, because then
-// nothing is retried and nothing can be adopted either.
+// nothing is retried and nothing stays visible either.
 func retryableCode(c errs.Code) bool {
 	switch c {
 	case errs.CodeIOError, errs.CodeDurabilityFailed, errs.CodeAccessDenied,
@@ -482,7 +551,7 @@ func (r *Reconciler) completeQuarantine(ctx context.Context, sc *execute.ScopeCt
 // started the object on the way to purge eligibility.
 func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
 	it := po.Item
-	out := Result{Item: it.ID, OpID: po.OpID, Action: po.Action}
+	out := Result{Item: it.ID, OpID: po.OpID, Action: po.Action, Scope: string(it.ScopeID)}
 
 	contract, dest, cerr := r.restoreContract(po)
 	if cerr != nil {

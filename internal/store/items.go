@@ -226,6 +226,11 @@ func (s *Store) ItemsDueForPurge(ctx context.Context, scope domain.ScopeID, nowN
 
 // PurgeQueuePage returns one page of due objects using a keyset cursor.
 //
+// Only lifecycle objects are listed. A historical duplicate is still readable
+// and still restorable, but it is not a candidate for the automatic purge queue:
+// the comparison that once authorised removing it no longer runs, so offering it
+// to the queue would put a delete in front of an operator that nothing supports.
+//
 // Why a cursor instead of LIMIT alone: the caller cannot filter "has an active
 // auto-purge grant" in SQL without duplicating the authority rules, so it used to
 // read page one, find every object in it unprocessable, and give up. If the first
@@ -241,6 +246,7 @@ func (s *Store) PurgeQueuePage(ctx context.Context, scope domain.ScopeID, nowNS 
 	rows, err := s.read(ctx, "SELECT "+prefixedItemColumns("i")+`
  FROM items i
  WHERE i.scope_id=? AND i.state='quarantined' AND i.pending_op_id IS NULL
+   AND i.reason='lifecycle'
    AND i.purge_not_before_ns IS NOT NULL AND i.purge_not_before_ns <= ?
    AND (i.purge_not_before_ns > ? OR (i.purge_not_before_ns = ? AND i.item_id > ?))
  ORDER BY i.purge_not_before_ns, i.item_id LIMIT ?`,
@@ -296,6 +302,33 @@ WHERE keeper_scope_id=? AND keeper_raw_relative=? AND keeper_pin_active=1`,
 			string(scope), rel)
 		return errs.Wrap(errs.CodeStateWriteFailed, err)
 	})
+}
+
+// ScopeHasUnresolved reports whether a scope still holds work that no automatic
+// pass may route around.
+//
+// Three conditions are the same question asked three ways: an operation is
+// recorded but its outcome is not (pending_op_id), an object was frozen by a
+// verdict (held, unknown), or an object sits between two states (q_intent,
+// r_intent, p_intent) because a process stopped in the middle. Any of them means
+// the account of that tree is incomplete, and starting a new quarantine or purge
+// next to it would add another unexplained episode to the same scope.
+//
+// Restore and reconcile deliberately do not consult this: converging the
+// unresolved state is the repair, and refusing to repair because a repair is
+// needed would be a way to lose data.
+func (s *Store) ScopeHasUnresolved(ctx context.Context, scope domain.ScopeID) (bool, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM items
+WHERE scope_id=?
+  AND (pending_op_id IS NOT NULL
+       OR state IN ('held','unknown','q_intent','r_intent','p_intent'))`,
+		string(scope)).Scan(&n)
+	if err != nil {
+		return false, errs.Wrap(errs.CodeDBError, err)
+	}
+	return n > 0, nil
 }
 
 // SetHoldCode records why an item is frozen.

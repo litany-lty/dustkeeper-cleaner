@@ -260,6 +260,31 @@ func (s *Store) ReconcileAttempts(ctx context.Context, id domain.ItemID) (int, e
 	return n, nil
 }
 
+// OpHasTerminalEvent reports whether the operation already carries a terminal
+// event (complete, abort or hold).
+//
+// The unique index one_terminal_per_op allows exactly one. An item that still
+// carries a pending marker for an operation that already ended is therefore not
+// something a second terminal write can fix: the write would be rejected, and
+// inventing a different verdict would rewrite history. Reconciliation reads this
+// before it decides, and leaves such a row exactly as it is.
+func (s *Store) OpHasTerminalEvent(ctx context.Context, opID domain.OperationID) (bool, error) {
+	rows, err := s.read(ctx, "SELECT COUNT(*) FROM events WHERE op_id=?"+
+		" AND phase IN ('complete','abort','hold')", string(opID))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var n int
+	if !rows.Next() {
+		return false, errs.Wrap(errs.CodeDBError, rows.Err())
+	}
+	if err := rows.Scan(&n); err != nil {
+		return false, errs.Wrap(errs.CodeDBError, err)
+	}
+	return n > 0, nil
+}
+
 // Intent is a request to begin one operation on one item.
 type Intent struct {
 	OpID         domain.OperationID

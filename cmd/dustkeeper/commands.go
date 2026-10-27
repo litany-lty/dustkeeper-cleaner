@@ -571,7 +571,7 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 			Clock:      a.clock,
 			Config:     a.cfg,
 			Registrar:  a.registrar(),
-			Exec:       a.executor(nil),
+			Exec:       a.executor(),
 			Reconciler: a.reconciler(),
 		}
 		var rerr error
@@ -775,7 +775,7 @@ func (a *app) registrar() *scope.Registrar {
 	}
 }
 
-func (a *app) executor(keeper execute.KeeperVerifier) *execute.Executor {
+func (a *app) executor() *execute.Executor {
 	return &execute.Executor{
 		Store: a.store,
 		Clock: a.clock,
@@ -787,8 +787,11 @@ func (a *app) executor(keeper execute.KeeperVerifier) *execute.Executor {
 			MinFreeBytes:   a.cfg.Runtime.MinFreeBytes,
 			MinFreePercent: a.cfg.Runtime.MinFreePercent,
 		},
-		Gate:   scope.PauseGate{StateDir: a.paths.StateDir},
-		Keeper: keeper,
+		Gate: scope.PauseGate{StateDir: a.paths.StateDir},
+		// One guard per process: the baseline is captured when the command
+		// starts, so a clock that jumps during the run is seen as a jump rather
+		// than silently re-baselined between objects.
+		QuarantineTrust: clocktrust.Start(a.store, a.clock).Assert,
 	}
 }
 
@@ -797,7 +800,7 @@ func (a *app) reconciler() *recovery.Reconciler {
 		Store:     a.store,
 		Clock:     a.clock,
 		Registrar: a.registrar(),
-		Exec:      a.executor(nil),
+		Exec:      a.executor(),
 	}
 }
 

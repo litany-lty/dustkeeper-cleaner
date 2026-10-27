@@ -140,10 +140,11 @@ const (
 	PurposeNormal          = "normal"
 	PurposeMiscaptureFixup = "miscapture_compensation"
 	PurposeReconcileOnly   = "reconcile"
-	// PurposeAdopt is an explicit operator decision that converges an item left
-	// behind by an earlier corruption: a terminal hold, or an item whose pending
-	// marker an older build cleared. It is a new operation, not a rewrite of the
-	// old one.
+	// PurposeAdopt is kept for decoding only. Adoption was an operation that
+	// converged an item left behind by earlier corruption; this build does not
+	// create one, but contracts already on disk name it, so the constant stays and
+	// reconciliation recognises it in order to refuse it rather than reinterpret
+	// it as a restore.
 	PurposeAdopt = "adopt"
 )
 

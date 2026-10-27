@@ -26,6 +26,32 @@ type ObjectEvidence struct {
 	Metadata domain.Digest
 }
 
+// sameStableObject compares the facts that must hold for an object that has not
+// been renamed by us: identity, size, mtime, ctime, link count, mode and
+// ownership.
+//
+// ctime is in this comparison and deliberately out of sameIdentityAndToken. The
+// case it closes is a writer that rewrites a file and puts the modification time
+// back: mtime and size then look untouched, while the kernel's ctime - the record
+// of the last inode change - cannot be restored by an unprivileged writer. The
+// other half is why it cannot simply be added to the shared comparison: our own
+// rename bumps ctime, so a restore or a purge of an object we moved would fail
+// against the token recorded before the move.
+//
+// A token that carries no ctime (a record written by an older build) is compared
+// on the other fields only; "not recorded" is not evidence of a change.
+func sameStableObject(now domain.FileIdentity, tok domain.ChangeToken,
+	wantID domain.FileIdentity, wantTok domain.ChangeToken) (bool, string) {
+
+	if ok, why := sameIdentityAndToken(now, tok, wantID, wantTok); !ok {
+		return false, why
+	}
+	if wantTok.CTimeNS != 0 && tok.CTimeNS != wantTok.CTimeNS {
+		return false, "change time changed"
+	}
+	return true, ""
+}
+
 // ReadStable reads an object and proves it did not change underneath the read.
 //
 // The order is load-bearing:
@@ -64,7 +90,7 @@ func ReadStable(f *fsops.File, opt VerifyOptions) (ObjectEvidence, error) {
 	if err != nil {
 		return ev, errs.Wrap(errs.CodeIOError, err)
 	}
-	if ok, why := sameIdentityAndToken(after, tokAfter, before, tokBefore); !ok {
+	if ok, why := sameStableObject(after, tokAfter, before, tokBefore); !ok {
 		return ev, errs.Wrapf(errs.CodeHeld, ErrUnstableObject, "%s", why)
 	}
 	metaAfter, err := MetadataOf(f)
@@ -98,7 +124,9 @@ func ConfirmUnchanged(f *fsops.File, want ObjectEvidence) error {
 	if err != nil {
 		return errs.Wrap(errs.CodeIOError, err)
 	}
-	if ok, why := sameIdentityAndToken(id, tok, want.Identity, want.Token); !ok {
+	// The object has not been renamed between the read and this call, so the
+	// stable comparison applies: a writer that restored mtime still moved ctime.
+	if ok, why := sameStableObject(id, tok, want.Identity, want.Token); !ok {
 		return errs.Newf(errs.CodeHeld, "the object changed after verification: %s", why)
 	}
 	return nil

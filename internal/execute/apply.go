@@ -77,8 +77,9 @@ func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID
 	if err != nil {
 		return out, err
 	}
-	if p.Kind != domain.PlanManualRule && p.Kind != domain.PlanScheduledRule && p.Kind != domain.PlanManualDuplicate {
-		return out, errs.Newf(errs.CodePlanStale, "plan %s is a %s plan, not a quarantine plan", p.ID, p.Kind)
+	if p.Kind != domain.PlanManualRule && p.Kind != domain.PlanScheduledRule {
+		return out, errs.Newf(errs.CodePlanStale,
+			"plan %s is a %s plan; this build applies rule plans for quarantine", p.ID, p.Kind)
 	}
 	if approval != "" && approval != p.Digest {
 		return out, errs.Newf(errs.CodeDigestMismatch,
@@ -94,6 +95,14 @@ func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID
 	}
 	// Whole-plan verification before the first file moves.
 	if err := plan.VerifyPlanDigest(p, items, approval); err != nil {
+		return out, err
+	}
+	// The same rule for every member, before the plan is marked applying. A plan
+	// that mixes in a historical duplicate is refused as a whole: applying the
+	// legal members and stopping at the first duplicate would leave a
+	// half-executed plan and would have already run the delete the check exists to
+	// prevent.
+	if err := requireLifecycleMembers(items); err != nil {
 		return out, err
 	}
 	out.Planned = len(items)
@@ -188,6 +197,12 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 		return out, err
 	}
 	out.Planned = len(members)
+	// A purge plan is refused as a whole before the plan is marked applying. The
+	// historical duplicate rows are still loadable through `plan apply`, and a
+	// member list that contains one is not a list this build may act on.
+	if err := requireLifecycleMembers(purgeMemberItems(members)); err != nil {
+		return out, err
+	}
 	if err := e.Store.SetPlanStatus(ctx, p.ID, domain.PlanApplying); err != nil {
 		return out, err
 	}

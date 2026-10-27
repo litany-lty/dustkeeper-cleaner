@@ -62,7 +62,12 @@ const (
 	CodeIOError          = Code("IO_ERROR")
 	CodeDBError          = Code("DB_ERROR")
 	CodeMigrationTooNew  = Code("MIGRATION_TOO_NEW")
-	CodeDiskPressure     = Code("DISK_PRESSURE")
+	// CodeMigrationTooOld refuses a database written by an older schema. The
+	// simplified build does not migrate in place: an old schema is read as
+	// "this file is not mine", and the operator keeps the old binary and the old
+	// state until they have a verified copy to move forward from.
+	CodeMigrationTooOld = Code("MIGRATION_TOO_OLD")
+	CodeDiskPressure    = Code("DISK_PRESSURE")
 
 	// 8: model unavailable; existing rules are unaffected.
 	CodeModelUnavailable = Code("MODEL_UNAVAILABLE")
@@ -137,6 +142,7 @@ var exitCodes = map[Code]int{
 	CodeIOError:          7,
 	CodeDBError:          7,
 	CodeMigrationTooNew:  7,
+	CodeMigrationTooOld:  7,
 	CodeDiskPressure:     7,
 
 	CodeModelUnavailable: 8,

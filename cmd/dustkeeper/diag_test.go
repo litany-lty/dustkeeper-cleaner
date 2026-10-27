@@ -69,7 +69,7 @@ func TestTheLogRecordsTheRunAndItsConclusion(t *testing.T) {
 	// A command that fails after opening the installation: no scope has that ID.
 	// It goes through the instance boundary, which is where the log opens.
 	cli(t, "init", "--json")
-	r := cli(t, "dedup", "plan", "--scope", "scp_doesnotexist", "--json")
+	r := cli(t, "scan", "--scope", "scp_doesnotexist", "--json")
 	if r.code == 0 {
 		t.Fatalf("expected a failing command, stdout:\n%s", r.stdout)
 	}
@@ -110,7 +110,7 @@ func TestTheLogRecordsTheRunAndItsConclusion(t *testing.T) {
 	if s, _ := result["message"].(string); s == "" {
 		t.Fatal("the result record carries no explanation")
 	}
-	if s, _ := result["command"].(string); !strings.HasPrefix(s, "dedup") {
+	if s, _ := result["command"].(string); !strings.HasPrefix(s, "scan") {
 		t.Fatalf("the result record names command %q", s)
 	}
 }
@@ -172,7 +172,7 @@ func TestTheLogNeverCarriesTheModelKeyOrFileContents(t *testing.T) {
 func TestEveryRecordUsesTheDocumentedKeys(t *testing.T) {
 	base := newHome(t)
 	cli(t, "init", "--json")
-	cli(t, "dedup", "plan", "--scope", "scp_doesnotexist", "--json")
+	cli(t, "scan", "--scope", "scp_doesnotexist", "--json")
 
 	recs := readRecords(t, filepath.Join(base, "state", "logs"))
 	if len(recs) == 0 {

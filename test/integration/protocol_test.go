@@ -15,7 +15,6 @@ import (
 	"dustkeeper/internal/execute"
 	"dustkeeper/internal/fsops"
 	"dustkeeper/internal/plan"
-	"dustkeeper/internal/recovery"
 	"dustkeeper/internal/store"
 )
 
@@ -363,82 +362,6 @@ func intentOfForTest(po store.PendingOp) store.Intent {
 	}
 }
 
-// TestHeldItemWithEvidenceIsAdoptedBackIntoTheTree is the missing exit for a
-// terminal hold: the file is in the vault, the hold is a verdict, and before
-// adoption existed nothing in the product could bring the object back.
-func TestHeldItemWithEvidenceIsAdoptedBackIntoTheTree(t *testing.T) {
-	e := newEnv(t)
-	ctx := context.Background()
-	f := e.stageLegacyHold(t, true)
-
-	held, err := e.st.GetItem(ctx, f.item.ID)
-	if err != nil {
-		t.Fatalf("get item: %v", err)
-	}
-	if held.State != domain.StateHeld || held.PendingOpID != nil {
-		t.Fatalf("the legacy hold was not staged: state=%s pending=%v", held.State, held.PendingOpID)
-	}
-
-	res, err := e.rec.Adopt(ctx, recovery.AdoptOptions{
-		ItemID: f.item.ID, Decision: recovery.AdoptRestore, Reason: "operator reviewed the vault object",
-	})
-	if err != nil {
-		t.Fatalf("adopt: %v", err)
-	}
-	if res.State != domain.StateRestored {
-		t.Fatalf("adoption ended in %s", res.State)
-	}
-	if res.PriorOpID == "" || res.NewOpID == res.PriorOpID {
-		t.Fatalf("adoption did not record the operation it converged: %+v", res)
-	}
-	if _, err := os.Stat(f.srcPath); err != nil {
-		t.Fatalf("the object was not put back: %v", err)
-	}
-	if _, err := os.Stat(f.vaultRaw); !os.IsNotExist(err) {
-		t.Fatal("the object is still in the vault")
-	}
-
-	got, err := e.st.GetItem(ctx, f.item.ID)
-	if err != nil {
-		t.Fatalf("get item: %v", err)
-	}
-	if got.State != domain.StateRestored {
-		t.Fatalf("the item is %s", got.State)
-	}
-
-	// History is appended to, never rewritten: the original terminal hold is
-	// still there, and the new operation has its own intent and completion.
-	events, err := e.st.EventsForItem(ctx, f.item.ID)
-	if err != nil {
-		t.Fatalf("events: %v", err)
-	}
-	holds, adopts := 0, 0
-	for _, ev := range events {
-		if ev.Phase == domain.PhaseHold {
-			holds++
-		}
-		if ev.Action == "adopt" && ev.Phase == domain.PhaseIntent {
-			adopts++
-		}
-	}
-	if holds != 1 {
-		t.Fatalf("the historical hold is no longer exactly one event: %d", holds)
-	}
-	if adopts != 1 {
-		t.Fatalf("adoption wrote %d intent events", adopts)
-	}
-
-	// And the object is protected where it landed: an adoption is a restore, and
-	// a restore is protected against being quarantined again.
-	protections, err := e.st.ListProtections(ctx, got.ScopeID, true)
-	if err != nil {
-		t.Fatalf("protections: %v", err)
-	}
-	if !hasProtection(protections, string(got.RawRelative)) {
-		t.Fatalf("the adopted path is not protected: %+v", protections)
-	}
-}
-
 func hasProtection(list []store.Protection, rel string) bool {
 	for _, p := range list {
 		if string(p.RawRelative) == rel {
@@ -446,48 +369,6 @@ func hasProtection(list []store.Protection, rel string) bool {
 		}
 	}
 	return false
-}
-
-// TestHeldItemWithoutEvidenceIsAdoptedUsingTheContract covers the older shape:
-// the hold recorded nothing about the object that moved. Adoption reads what the
-// intent contract expected and adopts only if the vault object matches it.
-func TestHeldItemWithoutEvidenceIsAdoptedUsingTheContract(t *testing.T) {
-	e := newEnv(t)
-	ctx := context.Background()
-	f := e.stageLegacyHold(t, false)
-
-	held, err := e.st.GetItem(ctx, f.item.ID)
-	if err != nil {
-		t.Fatalf("get item: %v", err)
-	}
-	if held.CapturedIdentityJSON != nil {
-		t.Fatal("this fixture was meant to have no captured evidence")
-	}
-
-	res, err := e.rec.Adopt(ctx, recovery.AdoptOptions{
-		ItemID: f.item.ID, Decision: recovery.AdoptRestore, Reason: "the vault object matches the intent contract",
-	})
-	if err != nil {
-		t.Fatalf("adopt: %v", err)
-	}
-	if res.State != domain.StateRestored {
-		t.Fatalf("adoption ended in %s", res.State)
-	}
-	if _, err := os.Stat(f.srcPath); err != nil {
-		t.Fatalf("the object was not put back: %v", err)
-	}
-}
-
-// TestAdoptionRefusesAnItemThatStillHasAnOpenOperation keeps the two exits
-// apart: an open operation is reconciliation's business, not the operator's.
-func TestAdoptionRefusesAnItemThatStillHasAnOpenOperation(t *testing.T) {
-	e := newEnv(t)
-	f := e.stageCrashedQuarantine(t, nil)
-
-	_, err := e.rec.Adopt(context.Background(), recovery.AdoptOptions{
-		ItemID: f.item.ID, Decision: recovery.AdoptRestore, Reason: "test",
-	})
-	requireCode(t, err, errs.CodeRecoveryRequired)
 }
 
 // TestCrashDiscoveredMiscaptureRecordsTheActualObject covers the first row of the
@@ -539,41 +420,23 @@ func TestCrashDiscoveredMiscaptureRecordsTheActualObject(t *testing.T) {
 	}
 
 	// The original path is taken by a new file, so the only safe restore is to an
-	// explicit empty destination.
+	// explicit empty destination. This is also the exit the simplified build keeps
+	// for a held object: adoption is gone, an explicit restore is not.
 	if err := os.WriteFile(f.srcPath, []byte("a new file at the old path"), 0o644); err != nil {
 		t.Fatalf("occupy the original path: %v", err)
 	}
-	if _, err := e.rec.Adopt(ctx, recovery.AdoptOptions{
-		ItemID: f.item.ID, Decision: recovery.AdoptRestore, Reason: "put the wrong object back",
-	}); errs.CodeOf(err) != errs.CodeRestoreConflict {
-		t.Fatalf("adoption into an occupied path returned %v", err)
+	sc := e.scopeCtx(f.item.ScopeID)
+	e.exec.Guard = e.guard(sc)
+	if _, err := e.exec.Restore(ctx, sc, f.item.ID, execute.RestoreOptions{}); errs.CodeOf(err) != errs.CodeRestoreConflict {
+		t.Fatalf("restoring onto an occupied path returned %v", err)
 	}
 
-	res, err := e.rec.Adopt(ctx, recovery.AdoptOptions{
-		ItemID:   f.item.ID,
-		Decision: recovery.AdoptRestore,
-		To:       []byte("recovered/wrong-object.bin"),
-		Reason:   "the original path was reused; this is the only empty destination",
-	})
-	if err != nil {
-		// The directory must already exist, by design: nothing is created on the
-		// operator's behalf.
-		requireCode(t, err, errs.CodeRestoreConflict)
-		if err := os.MkdirAll(filepath.Dir(e.treePath("exports", "recovered/wrong-object.bin")), 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		res, err = e.rec.Adopt(ctx, recovery.AdoptOptions{
-			ItemID:   f.item.ID,
-			Decision: recovery.AdoptRestore,
-			To:       []byte("recovered/wrong-object.bin"),
-			Reason:   "the original path was reused; this is the only empty destination",
-		})
-		if err != nil {
-			t.Fatalf("adopt to an explicit destination: %v", err)
-		}
+	if err := os.MkdirAll(filepath.Dir(e.treePath("exports", "recovered/wrong-object.bin")), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
 	}
-	if res.State != domain.StateRestored {
-		t.Fatalf("adoption ended in %s", res.State)
+	if _, err := e.exec.Restore(ctx, sc, f.item.ID,
+		execute.RestoreOptions{DestinationRelative: []byte("recovered/wrong-object.bin")}); err != nil {
+		t.Fatalf("restore the held object to an explicit destination: %v", err)
 	}
 	if data, err := os.ReadFile(e.treePath("exports", "recovered/wrong-object.bin")); err != nil {
 		t.Fatalf("the recovered object is not there: %v", err)
@@ -728,42 +591,5 @@ func TestCompensationCrashReturnsToTheHold(t *testing.T) {
 	}
 	if _, err := os.Stat(srcPath); !os.IsNotExist(err) {
 		t.Fatal("the object was moved even though the rename never ran")
-	}
-}
-
-// TestAdoptAcceptsQuarantineWithFreshEvidence is the other adoption decision: the
-// object is where it should be, so it is accepted as quarantined - with evidence
-// read from the object itself and a window that starts now.
-func TestAdoptAcceptsQuarantineWithFreshEvidence(t *testing.T) {
-	e := newEnv(t)
-	ctx := context.Background()
-	f := e.stageLegacyHold(t, false)
-
-	before := e.clock.Wall().UnixNano()
-	res, err := e.rec.Adopt(ctx, recovery.AdoptOptions{
-		ItemID: f.item.ID, Decision: recovery.AdoptQuarantine, Reason: "the object is where it belongs; accept it",
-	})
-	if err != nil {
-		t.Fatalf("adopt: %v", err)
-	}
-	if res.State != domain.StateQuarantined {
-		t.Fatalf("adoption ended in %s", res.State)
-	}
-	got, err := e.st.GetItem(ctx, f.item.ID)
-	if err != nil {
-		t.Fatalf("get item: %v", err)
-	}
-	if got.ContentHash == nil || *got.ContentHash == "" {
-		t.Fatal("an adopted object has no content hash")
-	}
-	if got.CapturedIdentityJSON == nil || got.PurgeNotBeforeNS == nil {
-		t.Fatal("an adopted object has no captured evidence or deadline")
-	}
-	if *got.PurgeNotBeforeNS <= before {
-		t.Fatalf("the adopted object's window starts in the past: %d <= %d", *got.PurgeNotBeforeNS, before)
-	}
-	want := before + got.BoundRetentionSeconds*int64(time.Second)
-	if *got.PurgeNotBeforeNS < want {
-		t.Fatalf("the window is shorter than the retention period: %d < %d", *got.PurgeNotBeforeNS, want)
 	}
 }

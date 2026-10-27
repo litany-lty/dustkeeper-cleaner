@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"dustkeeper/internal/clocktrust"
-	"dustkeeper/internal/dedup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
@@ -241,9 +240,8 @@ func planApply(ctx context.Context, a *app, args []string) (output, error) {
 		}
 		// Section 2.1: an assisted scope is only ever changed while the producer
 		// is stopped, and that is an operator statement the program cannot make
-		// for itself. A duplicate plan needs it too, because it removes copies of
-		// bytes that something might still be writing.
-		if !*writersStopped && (p.Kind == domain.PlanManualDuplicate || sc.Kind == domain.KindAssisted) {
+		// for itself.
+		if !*writersStopped && sc.Kind == domain.KindAssisted {
 			return output{}, errs.New(errs.CodeInvalidArgument,
 				"this plan changes files in an assisted scope; pass --writers-stopped to confirm that the producers are stopped and the directory is quiet")
 		}
@@ -257,7 +255,7 @@ func planApply(ctx context.Context, a *app, args []string) (output, error) {
 			return output{}, err
 		}
 
-		exec := a.executor(a.detector())
+		exec := a.executor()
 		exec.Guard = guard
 		budget := domain.NewBudget(a.cfg.Runtime.RunSoftSeconds, a.cfg.Runtime.RunReadBudgetBytes,
 			len(items), planBytes(items), a.cfg.Runtime.ReadRateBytesPerSecond)
@@ -346,124 +344,3 @@ func planBytes(items []store.Item) int64 {
 	return total
 }
 
-// cmdDedup routes the duplicate pipeline.
-func cmdDedup(ctx context.Context, a *app, args []string) (output, error) {
-	if len(args) == 0 || args[0] != "plan" {
-		return output{}, errs.New(errs.CodeInvalidArgument, "dedup needs a subcommand: plan")
-	}
-	fs := flagset("dedup plan", io.Discard)
-	scopeRef := fs.String("scope", "", "scope to search")
-	keeperRef := fs.String("keeper-scope", "", "scope whose copy is kept")
-	deep := fs.Bool("deep", false, "allow a larger read budget")
-	if err := parseFlags(fs, args[1:]); err != nil {
-		return output{}, err
-	}
-	if *scopeRef == "" {
-		return output{}, errs.New(errs.CodeInvalidArgument, "--scope is required")
-	}
-	if err := a.openStore(); err != nil {
-		return output{}, err
-	}
-
-	return a.withInstance(func() (output, error) {
-		sc, err := resolveScope(ctx, a.store, *scopeRef)
-		if err != nil {
-			return output{}, err
-		}
-		if !domain.MutableKind(sc.Kind) && sc.Kind != domain.KindAssisted {
-			return output{}, errs.Newf(errs.CodeInvalidArgument,
-				"scope %s is %s; duplicates can only be planned inside an assisted or managed scope", sc.ID, sc.Kind)
-		}
-		var keeperScope *domain.ScopeID
-		if *keeperRef != "" {
-			ks, err := resolveScope(ctx, a.store, *keeperRef)
-			if err != nil {
-				return output{}, err
-			}
-			keeperScope = &ks.ID
-		}
-
-		sctx, err := execute.OpenScopeCtx(ctx, a.registrar(), sc.ID)
-		if err != nil {
-			return output{}, err
-		}
-		defer sctx.Close()
-
-		readBudget := a.cfg.Runtime.RunReadBudgetBytes
-		softSeconds := a.cfg.Runtime.RunSoftSeconds
-		if *deep {
-			// --deep raises the read budget explicitly; it never removes the
-			// limit and never upgrades the background run.
-			readBudget *= 4
-			softSeconds *= 2
-		}
-		budget := domain.NewBudget(softSeconds, readBudget, 0, 0, a.cfg.Runtime.ReadRateBytesPerSecond)
-
-		det := a.detector()
-		det.Budget = budget
-		det.MaxBytes = readBudget
-		res, err := det.Detect(ctx, sctx, keeperScope)
-		if err != nil {
-			return output{}, err
-		}
-		if res.PlannableGroups == 0 {
-			o := ok()
-			o.ScopeID = string(sc.ID)
-			o.Code = errs.CodeNoCandidates
-			o.Data = res
-			o.Human = []string{
-				fmt.Sprintf("%d content group(s) have identical bytes; none can be planned", res.ContentGroups),
-				"  keeping every copy is the conservative outcome, not a failure to find duplicates",
-			}
-			for _, g := range res.Groups {
-				rel := displayPathBytes(g.Keeper.Rel)
-				if g.MetadataCompatible {
-					o.Human = append(o.Human, "  metadata equivalent, but nothing to remove: "+rel)
-				} else {
-					o.Human = append(o.Human, "  kept: "+rel+" — "+g.Note)
-				}
-			}
-			for _, n := range res.Notes {
-				o.Human = append(o.Human, "  "+n)
-			}
-			return o, nil
-		}
-
-		p, items, err := det.CreatePlan(ctx, sctx, res.Groups)
-		if err != nil {
-			return output{}, err
-		}
-
-		o := ok()
-		o.ScopeID = string(sc.ID)
-		o.PlanID = string(p.ID)
-		o.Counts = &counts{Planned: len(items)}
-		o.Data = map[string]any{
-			"plan_id":       string(p.ID),
-			"digest":        string(p.Digest),
-			"groups":        res.ContentGroups,
-			"plannable":     res.PlannableGroups,
-			"items":         previewItems(items),
-			"logical_bytes": res.LogicalBytes,
-			"notes":         res.Notes,
-			"retention":     dedup.RetentionSeconds(),
-		}
-		o.Human = []string{
-			fmt.Sprintf("%d content group(s), %d plannable, plan %s covers %d copy(ies)",
-				res.ContentGroups, res.PlannableGroups, p.ID, len(items)),
-			fmt.Sprintf("  each kept copy stays in place; retention for the copies is %d seconds",
-				dedup.RetentionSeconds()),
-			"  this program cannot prove that no other process holds a reference to the paths it removes",
-		}
-		for _, g := range res.Groups {
-			if !g.MetadataCompatible {
-				o.Human = append(o.Human, "  kept together (different metadata): "+g.Note)
-			}
-		}
-		o.Human = append(o.Human, "", "plan digest (repeat it to apply):", "  "+string(p.Digest))
-		o.Next = []string{
-			fmt.Sprintf("dustkeeper plan apply --id %s --digest %s --writers-stopped", p.ID, p.Digest),
-		}
-		return o, nil
-	})
-}

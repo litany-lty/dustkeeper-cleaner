@@ -69,90 +69,65 @@ func inodeFlags(t *testing.T, path string) uint64 {
 	return uint64(uint32(flags))
 }
 
-// TestANonZeroFlagKeeperIsPurgedNormally is the Linux half of R09 B.
+// TestANonZeroInodeFlagDoesNotBlockThePurge is the Linux half of R09 B, kept for
+// the lifecycle pipeline that this build still runs.
 //
-// The planning side used to build the metadata digest from the change token,
-// which carries no inode flags at all, while the re-check read the real flags
-// through the descriptor. An untouched file with any flag set therefore looked
-// modified, and the object could never be emptied. The fix reads both sides from
-// the same fd evidence; this test proves that an unchanged file with a real,
-// non-zero flag set still reaches a normal purge.
-func TestANonZeroFlagKeeperIsPurgedNormally(t *testing.T) {
+// Planning used to build the metadata digest from the change token, which
+// carries no inode flags at all, while the pre-purge re-check read the real flags
+// through the descriptor. An untouched quarantined file with any flag set then
+// looked modified and could never be emptied. Both sides now come from the same
+// fd evidence; this test proves that an unchanged object with a real, non-zero
+// flag set still reaches a normal purge.
+func TestANonZeroInodeFlagDoesNotBlockThePurge(t *testing.T) {
 	e := newEnv(t)
-	src := e.addScope("dups", domain.KindAssisted).ID
-	keeperScope := e.addScope("originals", domain.KindReference).ID
+	sc := e.addScope("exports", domain.KindManagedDisposable)
+	e.writeFile("exports", "old.bin", "payload", 40*24*time.Hour)
 
-	e.writeFile("dups", "one.bin", "same-bytes", 0)
-	e.writeFile("dups", "two.bin", "same-bytes", 0)
-	e.writeFile("originals", "keep.bin", "same-bytes", 0)
-
-	// Both copies must carry the same flags: the duplicate policy already refuses
-	// to pair files whose metadata differs, and that rule is not being relaxed
-	// here. What is being proved is that equal, non-zero flags survive a purge.
-	for _, rel := range []string{"dups/one.bin", "dups/two.bin", "originals/keep.bin"} {
-		if !setInodeFlag(t, filepath.Join(e.base, "trees", rel)) {
-			t.Skip("this host cannot set an inode flag, so the non-zero flags case cannot be built")
-		}
+	target := filepath.Join(e.base, "trees", "exports", "old.bin")
+	if !setInodeFlag(t, target) {
+		t.Skip("this host cannot set an inode flag, so the non-zero flags case cannot be built")
 	}
-	for _, rel := range []string{"dups/one.bin", "dups/two.bin", "originals/keep.bin"} {
-		if flags := inodeFlags(t, filepath.Join(e.base, "trees", rel)); flags == 0 {
-			t.Fatalf("%s reports no flags; the fixture did not take", rel)
-		}
+	if flags := inodeFlags(t, target); flags == 0 {
+		t.Fatal("the file reports no flags; the fixture did not take")
 	}
 
-	e.scan(src)
-	e.scan(keeperScope)
-
-	sctx := e.scopeCtx(src)
-	ks := keeperScope
-	res, err := e.det.Detect(context.Background(), sctx, &ks)
-	if err != nil {
-		t.Fatalf("detect: %v", err)
+	e.scan(sc.ID)
+	r := e.rule(sc.ID, "rule-1", []string{"*.bin"}, nil, 30*24*time.Hour, 7*24*time.Hour)
+	res := e.planFor(sc, r, 100)
+	if len(res.Items) != 1 {
+		t.Fatalf("expected one planned item, got %d (%v)", len(res.Items), res.Reasons)
 	}
-	if res.PlannableGroups != 1 {
-		t.Fatalf("expected one plannable group despite equal non-zero flags, got %d (%v)",
-			res.PlannableGroups, res.Notes)
-	}
-	p, items, err := e.det.CreatePlan(context.Background(), sctx, res.Groups)
-	if err != nil {
-		t.Fatalf("create plan: %v", err)
-	}
-	if len(items) != 2 {
-		t.Fatalf("expected two copies planned, got %d", len(items))
-	}
-	sc, err := e.st.GetScope(context.Background(), src)
-	if err != nil {
-		t.Fatalf("get scope: %v", err)
-	}
-	if _, err := e.apply(sc, p, p.Digest); err != nil {
+	if _, err := e.apply(sc, res.Plan, res.Plan.Digest); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 
-	e.clock.Advance(31 * 24 * time.Hour)
-	due, err := e.st.ItemsDueForPurge(context.Background(), src, e.clock.Wall().UnixNano(), 10)
+	quarantinedPath := filepath.Join(e.base, "trees", "exports", ".dustkeeper", "objects", res.Items[0].ObjectName)
+	if flags := inodeFlags(t, quarantinedPath); flags == 0 {
+		t.Fatalf("the rename lost the flags: %#x", flags)
+	}
+
+	e.clock.Advance(8 * 24 * time.Hour)
+	due, err := e.st.ItemsDueForPurge(context.Background(), sc.ID, e.clock.Wall().UnixNano(), 10)
 	if err != nil {
 		t.Fatalf("due: %v", err)
 	}
-	if len(due) == 0 {
-		t.Fatal("no duplicate became due")
+	if len(due) != 1 {
+		t.Fatalf("expected one due item, got %d", len(due))
 	}
 	item := due[0]
 
 	if item.MetadataHash == nil {
 		t.Fatal("the quarantined object carries no metadata digest")
 	}
-	t.Logf("inode flags %#x; recorded metadata digest %s", inodeFlags(t, e.keeperPath()), *item.MetadataHash)
+	t.Logf("inode flags %#x; recorded metadata digest %s", inodeFlags(t, quarantinedPath), *item.MetadataHash)
 
 	if err := e.tryPurge(sc, item); err != nil {
-		t.Fatalf("an unchanged keeper with non-zero flags blocked the purge: %v", err)
+		t.Fatalf("an unchanged object with non-zero flags blocked the purge: %v", err)
 	}
 	if e.vaultObjectExists(sc, item) {
 		t.Fatal("the payload is still in the vault")
 	}
 	if action := e.lastIntentAction(item.ID); action != "purge" {
 		t.Fatalf("expected a purge intent, got %q", action)
-	}
-	if flags := inodeFlags(t, e.keeperPath()); flags == 0 {
-		t.Fatalf("the keeper lost its flags: %#x", flags)
 	}
 }

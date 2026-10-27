@@ -134,7 +134,6 @@ func (e *Executor) scopeGate(ctx context.Context, sc *ScopeCtx) error {
 	}
 	switch cur.Status {
 	case domain.ScopeActive:
-		return nil
 	case domain.ScopePaused:
 		return errs.Newf(errs.CodePaused,
 			"scope %s is paused; no new operation starts until it is resumed", sc.Scope.ID)
@@ -144,6 +143,24 @@ func (e *Executor) scopeGate(ctx context.Context, sc *ScopeCtx) error {
 	default:
 		return errs.Newf(errs.CodePlanStale, "scope %s is %s", sc.Scope.ID, cur.Status)
 	}
+
+	// A scope whose own status looks fine can still hold work nobody finished: a
+	// pending operation, an object frozen by a verdict, an object between two
+	// states after a process died. The status column is a summary written at the
+	// time, and it is not authoritative for that. Asking the rows means the manual
+	// path and the background path are blocked by the same fact, which is what
+	// "the operator cannot route around an unresolved object" has to mean in
+	// practice.
+	unresolved, err := e.Store.ScopeHasUnresolved(ctx, sc.Scope.ID)
+	if err != nil {
+		return err
+	}
+	if unresolved {
+		return errs.Newf(errs.CodeHeld,
+			"scope %s holds an operation that is not converged (pending, held or unknown); run `dustkeeper recover reconcile` and resolve it before starting new work",
+			sc.Scope.ID)
+	}
+	return nil
 }
 
 // controlOf maps a stop condition onto the control axis so the caller does not

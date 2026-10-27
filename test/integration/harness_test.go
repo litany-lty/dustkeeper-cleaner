@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"dustkeeper/internal/config"
-	"dustkeeper/internal/dedup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
@@ -56,7 +55,6 @@ type env struct {
 	st    *store.Store
 	reg   *scope.Registrar
 	exec  *execute.Executor
-	det   *dedup.Detector
 	plan  *plan.Planner
 	rec   *recovery.Reconciler
 	run   *run.Runner
@@ -109,16 +107,11 @@ func newEnv(t *testing.T) *env {
 		Clock:  clock,
 		Config: executeConfig(cfg),
 		Gate:   scope.PauseGate{StateDir: paths.StateDir},
+		// The fake clock never moves backwards, so the run-wide assertion is the
+		// same one production supplies; a test that wants a refused clock sets
+		// its own function instead of relying on "nobody checked".
+		QuarantineTrust: trustOK,
 	}
-	det := &dedup.Detector{
-		Store:      st,
-		Registrar:  reg,
-		Clock:      clock,
-		Buffer:     make([]byte, 64<<10),
-		RatePerSec: 0,
-	}
-	exec.Keeper = det
-
 	e := &env{
 		t:     t,
 		base:  base,
@@ -128,7 +121,6 @@ func newEnv(t *testing.T) *env {
 		st:    st,
 		reg:   reg,
 		exec:  exec,
-		det:   det,
 		plan:  &plan.Planner{Store: st, Clock: clock},
 		rec: &recovery.Reconciler{
 			Store: st, Clock: clock, Registrar: reg, Exec: exec,

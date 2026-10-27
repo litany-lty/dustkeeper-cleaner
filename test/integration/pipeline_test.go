@@ -313,61 +313,6 @@ func TestManualPurgeRemovesOnlyListedObjects(t *testing.T) {
 	}
 }
 
-// A08: a duplicate whose keeper disappeared must not be purged.
-func TestPurgeRefusesWhenTheKeeperIsGone(t *testing.T) {
-	e := newEnv(t)
-	src := e.addScope("dups", domain.KindAssisted)
-	e.addScope("originals", domain.KindReference)
-
-	e.writeFile("dups", "one.bin", "same-bytes", 0)
-	e.writeFile("dups", "two.bin", "same-bytes", 0)
-	e.writeFile("originals", "keep.bin", "same-bytes", 0)
-
-	e.scan(src.ID)
-	e.scan(domain.ScopeID("originals"))
-
-	sctx := e.scopeCtx(src.ID)
-	keeper := domain.ScopeID("originals")
-	res, err := e.det.Detect(context.Background(), sctx, &keeper)
-	if err != nil {
-		t.Fatalf("detect: %v", err)
-	}
-	if res.PlannableGroups != 1 {
-		t.Fatalf("expected one plannable group, got %d (%v)", res.PlannableGroups, res.Notes)
-	}
-	if res.Groups[0].Keeper.ScopeID != keeper {
-		t.Fatalf("the keeper should come from the reference scope, got %s", res.Groups[0].Keeper.ScopeID)
-	}
-
-	p, items, err := e.det.CreatePlan(context.Background(), sctx, res.Groups)
-	if err != nil {
-		t.Fatalf("create plan: %v", err)
-	}
-	if len(items) != 2 {
-		t.Fatalf("expected two copies planned, got %d", len(items))
-	}
-	if _, err := e.apply(src, p, p.Digest); err != nil {
-		t.Fatalf("apply: %v", err)
-	}
-
-	// The keeper is removed by someone else.
-	if err := os.Remove(filepath.Join(e.base, "trees", "originals", "keep.bin")); err != nil {
-		t.Fatalf("remove keeper: %v", err)
-	}
-	e.clock.Advance(31 * 24 * time.Hour)
-
-	due, err := e.st.ItemsDueForPurge(context.Background(), src.ID, e.clock.Wall().UnixNano(), 10)
-	if err != nil {
-		t.Fatalf("due: %v", err)
-	}
-	if len(due) == 0 {
-		t.Fatal("no object became due")
-	}
-	if _, err := e.det.VerifyKeeper(context.Background(), due[0]); err == nil {
-		t.Fatal("the keeper verification passed after the keeper was deleted")
-	}
-}
-
 // A09: a zero action limit forbids the action; it never means "unlimited".
 func TestZeroBudgetForbidsTheAction(t *testing.T) {
 	e := newEnv(t)
