@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 
@@ -42,4 +43,14 @@ func readManifestFile(sc *execute.ScopeCtx, objectID string) ([]byte, error) {
 
 func decodeB64Std(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
+}
+
+// quoteJSON renders a string as a JSON literal for the result payloads stored in
+// the audit trail.
+func quoteJSON(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(b)
 }

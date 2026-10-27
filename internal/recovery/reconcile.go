@@ -40,11 +40,20 @@ type Result struct {
 }
 
 // Report summarises a reconciliation pass.
+//
+// Parked, Busy and Blocked exist because the previous report had one bucket,
+// "unknown", for three different situations, and the bucket cleared the pending
+// marker. A parked operation is still unfinished and will be retried; a busy
+// scope was never observed at all; a blocked scope could not be verified. Only
+// Held is a verdict.
 type Report struct {
 	Examined  int      `json:"examined"`
 	Completed int      `json:"completed"`
 	Aborted   int      `json:"aborted"`
 	Held      int      `json:"held"`
+	Parked    int      `json:"parked"`
+	Busy      int      `json:"busy"`
+	Blocked   int      `json:"blocked"`
 	Unknown   int      `json:"unknown"`
 	Results   []Result `json:"results"`
 	Scopes    []string `json:"scopes_held,omitempty"`
@@ -81,12 +90,23 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 		if !ok {
 			opened, err := execute.OpenScopeCtx(ctx, r.Registrar, po.Item.ScopeID)
 			if err != nil {
-				// A scope whose root cannot be verified is held, not guessed at.
+				// Not having the lock is not an observation about the object.
+				// Writing "unknown" or holding the scope here turned "somebody
+				// else is working on this tree" into "this object is broken",
+				// and the second one used to be permanent.
+				if errs.CodeOf(err) == errs.CodeInstanceBusy {
+					rep.Busy++
+					rep.Results = append(rep.Results, Result{Item: po.Item.ID, Action: po.Action,
+						Outcome: "busy", Detail: "another task holds the scope lock; nothing was changed"})
+					continue
+				}
+				// A scope that cannot be verified has not been observed either.
+				// The scope status records the problem; the item keeps its
+				// pending marker so the next pass can still finish it.
 				_ = r.Store.SetScopeStatus(ctx, po.Item.ScopeID, domain.ScopeHeld)
-				_ = r.Store.MarkItemState(ctx, po.Item.ID, domain.StateUnknown, "SCOPE_UNVERIFIABLE")
-				rep.Unknown++
+				rep.Blocked++
 				rep.Results = append(rep.Results, Result{Item: po.Item.ID, Action: po.Action,
-					Outcome: "unknown", Detail: "scope root could not be verified"})
+					Outcome: "blocked", Detail: "the scope root could not be verified: " + err.Error()})
 				continue
 			}
 			scopes[po.Item.ScopeID] = opened
@@ -101,6 +121,8 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 			rep.Aborted++
 		case "held":
 			rep.Held++
+		case "parked":
+			rep.Parked++
 		case "unknown":
 			rep.Unknown++
 		}
@@ -116,16 +138,92 @@ func (r *Reconciler) reconcileOne(ctx context.Context, sc *execute.ScopeCtx, po 
 	switch po.Action {
 	case "quarantine":
 		return r.reconcileQuarantine(ctx, sc, po)
-	case "restore", "compensate":
+	case "restore", "compensate", "adopt":
 		return r.reconcileRestore(ctx, sc, po)
 	case "purge":
 		return r.reconcilePurge(ctx, sc, po)
 	default:
-		_ = r.Store.MarkItemState(ctx, it.ID, domain.StateUnknown, "UNKNOWN_ACTION")
-		out.Outcome = "unknown"
-		out.Detail = "the pending operation has no recorded action"
+		return r.holdUnfixable(ctx, po, out, "UNKNOWN_ACTION",
+			"the pending operation has no recorded action")
+	}
+}
+
+// retryableCode reports whether a failure is an environment problem that may
+// clear on its own.
+//
+// The distinction matters because the two outcomes are different promises. A
+// retryable failure keeps the pending marker, the original contract and the
+// attempt count: the object may still be finished, and the next pass picks it up.
+// Anything else is a verdict and becomes a terminal hold, which is visible and
+// which `recover adopt` can converge. What must never happen - and what this
+// replaced - is a bare state write that clears the pending marker, because then
+// nothing is retried and nothing can be adopted either.
+func retryableCode(c errs.Code) bool {
+	switch c {
+	case errs.CodeIOError, errs.CodeDurabilityFailed, errs.CodeAccessDenied,
+		errs.CodeStateWriteFailed, errs.CodeDBError, errs.CodeInstanceBusy,
+		errs.CodeBudgetExhausted, errs.CodeCancelled:
+		return true
+	}
+	return false
+}
+
+// recordFailure parks or holds an operation depending on what kind of failure it
+// met, and returns the result row for the report.
+func (r *Reconciler) recordFailure(ctx context.Context, po store.PendingOp, out Result,
+	code string, err error) Result {
+
+	detail := code
+	if err != nil {
+		detail = code + ": " + err.Error()
+	}
+	if err == nil || retryableCode(errs.CodeOf(err)) {
+		return r.parkAttempt(ctx, po, out, code, detail)
+	}
+	return r.holdUnfixableDetail(ctx, po, out, code, detail)
+}
+
+// parkAttempt keeps the operation open. The item stays "unknown" with its pending
+// marker, so the next pass finds it again; the attempt count is recorded so an
+// operator can see that nothing is progressing.
+func (r *Reconciler) parkAttempt(ctx context.Context, po store.PendingOp, out Result,
+	code, detail string) Result {
+
+	attempts := 1
+	if n, err := r.Store.ReconcileAttempts(ctx, po.Item.ID); err == nil {
+		attempts = n + 1
+	}
+	if err := r.Store.NoteParked(ctx, po.Item.ID, code, detail, attempts); err != nil {
+		// Failing to write the note does not make the object explainable. The
+		// pending marker is still in place, which is the fact that matters.
+		out.Outcome = "parked"
+		out.Detail = detail + "; the attempt could not be recorded: " + err.Error()
 		return out
 	}
+	out.Outcome = "parked"
+	out.Detail = detail
+	return out
+}
+
+// holdUnfixable records a verdict: the observed state contradicts the record, or
+// there is nothing left to observe.
+func (r *Reconciler) holdUnfixable(ctx context.Context, po store.PendingOp, out Result, code, detail string) Result {
+	return r.holdUnfixableDetail(ctx, po, out, code, detail)
+}
+
+func (r *Reconciler) holdUnfixableDetail(ctx context.Context, po store.PendingOp, out Result,
+	code, detail string) Result {
+
+	if err := r.Store.HoldIntent(ctx, intentOf(po), code,
+		`{"source":"reconciled","result":"held without an automatic repair","detail":`+
+			quoteJSON(detail)+`}`); err != nil {
+		out.Outcome = "unknown"
+		out.Detail = detail + "; the hold could not be recorded: " + err.Error()
+		return out
+	}
+	out.Outcome = "held"
+	out.Detail = detail
+	return out
 }
 
 // reconcileQuarantine implements the Q_INTENT rows of the matrix.
@@ -142,7 +240,9 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 
 	contract, err := plan.ParseContract(po.ContractJSON)
 	if err != nil {
-		return r.markUnknown(ctx, it.ID, out, "INTENT_CONTRACT_UNREADABLE: "+err.Error())
+		// The contract is the record of what was meant to move. Without it there
+		// is nothing to compare against, so this is a verdict, not a retry.
+		return r.recordFailure(ctx, po, out, "INTENT_CONTRACT_UNREADABLE", err)
 	}
 	expected := contract.ExpectedIdent
 
@@ -154,7 +254,7 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 		// Nothing moved. Close the attempt; never replay an old plan.
 		if err := r.Store.AbortIntent(ctx, intentOf(po), domain.StateAborted,
 			`{"source":"reconciled","result":"source still present, vault empty"}`); err != nil {
-			return r.markUnknown(ctx, it.ID, out, "ABORT_FAILED")
+			return r.recordFailure(ctx, po, out, "ABORT_FAILED", err)
 		}
 		_ = r.Store.ReleaseItemKeeperPin(ctx, it.ID)
 		out.Outcome = "aborted"
@@ -165,7 +265,7 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 		// The move happened but was not recorded. Complete it after re-verifying.
 		completion, err := r.completeQuarantine(ctx, sc, po, contract)
 		if err != nil {
-			return r.markUnknown(ctx, it.ID, out, "COMPLETION_VERIFY_FAILED: "+err.Error())
+			return r.recordFailure(ctx, po, out, "COMPLETION_VERIFY_FAILED", err)
 		}
 		out.Outcome = "completed"
 		out.Detail = completion
@@ -174,25 +274,29 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 	case srcFound && vaultFound && vaultID.Equal(expected) && srcID.Equal(expected):
 		// The same object is in two places, which the single-link admission rule
 		// forbids. This is not a state to repair automatically.
-		_ = r.Store.HoldIntent(ctx, intentOf(po), "DUPLICATE_LINK_STATE",
-			`{"source":"reconciled","result":"object present at source and in vault"}`)
-		out.Outcome = "held"
-		out.Detail = "the object appears both at the source and in the vault"
-		return out
+		return r.holdUnfixable(ctx, po, out, "DUPLICATE_LINK_STATE",
+			"the object appears both at the source and in the vault")
 
 	case vaultFound && !vaultID.Equal(expected):
-		_ = r.Store.HoldIntent(ctx, intentOf(po), "UNEXPECTED_VAULT_OBJECT",
-			`{"source":"reconciled","result":"vault object is not the recorded object"}`)
-		_ = r.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld)
+		// The object in the vault is not the planned object. The file really did
+		// leave the tree, and the evidence of what left is available right here -
+		// so it is recorded.
+		//
+		// This branch used to write a plain hold. The consequence was a file the
+		// product could neither purge (no captured evidence) nor restore (no
+		// captured identity), preserved on disk but unreachable.
+		if why := r.holdCapturedObject(ctx, sc, po, out); why != "" {
+			out.Detail = "the vault holds an object that is not the planned one; " + why
+		} else {
+			out.Detail = "the vault holds an object that is not the planned one; its evidence was recorded so it can be restored"
+		}
 		out.Outcome = "held"
-		out.Detail = "the vault holds an object that is not the planned one"
+		_ = r.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld)
 		return out
 
 	case !srcFound && !vaultFound:
-		_ = r.Store.MarkItemState(ctx, it.ID, domain.StateUnknown, "OBJECT_MISSING_BOTH_PLACES")
-		out.Outcome = "unknown"
-		out.Detail = "neither the source nor the vault object exists; this cannot be explained"
-		return out
+		return r.holdUnfixable(ctx, po, out, "OBJECT_MISSING_BOTH_PLACES",
+			"neither the source nor the vault object exists")
 
 	default:
 		// A different object now sits at the source path. The vault object is
@@ -201,14 +305,52 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 		if vaultFound && vaultID.Equal(expected) {
 			completion, err := r.completeQuarantine(ctx, sc, po, contract)
 			if err != nil {
-				return r.markUnknown(ctx, it.ID, out, "COMPLETION_VERIFY_FAILED: "+err.Error())
+				return r.recordFailure(ctx, po, out, "COMPLETION_VERIFY_FAILED", err)
 			}
 			out.Outcome = "completed"
 			out.Detail = completion + "; a new file at the original path was left untouched"
 			return out
 		}
-		return r.markUnknown(ctx, it.ID, out, "UNEXPLAINED_QUARANTINE_STATE")
+		return r.holdUnfixable(ctx, po, out, "UNEXPLAINED_QUARANTINE_STATE",
+			"the observed source and vault state matches no explainable outcome")
 	}
+}
+
+// holdCapturedObject records a terminal hold together with the evidence of the
+// object that actually moved.
+//
+// The evidence is read from the object in the vault, never from the plan: the
+// plan describes what was expected, and repeating it here would produce a hold
+// whose "actual" record is a copy of the mistake. It returns a description of why
+// the evidence could not be read, or "" on success.
+func (r *Reconciler) holdCapturedObject(ctx context.Context, sc *execute.ScopeCtx,
+	po store.PendingOp, out Result) string {
+
+	it := po.Item
+	objParent, err := sc.Objects.ParentOf(it.ObjectName)
+	if err != nil {
+		r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
+			"the vault object cannot be opened, so the object that moved cannot be described")
+		return "the object could not be opened"
+	}
+	defer objParent.Close()
+	obj, err := fsops.OpenRegularAt(objParent, sc.RootDev)
+	if err != nil {
+		r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
+			"the vault object cannot be opened, so the object that moved cannot be described")
+		return "the object could not be opened"
+	}
+	defer obj.Close()
+
+	idJSON, _ := json.Marshal(obj.Identity)
+	tokJSON, _ := json.Marshal(obj.Token)
+	payload := `{"source":"reconciled","result":"vault object is not the planned object","captured_identity":` +
+		quoteJSON(string(idJSON)) + `,"captured_token":` + quoteJSON(string(tokJSON)) + `}`
+	if err := r.Store.HoldIntentWithCapture(ctx, intentOf(po), "UNEXPECTED_VAULT_OBJECT",
+		payload, string(idJSON), string(tokJSON)); err != nil {
+		return "the evidence could not be recorded: " + err.Error()
+	}
+	return ""
 }
 
 // completeQuarantine finishes a move that already happened.
@@ -328,24 +470,25 @@ func (r *Reconciler) completeQuarantine(ctx context.Context, sc *execute.ScopeCt
 }
 
 // reconcileRestore implements the R_INTENT rows of the matrix.
+//
+// Both the destination and the state an aborted attempt returns to are read from
+// the versioned contract. The previous version decoded one field loosely and
+// hardcoded "quarantined" as the return state, so a restore that was started from
+// a hold came back as "quarantined" - which both cleared the hold semantics and
+// started the object on the way to purge eligibility.
 func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
 	it := po.Item
 	out := Result{Item: it.ID, Action: po.Action}
 
-	var contract struct {
-		RawRelativeB64 string `json:"raw_relative_b64"`
+	contract, dest, cerr := r.restoreContract(po)
+	if cerr != nil {
+		return r.recordFailure(ctx, po, out, "RESTORE_CONTRACT_UNREADABLE", cerr)
 	}
-	_ = json.Unmarshal([]byte(po.ContractJSON), &contract)
-	dest := it.RawRelative
-	if contract.RawRelativeB64 != "" {
-		if raw, err := decodeB64(contract.RawRelativeB64); err == nil && len(raw) > 0 {
-			dest = raw
-		}
-	}
+	backState := priorStateOf(contract, it)
 
 	captured, err := identityOf(ptrString(it.CapturedIdentityJSON))
 	if err != nil {
-		return r.markUnknown(ctx, it.ID, out, "CAPTURED_IDENTITY_UNREADABLE")
+		return r.recordFailure(ctx, po, out, "CAPTURED_IDENTITY_UNREADABLE", err)
 	}
 
 	destID, destFound := statEntry(sc, dest)
@@ -360,20 +503,33 @@ func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx,
 		// after this record could leave a completion that was not on disk.
 		destParent, perr := sc.Root.OpenParent(dest)
 		if perr != nil {
-			return r.markUnknown(ctx, it.ID, out, "DEST_PARENT_UNAVAILABLE")
+			return r.recordFailure(ctx, po, out, "DEST_PARENT_UNAVAILABLE", perr)
 		}
 		defer destParent.Close()
+		// The contract recorded the directory the object was meant to land in. If
+		// that directory is now a different one, the completion would describe a
+		// move that did not happen where it was approved.
+		if contract != nil && contract.DestParentIdentity != nil {
+			nowParent, _, ierr := destParent.Stat()
+			if ierr != nil {
+				return r.recordFailure(ctx, po, out, "DEST_PARENT_UNAVAILABLE", ierr)
+			}
+			if !nowParent.Equal(*contract.DestParentIdentity) {
+				return r.holdUnfixable(ctx, po, out, "DEST_PARENT_REPLACED",
+					"the destination directory is not the one the operation recorded")
+			}
+		}
 		des, oerr := fsops.OpenRegularAt(destParent, sc.RootDev)
 		if oerr != nil {
-			return r.markUnknown(ctx, it.ID, out, "DEST_OPEN_FAILED")
+			return r.recordFailure(ctx, po, out, "DEST_OPEN_FAILED", oerr)
 		}
 		defer des.Close()
 		if serr := execute.SyncAfterMove(des.FD(), sc.Objects, destParent,
 			sc.AnchorFD(), "reconcile-restore"); serr != nil {
-			return r.markUnknown(ctx, it.ID, out, "SYNC_FAILED: "+serr.Error())
+			return r.recordFailure(ctx, po, out, "SYNC_FAILED", serr)
 		}
 		if err := r.Store.CompleteRestore(ctx, intentOf(po), `{"source":"reconciled"}`); err != nil {
-			return r.markUnknown(ctx, it.ID, out, "COMPLETE_FAILED")
+			return r.recordFailure(ctx, po, out, "COMPLETE_FAILED", err)
 		}
 		_ = r.Store.ReleaseItemKeeperPin(ctx, it.ID)
 		out.Outcome = "completed"
@@ -381,35 +537,89 @@ func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx,
 		return out
 
 	case !destFound && vaultFound && vaultID.Equal(captured):
-		// The restore never happened. End the attempt; the object stays safe.
-		if err := r.Store.AbortIntent(ctx, intentOf(po), domain.StateQuarantined,
-			`{"source":"reconciled","result":"destination empty, object still quarantined"}`); err != nil {
-			return r.markUnknown(ctx, it.ID, out, "ABORT_FAILED")
+		// The restore never happened. End the attempt and return the item to the
+		// state the contract says it came from: a hold stays a hold.
+		if err := r.Store.AbortIntent(ctx, intentOf(po), backState,
+			`{"source":"reconciled","result":"destination empty, object still in the vault","back_state":`+
+				quoteJSON(backState)+`}`); err != nil {
+			return r.recordFailure(ctx, po, out, "ABORT_FAILED", err)
 		}
 		out.Outcome = "aborted"
-		out.Detail = "the restore did not happen; the object is still quarantined"
+		out.Detail = "the restore did not happen; the object is back in " + backState
 		return out
 
 	case destFound && vaultFound:
-		_ = r.Store.HoldIntent(ctx, intentOf(po), "RESTORE_CONFLICT",
-			`{"source":"reconciled","result":"destination occupied and object still in vault"}`)
-		out.Outcome = "held"
-		out.Detail = "both the destination and the vault object exist; nothing was overwritten"
-		return out
+		return r.holdUnfixable(ctx, po, out, "RESTORE_CONFLICT",
+			"both the destination and the vault object exist; nothing was overwritten")
 
 	case !destFound && !vaultFound:
-		_ = r.Store.MarkItemState(ctx, it.ID, domain.StateUnknown, "RESTORE_UNEXPLAINED")
-		out.Outcome = "unknown"
-		out.Detail = "neither the destination nor the vault object exists"
-		return out
+		return r.holdUnfixable(ctx, po, out, "RESTORE_UNEXPLAINED",
+			"neither the destination nor the vault object exists")
 
 	default:
-		_ = r.Store.HoldIntent(ctx, intentOf(po), "RESTORE_UNEXPLAINED",
-			`{"source":"reconciled","result":"state does not match the matrix"}`)
-		out.Outcome = "held"
-		out.Detail = "the observed state does not match any explainable restore outcome"
-		return out
+		return r.holdUnfixable(ctx, po, out, "RESTORE_UNEXPLAINED",
+			"the observed state does not match any explainable restore outcome")
 	}
+}
+
+// restoreContract reads what a restore-family operation needs: where the object
+// was going, and which state an aborted attempt returns to.
+//
+// Two shapes exist in the field. Contracts written before the binding version was
+// recorded carry only the destination; they are read, labelled as legacy, and
+// nothing else is claimed about them. A contract that names a binding version but
+// does not parse is a refusal: that is a damaged record, not an old one.
+func (r *Reconciler) restoreContract(po store.PendingOp) (*plan.OperationContractV1, []byte, error) {
+	legacy := struct {
+		BindingVersion int    `json:"binding_version"`
+		RawRelativeB64 string `json:"raw_relative_b64"`
+	}{}
+	if po.ContractJSON != "" {
+		if err := json.Unmarshal([]byte(po.ContractJSON), &legacy); err != nil {
+			return nil, nil, errs.Newf(errs.CodeRecoveryRequired,
+				"the operation contract is not JSON: %v", err)
+		}
+	}
+
+	dest := po.Item.RawRelative
+	if legacy.RawRelativeB64 != "" {
+		if raw, err := decodeB64(legacy.RawRelativeB64); err == nil && len(raw) > 0 {
+			dest = raw
+		}
+	}
+	if legacy.BindingVersion == 0 {
+		// Pre-versioning record. The destination is the only field it can be
+		// trusted for, so that is the only thing returned.
+		return nil, dest, nil
+	}
+
+	contract, err := plan.ParseContract(po.ContractJSON)
+	if err != nil {
+		return nil, nil, err
+	}
+	if contract.RawRelativeB64 != "" {
+		if raw, berr := decodeB64(contract.RawRelativeB64); berr == nil && len(raw) > 0 {
+			dest = raw
+		}
+	}
+	return &contract, dest, nil
+}
+
+// priorStateOf returns the state an aborted operation goes back to.
+func priorStateOf(contract *plan.OperationContractV1, it store.Item) string {
+	if contract != nil {
+		switch contract.PriorState {
+		case domain.StateQuarantined, domain.StateHeld, domain.StateUnknown:
+			return contract.PriorState
+		}
+	}
+	// The item row is the fallback: it says where the operation started, and for
+	// a restore of a quarantined object that is the only sensible answer.
+	switch it.State {
+	case domain.StateRIntent, domain.StateQuarantined:
+		return domain.StateQuarantined
+	}
+	return domain.StateHeld
 }
 
 // reconcilePurge implements the P_INTENT rows of the matrix.
@@ -419,23 +629,22 @@ func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, p
 
 	captured, err := identityOf(ptrString(it.CapturedIdentityJSON))
 	if err != nil {
-		return r.markUnknown(ctx, it.ID, out, "CAPTURED_IDENTITY_UNREADABLE")
+		return r.recordFailure(ctx, po, out, "CAPTURED_IDENTITY_UNREADABLE", err)
 	}
 	vaultID, vaultFound := statVault(sc, it.ObjectName)
 
 	if vaultFound {
 		// The unlink did not happen (or did not take effect). Return the item to
-		// quarantined so a later, fully checked attempt can be made.
+		// the state the contract says it came from so a later, fully checked
+		// attempt can be made.
 		if !vaultID.Equal(captured) {
-			_ = r.Store.HoldIntent(ctx, intentOf(po), "UNEXPECTED_VAULT_OBJECT",
-				`{"source":"reconciled","result":"vault object changed"}`)
-			out.Outcome = "held"
-			out.Detail = "the vault object is not the recorded object"
-			return out
+			return r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
+				"the vault object is not the recorded object")
 		}
-		if err := r.Store.AbortIntent(ctx, intentOf(po), domain.StateQuarantined,
+		contract, _, _ := r.restoreContract(po)
+		if err := r.Store.AbortIntent(ctx, intentOf(po), priorStateOf(contract, it),
 			`{"source":"reconciled","result":"object still present, purge not confirmed"}`); err != nil {
-			return r.markUnknown(ctx, it.ID, out, "ABORT_FAILED")
+			return r.recordFailure(ctx, po, out, "ABORT_FAILED", err)
 		}
 		out.Outcome = "aborted"
 		out.Detail = "the purge did not happen; the object is still quarantined"
@@ -450,22 +659,15 @@ func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, p
 	// syncing only the objects directory and skipping the anchor barrier, so the
 	// completion record could be durable while the removal it describes was not.
 	if err := execute.SyncAfterUnlink(sc.Objects, sc.AnchorFD(), "reconcile-purge"); err != nil {
-		return r.markUnknown(ctx, it.ID, out, "SYNC_FAILED: "+err.Error())
+		return r.recordFailure(ctx, po, out, "SYNC_FAILED", err)
 	}
 	if err := r.Store.CompletePurge(ctx, intentOf(po),
 		`{"source":"reconciled","result":"RECONCILED_ABSENT"}`); err != nil {
-		return r.markUnknown(ctx, it.ID, out, "COMPLETE_FAILED")
+		return r.recordFailure(ctx, po, out, "COMPLETE_FAILED", err)
 	}
 	_ = r.Store.ReleaseItemKeeperPin(ctx, it.ID)
 	out.Outcome = "completed"
 	out.Detail = "the object was already absent; recorded as RECONCILED_ABSENT, not as a verified unlink"
-	return out
-}
-
-func (r *Reconciler) markUnknown(ctx context.Context, id domain.ItemID, out Result, code string) Result {
-	_ = r.Store.MarkItemState(ctx, id, domain.StateUnknown, code)
-	out.Outcome = "unknown"
-	out.Detail = code
 	return out
 }
 

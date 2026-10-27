@@ -375,8 +375,9 @@ Commands:
   quarantine list|restore  inspect and restore isolated objects
   protect add|list|remove  manage path protections
   purge plan|show|apply    separate due-purge plan and execution
-  recover inspect|reconcile
-                           finish or explain interrupted operations
+  recover inspect|reconcile|adopt
+                           finish or explain interrupted operations; adopt
+                           converges an item the automatic path held
   status | events          run state and audit trail
   run                      reconcile, scan, apply granted work
   pause | resume           global safety pause marker

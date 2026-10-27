@@ -13,6 +13,7 @@ import (
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
 	"dustkeeper/internal/plan"
+	"dustkeeper/internal/recovery"
 	"dustkeeper/internal/rescue"
 	"dustkeeper/internal/store"
 )
@@ -577,7 +578,7 @@ func purgeApply(ctx context.Context, a *app, args []string) (output, error) {
 // cmdRecover routes recover inspect/reconcile.
 func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 	if len(args) == 0 {
-		return output{}, errs.New(errs.CodeInvalidArgument, "recover needs a subcommand: inspect, reconcile")
+		return output{}, errs.New(errs.CodeInvalidArgument, "recover needs a subcommand: inspect, reconcile, adopt")
 	}
 	switch args[0] {
 	case "inspect":
@@ -660,8 +661,8 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			out := ok()
 			out.Data = rep
 			out.Human = []string{
-				fmt.Sprintf("reconciled %d operation(s): %d completed, %d aborted, %d held, %d unknown",
-					rep.Examined, rep.Completed, rep.Aborted, rep.Held, rep.Unknown),
+				fmt.Sprintf("reconciled %d operation(s): %d completed, %d aborted, %d held, %d parked, %d busy, %d blocked",
+					rep.Examined, rep.Completed, rep.Aborted, rep.Held, rep.Parked, rep.Busy, rep.Blocked),
 			}
 			for _, r := range rep.Results {
 				out.Human = append(out.Human, fmt.Sprintf("  %-28s %-8s %-10s %s", r.Item, r.Action, r.Outcome, r.Detail))
@@ -669,10 +670,72 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			if len(rep.Scopes) > 0 {
 				out.Human = append(out.Human, "  scopes held: "+fmt.Sprint(rep.Scopes))
 			}
-			if rep.Unknown > 0 || rep.Held > 0 {
+			switch {
+			case rep.Held > 0:
+				// A hold is a verdict: nothing is retried, so the operator needs
+				// to be told what the exits are.
 				out.Code = errs.CodeRecoveryRequired
 				out.Status = string(errs.StatusOf(errs.CodeRecoveryRequired))
-				out.Message = "some operations could not be explained; they stay visible and nothing was guessed"
+				out.Message = "some operations were held; they stay visible and nothing was guessed"
+				out.Next = []string{"dustkeeper recover adopt --item <id> --decision restore|quarantine --reason <why>"}
+			case rep.Parked > 0 || rep.Busy > 0 || rep.Blocked > 0:
+				// Still unfinished, still visible, and their pending markers are
+				// intact, so the next pass picks them up.
+				out.Code = errs.CodeRecoveryRequired
+				out.Status = string(errs.StatusOf(errs.CodeRecoveryRequired))
+				out.Message = "some operations could not be finished yet; nothing was dropped and they will be retried"
+				out.Next = []string{"dustkeeper recover reconcile"}
+			}
+			return out, nil
+		})
+	case "adopt":
+		fs := flagset("recover adopt", a.stderr)
+		item := fs.String("item", "", "item ID to adopt")
+		decision := fs.String("decision", "", "restore or quarantine")
+		to := fs.String("to", "", "restore destination, relative to the scope root (default: the original path)")
+		reason := fs.String("reason", "", "why this decision is being taken (recorded verbatim)")
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return output{}, err
+		}
+		if *item == "" {
+			return output{}, errs.New(errs.CodeInvalidArgument, "--item is required")
+		}
+		if *decision == "" {
+			return output{}, errs.New(errs.CodeInvalidArgument,
+				"--decision is required: restore puts the object back, quarantine accepts it as quarantined")
+		}
+		if *reason == "" {
+			// An adoption is a human decision about a file that could not be
+			// explained automatically. "Why" has to be part of the record.
+			return output{}, errs.New(errs.CodeInvalidArgument,
+				"--reason is required: the decision is recorded in the audit trail")
+		}
+		if err := a.openStore(); err != nil {
+			return output{}, err
+		}
+		return a.withInstance(func() (output, error) {
+			res, err := a.reconciler().Adopt(ctx, recovery.AdoptOptions{
+				ItemID:   domain.ItemID(*item),
+				Decision: *decision,
+				To:       []byte(*to),
+				Reason:   *reason,
+				Actor:    "operator",
+			})
+			if err != nil {
+				return output{}, err
+			}
+			out := ok()
+			out.ObjectID = string(res.Item)
+			out.Data = res
+			out.Human = []string{
+				fmt.Sprintf("adopted %s: %s -> %s (operation %s, converging %s)",
+					res.Item, res.PriorState, res.State, res.NewOpID, res.PriorOpID),
+			}
+			if res.Destination != "" {
+				out.Human = append(out.Human, "  destination: "+res.Destination)
+			}
+			if res.Detail != "" {
+				out.Human = append(out.Human, "  "+res.Detail)
 			}
 			return out, nil
 		})

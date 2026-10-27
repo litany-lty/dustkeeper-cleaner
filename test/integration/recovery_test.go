@@ -139,7 +139,7 @@ func TestReconcileRefusesAMissingManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if rep.Completed != 0 || rep.Unknown != 1 {
+	if rep.Completed != 0 || rep.Held != 1 {
 		t.Fatalf("a missing manifest was treated as a completion: %+v", rep)
 	}
 	if _, err := os.Stat(f.vaultRaw); err != nil {
@@ -152,8 +152,18 @@ func TestReconcileRefusesAMissingManifest(t *testing.T) {
 	if got.State == domain.StateQuarantined {
 		t.Fatalf("the item was completed without cross-checkable evidence: %s", got.State)
 	}
-	if got.State != domain.StateUnknown {
-		t.Fatalf("the item is %s; an unexplained crash state must stay visible as unknown", got.State)
+	// A missing manifest will not reappear by itself, so this is a verdict rather
+	// than a retry: the item is held, which is visible, which keeps the object in
+	// the vault, and which `recover adopt` can converge. Clearing the pending
+	// marker without a verdict is what used to leave the object unreachable.
+	if got.State != domain.StateHeld {
+		t.Fatalf("the item is %s; an unprovable move must be held rather than dropped or completed", got.State)
+	}
+	if got.PendingOpID != nil {
+		t.Fatal("a held item still claims an open operation")
+	}
+	if got.HoldCode == nil || *got.HoldCode == "" {
+		t.Fatal("the hold records no reason")
 	}
 }
 

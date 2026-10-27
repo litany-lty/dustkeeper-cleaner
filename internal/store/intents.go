@@ -193,6 +193,73 @@ func (s *Store) PendingOps(ctx context.Context) ([]PendingOp, error) {
 	return out, nil
 }
 
+// LastIntentForItem returns the most recent intent event for one item, whether
+// or not the item still carries a pending marker.
+//
+// Adoption needs exactly this: an older build could clear pending_op_id while
+// leaving the object in the vault, so the item row no longer points at its
+// operation even though the audit trail still does. Reading the trail is the
+// only way to converge such an item without inventing facts.
+func (s *Store) LastIntentForItem(ctx context.Context, id domain.ItemID) (PendingOp, bool, error) {
+	rows, err := s.read(ctx, "SELECT op_id, action, contract_json, occurred_at_ns FROM events"+
+		" WHERE item_id=? AND phase='intent' ORDER BY sequence DESC LIMIT 1", string(id))
+	if err != nil {
+		return PendingOp{}, false, err
+	}
+	var opID, action, contract string
+	var atNS int64
+	found := false
+	if rows.Next() {
+		if err := rows.Scan(&opID, &action, &contract, &atNS); err != nil {
+			rows.Close()
+			return PendingOp{}, false, errs.Wrap(errs.CodeDBError, err)
+		}
+		found = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return PendingOp{}, false, errs.Wrap(errs.CodeDBError, err)
+	}
+	// The rows are closed before the item is read: the store runs on a single
+	// connection, so a query issued while these rows are open would wait for
+	// itself.
+	rows.Close()
+	if !found {
+		return PendingOp{}, false, nil
+	}
+	it, err := s.GetItem(ctx, id)
+	if err != nil {
+		return PendingOp{}, false, err
+	}
+	return PendingOp{
+		OpID:         domain.OperationID(opID),
+		Item:         it,
+		Action:       action,
+		ContractJSON: contract,
+		IntentAtNS:   atNS,
+	}, true, nil
+}
+
+// ReconcileAttempts counts the non-terminal reconciliation attempts recorded for
+// one item. It is informational: the count exists so an operator can see that an
+// item is not progressing, never so that the item can be dropped.
+func (s *Store) ReconcileAttempts(ctx context.Context, id domain.ItemID) (int, error) {
+	rows, err := s.read(ctx, "SELECT COUNT(*) FROM events"+
+		" WHERE item_id=? AND action='reconcile' AND phase='info'", string(id))
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var n int
+	if !rows.Next() {
+		return 0, errs.Wrap(errs.CodeDBError, rows.Err())
+	}
+	if err := rows.Scan(&n); err != nil {
+		return 0, errs.Wrap(errs.CodeDBError, err)
+	}
+	return n, nil
+}
+
 // Intent is a request to begin one operation on one item.
 type Intent struct {
 	OpID         domain.OperationID

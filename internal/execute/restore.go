@@ -107,6 +107,13 @@ func (e *Executor) Restore(ctx context.Context, sc *ScopeCtx, itemID domain.Item
 	}
 
 	nowNS := e.Clock.Wall().UnixNano()
+	// The destination directory is recorded, not re-derived later: after a crash
+	// reconciliation has to decide whether the object landed where it was meant
+	// to, and "where it was meant to" is a fact about this instant.
+	destParentID, _, perr := destParent.Stat()
+	if perr != nil {
+		return res, errs.Wrap(errs.CodeAccessDenied, perr)
+	}
 	protections := []store.Protection{{
 		ID:           domain.ProtectionID(domain.NewID("prot")),
 		ScopeID:      sc.Scope.ID,
@@ -129,18 +136,26 @@ func (e *Executor) Restore(ctx context.Context, sc *ScopeCtx, itemID domain.Item
 	}
 
 	opID := domain.OperationID(domain.NewID("op"))
+	var sourceParentID domain.FileIdentity
+	if it.SourceParentIdentityJSON != "" {
+		if id, ierr := decodeID(it.SourceParentIdentityJSON); ierr == nil {
+			sourceParentID = id
+		}
+	}
 	contract := plan.OperationContractV1{
-		BindingVersion:  plan.BindingVersion,
-		ItemID:          string(it.ID),
-		PriorState:      it.State,
-		NextState:       domain.StateRIntent,
-		Purpose:         plan.PurposeNormal,
-		ScopeID:         string(sc.Scope.ID),
-		RawRelativeB64:  plan.B64(destRel),
-		ObjectName:      it.ObjectName,
-		ExpectedIdent:   capturedID,
-		MaxFiles:        e.Config.MaxFiles,
-		MaxLogicalBytes: e.Config.MaxBytes,
+		BindingVersion:     plan.BindingVersion,
+		ItemID:             string(it.ID),
+		PriorState:         it.State,
+		NextState:          domain.StateRIntent,
+		Purpose:            plan.PurposeNormal,
+		ScopeID:            string(sc.Scope.ID),
+		RawRelativeB64:     plan.B64(destRel),
+		ObjectName:         it.ObjectName,
+		ParentIdentity:     sourceParentID,
+		DestParentIdentity: &destParentID,
+		ExpectedIdent:      capturedID,
+		MaxFiles:           e.Config.MaxFiles,
+		MaxLogicalBytes:    e.Config.MaxBytes,
 	}
 	contractJSON, err := json.Marshal(contract)
 	if err != nil {

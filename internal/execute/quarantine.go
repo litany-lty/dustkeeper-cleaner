@@ -281,6 +281,7 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	if !finalID.Equal(preID) {
 		return res, e.hold(ctx, intent, "SOURCE_REPLACED", nil)
 	}
+	runPreRenameHook()
 
 	if err := fsops.RenameNoReplace(parent, parent.Name(), sc.Objects, it.ObjectName); err != nil {
 		if errors.Is(err, fsops.ErrExists) {
@@ -461,19 +462,30 @@ func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Ite
 	}
 
 	opID := domain.OperationID(domain.NewID("op"))
+	nowNS := e.Clock.Wall().UnixNano()
+	destParentID, _, perr := parent.Stat()
+	if perr != nil {
+		return false, "the original directory cannot be inspected; the captured object stays in the vault"
+	}
+	// The destination directory is written into the contract for the same reason
+	// the normal restore writes it: after a crash the question "did the object
+	// land where it was meant to" must be answerable from the record, not from a
+	// directory that may since have been replaced.
 	contract := plan.OperationContractV1{
-		BindingVersion:  plan.BindingVersion,
-		ItemID:          string(it.ID),
-		NextState:       domain.StateRIntent,
-		PriorState:      domain.StateHeld,
-		Purpose:         plan.PurposeMiscaptureFixup,
-		ScopeID:         string(sc.Scope.ID),
-		RawRelativeB64:  plan.B64(it.RawRelative),
-		ObjectName:      it.ObjectName,
-		ExpectedIdent:   obj.Identity,
-		ExpectedToken:   obj.Token,
-		MaxFiles:        e.Config.MaxFiles,
-		MaxLogicalBytes: e.Config.MaxBytes,
+		BindingVersion:     plan.BindingVersion,
+		ItemID:             string(it.ID),
+		NextState:          domain.StateRIntent,
+		PriorState:         domain.StateHeld,
+		Purpose:            plan.PurposeMiscaptureFixup,
+		ScopeID:            string(sc.Scope.ID),
+		RawRelativeB64:     plan.B64(it.RawRelative),
+		ObjectName:         it.ObjectName,
+		ParentIdentity:     storedParent,
+		DestParentIdentity: &destParentID,
+		ExpectedIdent:      obj.Identity,
+		ExpectedToken:      obj.Token,
+		MaxFiles:           e.Config.MaxFiles,
+		MaxLogicalBytes:    e.Config.MaxBytes,
 	}
 	contractJSON, err := json.Marshal(contract)
 	if err != nil {
@@ -486,11 +498,25 @@ func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Ite
 		PriorState:   domain.StateHeld,
 		NextState:    domain.StateRIntent,
 		ContractJSON: string(contractJSON),
-		OccurredAtNS: e.Clock.Wall().UnixNano(),
+		OccurredAtNS: nowNS,
 	}
-	if err := e.Store.BeginIntent(ctx, comp); err != nil {
+	// The compensation reuses the restore transaction, protections included. The
+	// earlier version began a bare intent, so an object that was put back could
+	// be quarantined again by the very next scan: it was restored in fact and
+	// unprotected in the record.
+	protections := []store.Protection{{
+		ID:           domain.ProtectionID(domain.NewID("prot")),
+		ScopeID:      sc.Scope.ID,
+		RawRelative:  it.RawRelative,
+		MatchKind:    domain.MatchExact,
+		Source:       domain.ProtectRestore,
+		EvidenceJSON: `{"reason":"a compensated miscapture must not be quarantined again"}`,
+		CreatedAtNS:  nowNS,
+	}}
+	if err := e.Store.RestoreIntent(ctx, comp, protections); err != nil {
 		return false, "a compensation intent could not be recorded"
 	}
+	runCompensateHook()
 	if err := fsops.RenameNoReplace(sc.Objects, it.ObjectName, parent, parent.Name()); err != nil {
 		_ = e.Store.AbortIntent(ctx, comp, domain.StateHeld,
 			`{"source":"observed","reason":"compensation rename failed"}`)

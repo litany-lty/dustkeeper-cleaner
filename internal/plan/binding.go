@@ -119,6 +119,19 @@ type OperationContractV1 struct {
 	MaxFiles        int                 `json:"max_files"`
 	MaxLogicalBytes int64               `json:"max_logical_bytes"`
 	MaxReadBytes    int64               `json:"max_read_bytes"`
+	// DestParentIdentity records the directory the object was moved into.
+	//
+	// A restore and a compensation both depend on "did the destination
+	// directory change under us", and both used to answer it by re-reading the
+	// item row. The row describes where the object came from, not where it was
+	// put, so an unrecorded destination could only be re-derived - which is
+	// exactly the kind of guess reconciliation must not make.
+	DestParentIdentity *domain.FileIdentity `json:"dest_parent_identity,omitempty"`
+	// PriorOpID links an operation that converges an earlier one (adoption of a
+	// legacy terminal hold, or a compensation) to the operation it converges.
+	// The earlier operation keeps its own events untouched; history is
+	// appended to, never rewritten.
+	PriorOpID *string `json:"prior_op_id,omitempty"`
 }
 
 // PurgePurpose values, so reconciliation can tell a normal action from a
@@ -127,6 +140,11 @@ const (
 	PurposeNormal          = "normal"
 	PurposeMiscaptureFixup = "miscapture_compensation"
 	PurposeReconcileOnly   = "reconcile"
+	// PurposeAdopt is an explicit operator decision that converges an item left
+	// behind by an earlier corruption: a terminal hold, or an item whose pending
+	// marker an older build cleared. It is a new operation, not a rewrite of the
+	// old one.
+	PurposeAdopt = "adopt"
 )
 
 // B64 encodes raw path bytes losslessly for JSON storage.

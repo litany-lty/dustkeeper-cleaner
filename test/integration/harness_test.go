@@ -60,6 +60,9 @@ type env struct {
 	plan  *plan.Planner
 	rec   *recovery.Reconciler
 	run   *run.Runner
+	// ctxs are the scope contexts this environment has opened, so a test can
+	// release the in-tree lock without waiting for the end of the run.
+	ctxs []*execute.ScopeCtx
 }
 
 func newEnv(t *testing.T) *env {
@@ -184,8 +187,21 @@ func (e *env) scopeCtx(id domain.ScopeID) *execute.ScopeCtx {
 	if err != nil {
 		e.t.Fatalf("open scope %s: %v", id, err)
 	}
+	e.ctxs = append(e.ctxs, sctx)
 	e.t.Cleanup(sctx.Close)
 	return sctx
+}
+
+// closeScopeCtxs releases every scope context this environment opened, so the
+// in-tree lock is genuinely free. Contexts are normally released at the end of a
+// test; a lock-contention scenario needs them released earlier, because the lock
+// is re-entrant within one process and a test that holds it is not "another
+// task".
+func (e *env) closeScopeCtxs() {
+	for _, c := range e.ctxs {
+		c.Close()
+	}
+	e.ctxs = nil
 }
 
 func (e *env) guard(sctx *execute.ScopeCtx) *policy.Guard {
