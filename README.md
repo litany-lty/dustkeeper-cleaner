@@ -130,10 +130,19 @@ go test -race ./...
 |---|---|---|---|
 | darwin/arm64 | 是 | 全量 `go test ./...` + 端到端闭环 | 受支持 |
 | darwin/amd64 (`CC_darwin_amd64`) | 是 | 未在目标机器上跑过 | **实验性** |
-| linux/amd64 (`CC_linux_amd64`) | 是（musl 静态） | 未在目标机器上跑过 | **实验性** |
-| linux/arm64 (`CC_linux_arm64`) | 是（musl 静态） | 未在目标机器上跑过 | **实验性** |
+| linux/amd64 (`CC_linux_amd64`) | x86_64 宿主上是（musl 静态） | 未在目标机器上跑过 | **实验性** |
+| linux/arm64 (`CC_linux_arm64`) | 本机容器内实测是（musl 静态，`smoke=ok`） | 全量 `go test ./...` 在 linux 容器（ext4 loop）通过 | **实验性** |
 
 "实验性"是准确说法：这些目标能编译、能通过 `SHA256SUMS` 校验，但没有在真机上跑过"注册 → 计划 → 隔离 → 不覆盖恢复 → 到期清空 → 重启对账"。验收记录见 `docs/compliance.md`。
+
+```sh
+# 在容器里真实构建 linux 目标，并证明 musl 来源 + 静态链接 + 本机架构冒烟
+./build/build-linux-release.sh          # 默认只构建容器自身架构
+./build/build-linux-release.sh arm64    # 显式指定
+```
+
+`musl-gcc` 只为它自己被编译的那个架构工作，所以 arm64 宿主上默认只构建 `linux/arm64`；
+要产出 `linux/amd64` 需要一台 x86_64 宿主（或交叉 musl 工具链）。脚本不会假装跨架构成功。
 
 性能证据（会真的创建文件，默认不跑）。它先核对"活儿干完了"，再报资源：
 
