@@ -33,10 +33,14 @@ type Reconciler struct {
 
 // Result is the outcome for one pending operation.
 type Result struct {
-	Item    domain.ItemID `json:"item_id"`
-	Action  string        `json:"action"`
-	Outcome string        `json:"outcome"`
-	Detail  string        `json:"detail,omitempty"`
+	Item domain.ItemID `json:"item_id"`
+	// OpID is the intent this pass finished. It is carried so that the
+	// operational log and the envelope name the same operation: "pending" is an
+	// item state, but the thing that was left half-done is an operation.
+	OpID    domain.OperationID `json:"op_id,omitempty"`
+	Action  string             `json:"action"`
+	Outcome string             `json:"outcome"`
+	Detail  string             `json:"detail,omitempty"`
 }
 
 // Report summarises a reconciliation pass.
@@ -96,7 +100,7 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 				// and the second one used to be permanent.
 				if errs.CodeOf(err) == errs.CodeInstanceBusy {
 					rep.Busy++
-					rep.Results = append(rep.Results, Result{Item: po.Item.ID, Action: po.Action,
+					rep.Results = append(rep.Results, Result{Item: po.Item.ID, OpID: po.OpID, Action: po.Action,
 						Outcome: "busy", Detail: "another task holds the scope lock; nothing was changed"})
 					continue
 				}
@@ -105,7 +109,7 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 				// pending marker so the next pass can still finish it.
 				_ = r.Store.SetScopeStatus(ctx, po.Item.ScopeID, domain.ScopeHeld)
 				rep.Blocked++
-				rep.Results = append(rep.Results, Result{Item: po.Item.ID, Action: po.Action,
+				rep.Results = append(rep.Results, Result{Item: po.Item.ID, OpID: po.OpID, Action: po.Action,
 					Outcome: "blocked", Detail: "the scope root could not be verified: " + err.Error()})
 				continue
 			}
@@ -133,7 +137,7 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 
 func (r *Reconciler) reconcileOne(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
 	it := po.Item
-	out := Result{Item: it.ID, Action: po.Action}
+	out := Result{Item: it.ID, OpID: po.OpID, Action: po.Action}
 
 	switch po.Action {
 	case "quarantine":
@@ -236,7 +240,7 @@ func (r *Reconciler) holdUnfixableDetail(ctx context.Context, po store.PendingOp
 // can never be purged and can never be explained.
 func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
 	it := po.Item
-	out := Result{Item: it.ID, Action: "quarantine"}
+	out := Result{Item: it.ID, OpID: po.OpID, Action: "quarantine"}
 
 	contract, err := plan.ParseContract(po.ContractJSON)
 	if err != nil {
@@ -478,7 +482,7 @@ func (r *Reconciler) completeQuarantine(ctx context.Context, sc *execute.ScopeCt
 // started the object on the way to purge eligibility.
 func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
 	it := po.Item
-	out := Result{Item: it.ID, Action: po.Action}
+	out := Result{Item: it.ID, OpID: po.OpID, Action: po.Action}
 
 	contract, dest, cerr := r.restoreContract(po)
 	if cerr != nil {
@@ -625,7 +629,7 @@ func priorStateOf(contract *plan.OperationContractV1, it store.Item) string {
 // reconcilePurge implements the P_INTENT rows of the matrix.
 func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
 	it := po.Item
-	out := Result{Item: it.ID, Action: "purge"}
+	out := Result{Item: it.ID, OpID: po.OpID, Action: "purge"}
 
 	captured, err := identityOf(ptrString(it.CapturedIdentityJSON))
 	if err != nil {

@@ -169,6 +169,109 @@ func TestManifestInventoryListsUnexplainedEntries(t *testing.T) {
 	}
 }
 
+// A23: an objects directory that cannot be opened proves only that the check did
+// not happen. Reporting manifest_without_object would turn "I could not look"
+// into "your file is gone", which is the one conclusion a rescue inventory must
+// never invent.
+func TestAnUnreadableObjectsDirectoryDoesNotClaimTheObjectsAreGone(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode bits do not deny access")
+	}
+	e := newEnv(t)
+	sc := e.addScope("exports", domain.KindManagedDisposable)
+	e.writeFile("exports", "old.zip", "recoverable-payload", 40*24*time.Hour)
+	e.scan(sc.ID)
+	r := e.rule(sc.ID, "rule-1", []string{"*.zip"}, nil, 30*24*time.Hour, 30*24*time.Hour)
+	res := e.planFor(sc, r, 100)
+	if _, err := e.apply(sc, res.Plan, res.Plan.Digest); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	root := filepath.Join(e.base, "trees", "exports")
+	before := treeSnapshot(t, root)
+	objects := filepath.Join(root, domain.VaultObjects)
+	if err := os.Chmod(objects, 0o000); err != nil {
+		t.Fatalf("chmod objects: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(objects, 0o700) })
+
+	rep, err := rescue.Inspect(root)
+	if err != nil {
+		t.Fatalf("inventory with an unreadable objects directory: %v", err)
+	}
+	if rep.ObjectState != rescue.ObjectStateUnreadable {
+		t.Fatalf("object_state = %q, want %q", rep.ObjectState, rescue.ObjectStateUnreadable)
+	}
+	if rep.Missing != 0 {
+		t.Fatalf("manifest_without_object = %d; an unreadable directory does not prove absence (%+v)",
+			rep.Missing, rep.Entries)
+	}
+	if rep.Complete != 0 {
+		t.Fatalf("complete = %d; the inventory could not look", rep.Complete)
+	}
+	if rep.Unverified != 1 || len(rep.Entries) != 1 {
+		t.Fatalf("unverified = %d with %d entries, want 1/1", rep.Unverified, len(rep.Entries))
+	}
+	entry := rep.Entries[0]
+	if entry.Status != rescue.StatusUnverified {
+		t.Fatalf("entry status = %q, want %q (%+v)", entry.Status, rescue.StatusUnverified, entry)
+	}
+	// The path and the evidence still come from the manifest: the operator keeps
+	// what the scope recorded even when the objects cannot be examined.
+	if entry.RawRelative != "old.zip" || entry.ContentHash == "" {
+		t.Fatalf("the manifest facts were lost: %+v", entry)
+	}
+
+	if err := os.Chmod(objects, 0o700); err != nil {
+		t.Fatalf("restore mode: %v", err)
+	}
+	if diff := diffSnapshots(before, treeSnapshot(t, root)); len(diff) != 0 {
+		t.Fatalf("the inventory changed the scope: %v", diff)
+	}
+}
+
+// A23: a whole objects directory that is absent is a different fact from one
+// that cannot be read, and it does establish that the objects are not there.
+func TestAMissingObjectsDirectoryIsReportedAsMissingNotUnverified(t *testing.T) {
+	e := newEnv(t)
+	sc := e.addScope("exports", domain.KindManagedDisposable)
+	e.writeFile("exports", "old.zip", "payload", 40*24*time.Hour)
+	e.scan(sc.ID)
+	r := e.rule(sc.ID, "rule-1", []string{"*.zip"}, nil, 30*24*time.Hour, 30*24*time.Hour)
+	res := e.planFor(sc, r, 100)
+	if _, err := e.apply(sc, res.Plan, res.Plan.Digest); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	root := filepath.Join(e.base, "trees", "exports")
+	if err := os.RemoveAll(filepath.Join(root, domain.VaultObjects)); err != nil {
+		t.Fatalf("remove objects: %v", err)
+	}
+
+	rep, err := rescue.Inspect(root)
+	if err != nil {
+		t.Fatalf("inventory with a missing objects directory: %v", err)
+	}
+	if rep.ObjectState != rescue.ObjectStateMissing {
+		t.Fatalf("object_state = %q, want %q", rep.ObjectState, rescue.ObjectStateMissing)
+	}
+	if rep.Unverified != 0 {
+		t.Fatalf("unverified = %d; an absent directory is established, not unknown", rep.Unverified)
+	}
+	if rep.Missing != 1 || len(rep.Entries) != 1 {
+		t.Fatalf("manifest_without_object = %d with %d entries, want 1/1 (%+v)",
+			rep.Missing, len(rep.Entries), rep.Entries)
+	}
+	if got := rep.Entries[0].Status; got != rescue.StatusMissingObject {
+		t.Fatalf("entry status = %q, want %q", got, rescue.StatusMissingObject)
+	}
+	// The manifests still name the file: the independent record outlives the
+	// payload, which is what makes the loss explainable.
+	if rep.Entries[0].RawRelative != "old.zip" {
+		t.Fatalf("the manifest facts were lost: %+v", rep.Entries[0])
+	}
+}
+
 // A directory that is not a managed scope is reported as such, not as an empty
 // vault. R13 asks for a rescue path that fails closed.
 func TestManifestInventoryRefusesAnUnmanagedDirectory(t *testing.T) {

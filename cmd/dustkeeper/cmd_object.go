@@ -595,6 +595,11 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			if err != nil {
 				return output{}, err
 			}
+			// The inventory must not depend on the database, but the log is just a
+			// file: opening it is best-effort, and a failure only produces a
+			// warning. A rescue an operator runs at 3am should still leave a record
+			// of what it saw.
+			a.openLog()
 			rep, err := rescue.Inspect(clean)
 			if err != nil {
 				return output{}, err
@@ -603,8 +608,9 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			out.Data = rep
 			out.Human = []string{
 				fmt.Sprintf("inventory of %s (no database was opened)", rep.Root),
-				fmt.Sprintf("  %d object(s): %d complete, %d manifest without object, %d orphan, %d conflict, %d unknown",
-					rep.Objects, rep.Complete, rep.Missing, rep.Orphans, rep.Conflicts, rep.Unknown),
+				fmt.Sprintf("  %d object(s): %d complete, %d manifest without object, %d orphan, %d unverified, %d conflict, %d unknown",
+					rep.Objects, rep.Complete, rep.Missing, rep.Orphans, rep.Unverified, rep.Conflicts, rep.Unknown),
+				"  objects directory: " + rep.ObjectState,
 			}
 			if rep.InstanceID != "" {
 				out.Human = append(out.Human, "  owner instance: "+rep.InstanceID)
@@ -619,10 +625,23 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			for _, n := range rep.Notes {
 				out.Human = append(out.Human, "  note: "+n)
 			}
-			if rep.Orphans > 0 || rep.Conflicts > 0 || rep.Missing > 0 {
+			switch {
+			case rep.Orphans > 0 || rep.Conflicts > 0 || rep.Missing > 0:
 				out.Code = errs.CodeRecoveryRequired
 				out.Status = string(errs.StatusOf(out.Code))
 				out.Message = "the directory holds objects this inventory cannot explain; nothing was changed"
+				if rep.Unverified > 0 {
+					out.Message += "; some entries were not verified because the objects directory could not be read"
+				}
+			case rep.Unverified > 0:
+				// Nothing is known to be missing. Reporting "everything is fine"
+				// here would turn an unavailable check into a conclusion.
+				out.Code = errs.CodeRecoveryRequired
+				out.Status = string(errs.StatusOf(out.Code))
+				out.Message = "the objects directory could not be read, so this inventory does not establish which objects are present; nothing was changed"
+			}
+			if rep.Unverified > 0 {
+				out.Next = append(out.Next, "dustkeeper recover inspect --root "+rep.Root)
 			}
 			return out, nil
 		}
@@ -660,6 +679,18 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			}
 			out := ok()
 			out.Data = rep
+			// One record per operation, so that a day later the question "which
+			// operation was left half-finished, and what did the pass decide?"
+			// has an answer in the log rather than only in a terminal buffer.
+			for _, r := range rep.Results {
+				a.log.Log("operation", "phase", "op",
+					"run_id", a.runID,
+					"op_id", string(r.OpID),
+					"item_id", string(r.Item),
+					"action", r.Action,
+					"outcome", r.Outcome,
+					"detail", r.Detail)
+			}
 			out.Human = []string{
 				fmt.Sprintf("reconciled %d operation(s): %d completed, %d aborted, %d held, %d parked, %d busy, %d blocked",
 					rep.Examined, rep.Completed, rep.Aborted, rep.Held, rep.Parked, rep.Busy, rep.Blocked),

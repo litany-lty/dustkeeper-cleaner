@@ -126,13 +126,7 @@ func Inspect(rootPath string) (Report, error) {
 	rep.Objects = len(objects)
 	rep.Unknown = len(unknown)
 	rep.ObjectState = inv.state
-	if inv.state == objectStateRead {
-		rep.Notes = append(rep.Notes,
-			"a manifest_and_object entry means the two names exist; the inventory compares no hash and no identity")
-	} else {
-		rep.Notes = append(rep.Notes,
-			"the objects directory was not read: absence of an object is not established")
-	}
+	rep.Notes = append(rep.Notes, inv.conclusion())
 
 	for _, name := range unknown {
 		rep.Entries = append(rep.Entries, Entry{
@@ -161,7 +155,7 @@ func Inspect(rootPath string) (Report, error) {
 			e.Notes = append(e.Notes, m.problem)
 			rep.Conflicts++
 		}
-		if inv.state != objectStateRead {
+		if inv.state == objectStateUnreadable {
 			if e.Status == "" {
 				e.Status = StatusUnverified
 				rep.Unverified++
@@ -171,17 +165,19 @@ func Inspect(rootPath string) (Report, error) {
 			delete(objects, m.manifest.ObjectID)
 			if e.Status == "" {
 				if obj.err != "" {
-					// The objects directory could not be read, so "present" is not
-					// something this report can claim.
-					e.Status = StatusConflict
-					e.Notes = append(e.Notes, "the object entry could not be read: "+obj.err)
-					rep.Conflicts++
+					// The entry could not be examined, which is not the same fact as
+					// "the object is not there" and not a contradiction either.
+					e.Status = StatusUnverified
+					e.Notes = append(e.Notes, "the object entry could not be examined: "+obj.err)
+					rep.Unverified++
 				} else {
 					e.Status = StatusComplete
 					rep.Complete++
 				}
 			}
 		} else if e.Status == "" {
+			// Reached only when the directory was read, or when it is known to be
+			// entirely absent. Both establish that this object is not there.
 			e.Status = StatusMissingObject
 			e.Notes = append(e.Notes, "the manifest is intact but the object is gone; this is not a recoverable payload")
 			rep.Missing++
@@ -189,7 +185,7 @@ func Inspect(rootPath string) (Report, error) {
 		rep.Entries = append(rep.Entries, e)
 	}
 
-	if inv.state != objectStateRead {
+	if inv.state == objectStateUnreadable {
 		return rep, nil
 	}
 	orphanNames := make([]string, 0, len(objects))
@@ -291,11 +287,21 @@ type objectEntry struct {
 }
 
 // The three states an objects directory can be in. Only objectStateRead supports
-// a statement about a particular object being absent.
+// a statement about a particular object being absent; objectStateMissing
+// establishes that the whole directory is gone, which also establishes that no
+// object is in it; objectStateUnreadable establishes nothing.
 const (
 	objectStateRead       = "read"
 	objectStateMissing    = "missing"
 	objectStateUnreadable = "unreadable"
+)
+
+// Exported names for the report's object_state field, so a caller does not have
+// to match a string to know which fact it is holding.
+const (
+	ObjectStateRead       = objectStateRead
+	ObjectStateMissing    = objectStateMissing
+	ObjectStateUnreadable = objectStateUnreadable
 )
 
 type objectInventory struct {
@@ -353,6 +359,20 @@ func readObjects(root *fsops.Root) objectInventory {
 	}
 	inv.unknown = unknown
 	return inv
+}
+
+// conclusion states what this inventory is allowed to claim about the objects it
+// did not see. The three cases are different facts, so they get different
+// sentences rather than one hedge covering all of them.
+func (inv objectInventory) conclusion() string {
+	switch inv.state {
+	case objectStateRead:
+		return "a manifest_and_object entry means the two names exist; the inventory compares no hash and no identity"
+	case objectStateMissing:
+		return "the objects directory does not exist, so every manifest is reported as having no object"
+	default:
+		return "the objects directory could not be read: absence of an object is not established"
+	}
 }
 
 // listDir returns the entry names of a directory, sorted.

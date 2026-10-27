@@ -579,6 +579,57 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 		if rerr != nil {
 			return output{}, rerr
 		}
+		// The run's own record, before the envelope is rendered: run_id, the control
+		// it reached, what it read and moved, and one line per scope explaining any
+		// phase that did not run. A scheduler waking somebody up needs the scope and
+		// the reason, not the totals.
+		a.log.Log("run", "phase", "run",
+			"run_id", rep.RunID,
+			"control", rep.Control,
+			"failure_code", string(rep.FailureCode),
+			"clock_trusted", rep.ClockTrusted,
+			"clock_note", rep.ClockNote,
+			"clock_reassessed", rep.ClockReassessed,
+			"scopes", len(rep.Scopes),
+			"scopes_not_reached", rep.UntouchedScopes,
+			"quarantined", rep.Quarantined,
+			"purged", rep.Purged,
+			"read_bytes", rep.ReadBytes,
+			"disk_pressure", rep.DiskPressure,
+			"pressure_note", rep.PressureNote,
+			"failures", strings.Join(rep.Failures, " | "),
+			"pending_examined", rep.Reconciliation.Examined,
+			"pending_completed", rep.Reconciliation.Completed,
+			"pending_aborted", rep.Reconciliation.Aborted,
+			"pending_held", rep.Reconciliation.Held,
+			"pending_parked", rep.Reconciliation.Parked,
+			"pending_unknown", rep.Reconciliation.Unknown)
+		for _, s := range rep.Scopes {
+			a.log.Log("scope", "phase", "scope",
+				"run_id", rep.RunID,
+				"scope_id", string(s.Scope),
+				"control", s.Control,
+				"scanned", s.Scanned,
+				"scan_complete", s.ScanComplete,
+				"scan_interrupted", s.ScanInterrupted,
+				"deep_scan_required", s.DeepScanRequired,
+				"quarantined", s.Quarantined,
+				"purged", s.Purged,
+				"due_not_authorised", s.DueNotAuthorised,
+				"skipped", s.Skipped,
+				"purge_skipped", s.PurgeSkipped,
+				"quarantine_skipped", s.QuarantineSkipped,
+				"message", s.Message)
+		}
+		for _, op := range rep.Reconciliation.Results {
+			a.log.Log("operation", "phase", "op",
+				"run_id", rep.RunID,
+				"op_id", string(op.OpID),
+				"item_id", string(op.Item),
+				"action", op.Action,
+				"outcome", op.Outcome,
+				"detail", op.Detail)
+		}
 		res := ok()
 		res.Data = rep
 		res.Human = []string{

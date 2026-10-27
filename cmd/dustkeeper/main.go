@@ -19,6 +19,7 @@ import (
 	"syscall"
 
 	"dustkeeper/internal/config"
+	"dustkeeper/internal/diag"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/store"
@@ -43,12 +44,16 @@ type app struct {
 	cfg    config.Config
 	clock  domain.Clock
 	runID  string
+	cmd    string
 	json   bool
 	stdout io.Writer
 	stderr io.Writer
 
 	store    *store.Store
 	instance string
+	// log is the bounded operational log. It is nil until a mutating command opens
+	// it, and a nil logger drops records rather than panicking.
+	log *diag.Logger
 }
 
 // output is what a command returns. Every field ends up in the JSON envelope,
@@ -139,6 +144,13 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return a.emit(out)
 	}
 
+	// The command name is the key a person greps for. Two-word commands are kept
+	// together ("plan apply", not "plan"), because the pair is what ran.
+	a.cmd = args[0]
+	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+		a.cmd = a.cmd + " " + args[1]
+	}
+
 	out, err := fn(ctx, a, rest)
 	if a.store != nil {
 		a.store.Close()
@@ -153,7 +165,59 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			out.Message = messageOf(err)
 		}
 	}
-	return a.emit(out)
+	code := a.emit(out)
+	a.closeLog()
+	return code
+}
+
+// closeLog flushes the operational log exactly once.
+func (a *app) closeLog() {
+	if a.log == nil {
+		return
+	}
+	if err := a.log.Close(); err != nil {
+		fmt.Fprintf(a.stderr, "warning: could not close the operational log: %v\n", err)
+	}
+	a.log = nil
+}
+
+// nextStepsFor turns an error code into the next thing to run. It is a fallback:
+// a command that knows more about its own failure has already filled Next, and
+// that answer wins.
+func nextStepsFor(code errs.Code) []string {
+	switch code {
+	case errs.CodeInvalidArgument, errs.CodeUnknownField, errs.CodeDuplicateKey,
+		errs.CodeRuleAmbiguous, errs.CodeRuleUnsupported, errs.CodeDSLInvalid,
+		errs.CodeNeedsInput:
+		return []string{"dustkeeper help"}
+	case errs.CodeScopeNotFound:
+		return []string{"dustkeeper scope list"}
+	case errs.CodePlanNotFound:
+		return []string{"dustkeeper plan create --scope <scope_id> --rule <rule_id>"}
+	case errs.CodeItemNotFound:
+		return []string{"dustkeeper quarantine list"}
+	case errs.CodeRuleNotFound:
+		return []string{"dustkeeper rule import --file <rules.json>"}
+	case errs.CodeInstanceBusy:
+		return []string{"wait for the running task, then retry"}
+	case errs.CodeAccessDenied, errs.CodeScopeRefused:
+		return []string{"check the path exists and this user may read it, then retry"}
+	case errs.CodeRecoveryRequired, errs.CodeRestoreConflict, errs.CodeHeld:
+		return []string{"dustkeeper recover inspect"}
+	case errs.CodeClockUntrusted:
+		return []string{"dustkeeper doctor"}
+	case errs.CodeDiskPressure:
+		return []string{"free space, then retry"}
+	case errs.CodeStateWriteFailed, errs.CodeDBError, errs.CodeIOError, errs.CodeDurabilityFailed:
+		return []string{"dustkeeper doctor"}
+	case errs.CodeModelUnavailable:
+		return []string{"retry later; existing rules are unaffected"}
+	case errs.CodePartial, errs.CodeBudgetExhausted:
+		return []string{"run again to continue; progress is recorded"}
+	case errs.CodeCancelled:
+		return []string{"run again when ready"}
+	}
+	return []string{"dustkeeper doctor"}
 }
 
 // emit writes the envelope (or the human rendering) and returns the exit code.
@@ -163,6 +227,41 @@ func (a *app) emit(out output) int {
 	}
 	if out.Code == "" {
 		out.Code = errs.CodeOK
+	}
+	exit := 0
+	if out.Code != errs.CodeOK {
+		exit = errs.Exit(out.Code)
+	}
+	// Every failure ends with something to try, in the envelope and in the log.
+	// A code on its own tells an operator what went wrong but not what to do, and
+	// that is exactly the moment they are reading this.
+	if len(out.Next) == 0 && out.Code != errs.CodeOK {
+		out.Next = nextStepsFor(out.Code)
+	}
+	// One record per command, with what a person looking at yesterday needs: which
+	// run, what was decided, how it ended, and what to do next. The same facts the
+	// envelope carries, in a file that outlives the terminal.
+	if a.log != nil {
+		kv := []any{
+			"phase", "result",
+			"command", a.cmd,
+			"run_id", a.runID,
+			"instance", a.instance,
+			"code", string(out.Code),
+			"status", out.Status,
+			"exit", exit,
+			"retryable", errs.RetryableCode(out.Code),
+			"scope_id", out.ScopeID,
+			"plan_id", out.PlanID,
+			"object_id", out.ObjectID,
+			"next_steps", strings.Join(out.Next, " | "),
+			"message", out.Message,
+		}
+		if out.Counts != nil {
+			kv = append(kv, "planned", out.Counts.Planned, "completed", out.Counts.Completed,
+				"skipped", out.Counts.Skipped, "failed", out.Counts.Failed)
+		}
+		a.log.Log("result", kv...)
 	}
 	if a.json {
 		env := map[string]any{
@@ -213,10 +312,7 @@ func (a *app) emit(out output) int {
 			fmt.Fprintf(a.stdout, "next: %s\n", n)
 		}
 	}
-	if out.Code == errs.CodeOK {
-		return 0
-	}
-	return errs.Exit(out.Code)
+	return exit
 }
 
 func isZero(v any) bool {
@@ -347,13 +443,35 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 // withInstance runs fn while holding the instance execution lock. Any command
 // that can change a business file or commit an intent takes it first, so two
 // runs never interleave over one state directory.
+//
+// It also opens the operational log, because this is the boundary every mutating
+// command crosses: read-only commands (help, status) must not create files, and a
+// command that changes state must leave a record that outlives the process.
 func (a *app) withInstance(fn func() (output, error)) (output, error) {
 	lock, err := lockInstance(a.paths.StateDir)
 	if err != nil {
 		return output{}, err
 	}
 	defer lock()
+	a.openLog()
+	a.log.Log("command", "phase", "begin",
+		"command", a.cmd, "run_id", a.runID, "instance", a.instance)
 	return fn()
+}
+
+// openLog prepares the log once. A failure is reported on stderr and ignored: the
+// command's own result matters more than the record of it, and refusing to work
+// because a log file cannot be opened would be its own kind of outage.
+func (a *app) openLog() {
+	if a.log != nil {
+		return
+	}
+	l, err := diag.Open(a.paths.LogDir)
+	if err != nil {
+		fmt.Fprintf(a.stderr, "warning: the operational log is unavailable: %v\n", err)
+		return
+	}
+	a.log = l
 }
 
 var helpText = `dustkeeper — bounded, reversible file cleanup
