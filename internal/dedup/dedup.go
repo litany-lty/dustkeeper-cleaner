@@ -424,23 +424,29 @@ func (d *Detector) referenceKeeperMatches(source, keeper *execute.ScopeCtx, c Ca
 // the state after the read finished, and any byte comparison against the copy
 // about to be deleted. Each of those is now required. The bytes matter most: an
 // equal hash is a claim, and comparing the two files is the evidence.
-func (d *Detector) VerifyKeeper(ctx context.Context, it store.Item) error {
+//
+// The keeper is left open in the returned proof. The byte comparison above is
+// the last full read of either file, so the caller has to be able to re-read the
+// keeper's identity, token and metadata after it: R09 A records that nothing did,
+// and a write that lands in a region the comparison has already passed still
+// leaves the two files equal for that comparison.
+func (d *Detector) VerifyKeeper(ctx context.Context, it store.Item) (execute.KeeperProof, error) {
 	if it.KeeperJSON == nil {
-		return errs.New(errs.CodeHeld, "this duplicate has no recorded keeper")
+		return nil, errs.New(errs.CodeHeld, "this duplicate has no recorded keeper")
 	}
 	var ev plan.KeeperEvidenceV1
 	if err := json.Unmarshal([]byte(*it.KeeperJSON), &ev); err != nil {
-		return errs.Newf(errs.CodeHeld, "the keeper record is unreadable: %v", err)
+		return nil, errs.Newf(errs.CodeHeld, "the keeper record is unreadable: %v", err)
 	}
 	rel, err := plan.UnB64(ev.RawRelativeB64)
 	if err != nil {
-		return errs.New(errs.CodeHeld, "the keeper path is unreadable")
+		return nil, errs.New(errs.CodeHeld, "the keeper path is unreadable")
 	}
 	if ev.MetadataHash == "" {
 		// A plan made without metadata evidence cannot prove equivalence now.
 		// Refusing is the only honest answer; guessing that "no evidence" means
 		// "no difference" is how a non-equivalent copy gets deleted.
-		return errs.New(errs.CodeHeld,
+		return nil, errs.New(errs.CodeHeld,
 			"the plan recorded no metadata evidence for this keeper, so equivalence cannot be re-proven")
 	}
 
@@ -448,23 +454,30 @@ func (d *Detector) VerifyKeeper(ctx context.Context, it store.Item) error {
 
 	sc, err := execute.OpenScopeCtx(ctx, d.Registrar, domain.ScopeID(ev.ScopeID))
 	if err != nil {
-		return errs.New(errs.CodeHeld, "the keeper scope cannot be verified")
+		return nil, errs.New(errs.CodeHeld, "the keeper scope cannot be verified")
 	}
-	defer sc.Close()
-
 	parent, err := sc.Root.OpenParent(rel)
 	if err != nil {
-		return errs.Newf(errs.CodeHeld, "the keeper %q is missing", rel)
+		sc.Close()
+		return nil, errs.Newf(errs.CodeHeld, "the keeper %q is missing", rel)
 	}
-	defer parent.Close()
 	f, err := fsops.OpenRegularAt(parent, sc.RootDev)
+	parent.Close()
+	// The descriptor stays valid on its own; only the scope lock is released, so
+	// the proof does not hold a scope while the purge continues.
+	sc.Close()
 	if err != nil {
-		return errs.Newf(errs.CodeHeld, "the keeper %q cannot be opened", rel)
+		return nil, errs.Newf(errs.CodeHeld, "the keeper %q cannot be opened", rel)
 	}
-	defer f.Close()
+	proven := false
+	defer func() {
+		if !proven {
+			f.Close()
+		}
+	}()
 
 	if !f.Identity.Equal(ev.Identity) {
-		return errs.New(errs.CodeHeld, "the keeper is no longer the recorded object")
+		return nil, errs.New(errs.CodeHeld, "the keeper is no longer the recorded object")
 	}
 
 	// One stable read establishes content, metadata and the post-read identity in
@@ -472,30 +485,30 @@ func (d *Detector) VerifyKeeper(ctx context.Context, it store.Item) error {
 	ev2, err := execute.ReadStable(f, opt)
 	if err != nil {
 		if errors.Is(err, execute.ErrUnstableObject) {
-			return errs.Newf(errs.CodeHeld, "the keeper changed while it was being verified: %v", err)
+			return nil, errs.Newf(errs.CodeHeld, "the keeper changed while it was being verified: %v", err)
 		}
-		return err
+		return nil, err
 	}
 	if ev2.Token.NLink != 1 {
-		return errs.Newf(errs.CodeHeld,
+		return nil, errs.Newf(errs.CodeHeld,
 			"the keeper now has %d links; another name can outlive the copy being deleted",
 			ev2.Token.NLink)
 	}
 	if ev2.Token.Size != ev.Token.Size || ev2.Token.MTimeNS != ev.Token.MTimeNS {
-		return errs.New(errs.CodeHeld, "the keeper was modified after the plan was made")
+		return nil, errs.New(errs.CodeHeld, "the keeper was modified after the plan was made")
 	}
 	if ev2.Token.Mode != ev.Token.Mode || ev2.Token.UID != ev.Token.UID || ev2.Token.GID != ev.Token.GID {
-		return errs.New(errs.CodeHeld,
+		return nil, errs.New(errs.CodeHeld,
 			"the keeper's permissions or ownership changed after the plan was made")
 	}
 	if string(ev2.Content) != ev.ContentHash {
-		return errs.New(errs.CodeHeld, "the keeper's content no longer matches the plan")
+		return nil, errs.New(errs.CodeHeld, "the keeper's content no longer matches the plan")
 	}
 	if string(ev2.Metadata) != ev.MetadataHash {
-		return errs.New(errs.CodeHeld, "the keeper's extended metadata no longer matches the plan")
+		return nil, errs.New(errs.CodeHeld, "the keeper's extended metadata no longer matches the plan")
 	}
 	if it.ContentHash != nil && *it.ContentHash != ev.ContentHash {
-		return errs.New(errs.CodeHeld, "the keeper does not hold the same content as this copy")
+		return nil, errs.New(errs.CodeHeld, "the keeper does not hold the same content as this copy")
 	}
 
 	// Finally, compare the two files byte for byte. The quarantined copy is still
@@ -503,18 +516,84 @@ func (d *Detector) VerifyKeeper(ctx context.Context, it store.Item) error {
 	// deleted, not against a remembered digest.
 	obj, closeObj, err := openQuarantined(ctx, d.Registrar, it)
 	if err != nil {
-		return errs.Newf(errs.CodeHeld, "the quarantined copy cannot be read for comparison: %v", err)
+		return nil, errs.Newf(errs.CodeHeld, "the quarantined copy cannot be read for comparison: %v", err)
 	}
 	defer closeObj()
 	same, err := execute.CompareFiles(f, obj, opt)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !same {
-		return errs.New(errs.CodeHeld,
+		return nil, errs.New(errs.CodeHeld,
 			"the keeper and the quarantined copy hold different bytes despite an equal hash")
 	}
+
+	proven = true
+	return &keeperProof{file: f, want: ev, metadata: ev2.Metadata}, nil
+}
+
+// keeperProof carries the verified keeper and its open descriptor to the last
+// check boundary before the unlink.
+type keeperProof struct {
+	file     *fsops.File
+	want     plan.KeeperEvidenceV1
+	metadata domain.Digest
+}
+
+// Confirm re-reads the keeper through the descriptor that was verified.
+//
+// It compares identity, link count, size, mtime, permissions, ownership and the
+// extended-metadata digest. Content is not read again: the point is to detect a
+// change that landed after the comparison had passed the region, not to claim a
+// snapshot that a concurrent writer cannot break.
+func (p *keeperProof) Confirm(ctx context.Context) error {
+	if p == nil || p.file == nil {
+		return errs.New(errs.CodeHeld, "the keeper was not held open; its state cannot be re-read")
+	}
+	if err := ctx.Err(); err != nil {
+		return errs.Wrap(errs.CodeCancelled, err)
+	}
+	id, tok, err := p.file.Stat()
+	if err != nil {
+		return errs.Newf(errs.CodeHeld, "the keeper can no longer be inspected: %v", err)
+	}
+	if !id.Equal(p.want.Identity) {
+		return errs.New(errs.CodeHeld, "the keeper is no longer the recorded object")
+	}
+	if tok.NLink != 1 {
+		return errs.Newf(errs.CodeHeld,
+			"the keeper now has %d links; another name can outlive the copy being deleted", tok.NLink)
+	}
+	if tok.Size != p.want.Token.Size || tok.MTimeNS != p.want.Token.MTimeNS {
+		return errs.New(errs.CodeHeld, "the keeper changed after the final comparison")
+	}
+	if tok.Mode != p.want.Token.Mode || tok.UID != p.want.Token.UID || tok.GID != p.want.Token.GID {
+		return errs.New(errs.CodeHeld,
+			"the keeper's permissions or ownership changed after the final comparison")
+	}
+	meta, err := execute.MetadataOf(p.file)
+	if err != nil {
+		return err
+	}
+	if meta.Unsupported != "" {
+		return errs.Newf(errs.CodeHeld,
+			"the keeper's extended metadata can no longer be established (%s); refusing to treat it as equivalent",
+			meta.Unsupported)
+	}
+	if got := execute.MetadataDigest(meta, tok); got != p.metadata {
+		return errs.New(errs.CodeHeld, "the keeper's extended metadata changed after the final comparison")
+	}
 	return nil
+}
+
+// Close releases the keeper descriptor.
+func (p *keeperProof) Close() error {
+	if p == nil || p.file == nil {
+		return nil
+	}
+	err := p.file.Close()
+	p.file = nil
+	return err
 }
 
 // openQuarantined opens one object inside a scope's private vault.

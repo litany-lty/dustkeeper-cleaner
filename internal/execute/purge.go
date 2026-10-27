@@ -18,8 +18,27 @@ import (
 
 // KeeperVerifier is implemented by the dedup package. It is an interface here so
 // that the executor does not depend on duplicate detection.
+//
+// It returns a proof rather than an error because the verification ends with a
+// full byte comparison, and a check that ends before the last possible moment is
+// not the strongest claim available: R09 A records that nothing re-read the
+// keeper afterwards. The proof keeps the very descriptor that was verified open,
+// so the final re-check is against that object and not against a path that may
+// since have been pointed somewhere else.
 type KeeperVerifier interface {
-	VerifyKeeper(ctx context.Context, it store.Item) error
+	VerifyKeeper(ctx context.Context, it store.Item) (KeeperProof, error)
+}
+
+// KeeperProof is a keeper whose equivalence has been proven and whose handle is
+// still open.
+type KeeperProof interface {
+	// Confirm re-reads the keeper's identity, change token and metadata through
+	// the descriptor that was verified, and fails if any of them moved after the
+	// final comparison. It does not read content again: this narrows the window,
+	// it does not claim an atomic snapshot.
+	Confirm(ctx context.Context) error
+	// Close releases the keeper handle.
+	Close() error
 }
 
 // TrustFunc asserts that the wall clock may be used to prove that a retention
@@ -166,12 +185,18 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 	}
 
 	// Exact duplicates must still have a living keeper.
+	var keeper KeeperProof
 	if it.Reason == domain.ReasonExactDuplicate {
 		if e.Keeper == nil {
 			return res, errs.New(errs.CodeHeld, "no keeper verifier is configured; refusing to purge a duplicate")
 		}
-		if err := e.Keeper.VerifyKeeper(ctx, it); err != nil {
-			return res, err
+		proof, kerr := e.Keeper.VerifyKeeper(ctx, it)
+		if kerr != nil {
+			return res, kerr
+		}
+		keeper = proof
+		if keeper != nil {
+			defer keeper.Close()
 		}
 	}
 
@@ -197,6 +222,18 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 	if opt.Budget != nil && opt.Budget.TimeUp(e.Clock) {
 		return res, errs.New(errs.CodeBudgetExhausted,
 			"the run's time slice ran out while this object was being verified; nothing was removed")
+	}
+
+	// The last check of the other side. The keeper's own proof ended with the byte
+	// comparison; between that comparison and this line its inode, size, mtime,
+	// permissions, link count or extended metadata could have moved, and the
+	// payload's own re-check would not notice. Both sides have now been re-read
+	// after the final comparison, and both handle-bound facts survive to the
+	// intent boundary below.
+	if keeper != nil {
+		if err := keeper.Confirm(ctx); err != nil {
+			return res, err
+		}
 	}
 
 	opID := domain.OperationID(domain.NewID("op"))
@@ -345,55 +382,66 @@ func (e *Executor) checkAutomaticAuthority(ctx context.Context, sc *ScopeCtx, it
 // path slot.
 //
 // The path usually no longer exists, so "ENOENT means no protection" would be
-// exactly wrong. There are two entries, as section 11.4 requires:
+// exactly wrong. Four entries, in this order:
 //
-//  1. a literal comparison of the recorded relative path (exact match or full
-//     segment prefix), which holds even though nothing is there any more;
-//  2. alias resolution by kernel identity — a protection spelled differently
-//     but living in the same directory, or even resolving to the very object
-//     that now sits in the vault, still protects this slot.
+//  1. the recorded path compared without touching the filesystem (exact match
+//     or full segment prefix), which holds even though nothing is there any
+//     more — this is the same judgement planning and quarantine make;
+//  2. the very object now in the vault: a protection that was recorded for it
+//     still names it, whatever spelling was used;
+//  3. the directories above the slot, by kernel identity: on a case-insensitive
+//     volume "folder" and "Folder" are one directory, and only the kernel's
+//     identity says so. A subtree protection whose root is one of those
+//     ancestors protects this slot;
+//  4. the same directory with a leaf that cannot be resolved. A different
+//     spelling that the kernel might still call the same name — case, or the
+//     NFC/NFD pair — is an unresolved alias, not a stranger.
 //
 // When the original directory itself cannot be resolved, nothing can be
 // compared by identity any more. The answer is then PROTECTION_ALIAS_UNRESOLVED
 // rather than a guess: freezing a scope is recoverable, deleting a file that a
 // protection was meant to keep is not.
 func (e *Executor) purgeBlockedByProtection(ctx context.Context, sc *ScopeCtx, it store.Item) (bool, string, error) {
-	ps, err := e.Store.ListProtections(ctx, sc.Scope.ID, true)
+	rel := string(it.RawRelative)
+
+	// The guard is rebuilt from the store, never taken from the executor. An
+	// executor that planned earlier in this process can hold a guard built before
+	// the protection being asked about existed, and reading that stale answer here
+	// deletes a file the user has since protected. The cost is one resolution per
+	// protection per purge, which is small next to a permanent deletion.
+	guard, err := BuildGuard(ctx, e.Store, sc)
 	if err != nil {
 		return false, "", err
 	}
-	rel := string(it.RawRelative)
-	for _, p := range ps {
-		target := string(p.RawRelative)
-		switch p.MatchKind {
-		case domain.MatchExact:
-			if target == rel {
-				return true, "exact protection held by " + p.Source, nil
-			}
-		case domain.MatchSubtree:
-			if policy.HasDirPrefix(rel, target) {
-				return true, "subtree protection held by " + p.Source, nil
-			}
-		}
+
+	// 1. The recorded path, as a name.
+	if ok, why := guard.CheckNameOnly(rel); ok {
+		return true, "the recorded path is still covered: " + why, nil
 	}
 	// A project tree protects everything inside it, including for a slot that
 	// currently holds nothing.
 	if inside, why, perr := e.projectProtected(sc, it.RawRelative); perr == nil && inside {
 		return true, why, nil
 	}
-	if len(ps) == 0 {
+	if guard.Empty() {
 		return false, "", nil
+	}
+
+	var captured domain.FileIdentity
+	if it.CapturedIdentityJSON != nil {
+		var cerr error
+		if captured, cerr = decodeID(*it.CapturedIdentityJSON); cerr != nil {
+			return false, "", cerr
+		}
+	}
+	// 2. A protection recorded for the object that now sits in the vault.
+	if ok, why := guard.CheckExact(rel, captured); ok {
+		return true, why + " (it names the object now in the vault)", nil
 	}
 
 	storedParent, err := decodeID(it.SourceParentIdentityJSON)
 	if err != nil {
 		return false, "", err
-	}
-	var captured domain.FileIdentity
-	if it.CapturedIdentityJSON != nil {
-		if captured, err = decodeID(*it.CapturedIdentityJSON); err != nil {
-			return false, "", err
-		}
 	}
 
 	itemParent, err := sc.Root.OpenParent(it.RawRelative)
@@ -412,18 +460,51 @@ func (e *Executor) purgeBlockedByProtection(ctx context.Context, sc *ScopeCtx, i
 			"the original directory of %q was replaced, so protections cannot be matched by identity", rel)
 	}
 
-	base := rel
-	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
-		base = rel[i+1:]
+	// 3. The directories above the slot. A subtree root spelled differently at
+	// any level is still found, because the kernel resolved the spelling.
+	ancestors, aerr := ancestorIdentities(sc, it.RawRelative)
+	if aerr != nil {
+		return true, "", errs.Newf(errs.CodeProtectionAliasUnresolved,
+			"the directories above %q cannot all be resolved, so subtree protections cannot be compared by identity: %v", rel, aerr)
+	}
+	if ok, why := guard.CheckAncestors(ancestors); ok {
+		return true, why + " (this slot is inside it)", nil
 	}
 
+	// 4. The same directory, and a leaf that has to be resolved by hand.
+	return e.slotAliasAmbiguity(ctx, sc, rel, itemParentID, captured)
+}
+
+// slotAliasAmbiguity reports whether an exact protection whose parent is the
+// slot's own directory leaves this slot unresolved.
+//
+// A protection with the same leaf spelling protects the slot outright, whatever
+// currently occupies it: the protection was recorded for this name in this
+// directory, and a new file appearing there does not make the protection
+// somebody else's.
+//
+// A different leaf spelling is reported as PROTECTION_ALIAS_UNRESOLVED when the
+// two spellings could name one entry (case, or Unicode normalisation). When the
+// protection's entry still exists and is the captured object, the kernel has
+// already proven the alias, and the slot is protected.
+func (e *Executor) slotAliasAmbiguity(ctx context.Context, sc *ScopeCtx, rel string,
+	itemParentID domain.FileIdentity, captured domain.FileIdentity) (bool, string, error) {
+	ps, err := e.Store.ListProtections(ctx, sc.Scope.ID, true)
+	if err != nil {
+		return false, "", err
+	}
+	base := baseOf(rel)
+
 	for _, p := range ps {
+		if p.MatchKind != domain.MatchExact {
+			continue
+		}
 		target := strings.TrimSuffix(string(p.RawRelative), "/")
 		if target == "" {
 			continue
 		}
-		parent, err := sc.Root.OpenParent([]byte(target))
-		if err != nil {
+		parent, perr := sc.Root.OpenParent([]byte(target))
+		if perr != nil {
 			// This protection's own parent is gone; it says nothing about the
 			// slot being purged, so it is not evidence either way.
 			continue
@@ -437,23 +518,17 @@ func (e *Executor) purgeBlockedByProtection(ctx context.Context, sc *ScopeCtx, i
 			parent.Close()
 			continue
 		}
+		targetBase := baseOf(target)
 		entryID, _, eerr := parent.StatAtNoFollow()
 		parent.Close()
-		if eerr == nil {
-			// The entry exists under another spelling. If it is the object now
-			// held in the vault, the kernel has proven an alias.
-			if !captured.IsZero() && entryID.Equal(captured) {
-				return true, "an equivalent spelling of this path is protected by " + p.Source, nil
-			}
-			continue
-		}
-		if baseOf(target) == base {
+
+		if targetBase == base {
 			return true, "the original path slot is protected by " + p.Source, nil
 		}
-		// Same directory, no entry, different spelling. A case or normalisation
-		// alias cannot be ruled out without inventing a casefold, so the scope is
-		// frozen instead.
-		if strings.EqualFold(base, baseOf(target)) {
+		if eerr == nil && !captured.IsZero() && entryID.Equal(captured) {
+			return true, "an equivalent spelling of this path is protected by " + p.Source, nil
+		}
+		if policy.SpellingsMayCollide(base, targetBase) {
 			return true, "", errs.Newf(errs.CodeProtectionAliasUnresolved,
 				"a protection in the same directory (%q) differs only in spelling; resolve or remove it before purging", target)
 		}

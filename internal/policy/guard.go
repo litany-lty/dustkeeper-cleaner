@@ -259,10 +259,12 @@ func (g *Guard) SubtreePaths() []string {
 // case — it is new — so the protection-revision check could not catch it either.
 //
 // Exact match is answered by identity first; subtree match is answered by path
-// containment, because the protection was recorded as a path and the directory it
-// named may since have been renamed or replaced. Path containment is the
-// conservative answer: it keeps files.
-func (g *Guard) CheckFile(rel string, id domain.FileIdentity) (bool, string) {
+// containment, by the identity of the directories above the object, or both. The
+// ancestry argument is what makes the answer independent of spelling: on a
+// case-insensitive volume "Folder" and "folder" are one directory, and only the
+// kernel's identity says so. Callers that have no descriptors pass none, and the
+// path answer still applies.
+func (g *Guard) CheckFile(rel string, id domain.FileIdentity, ancestors ...domain.FileIdentity) (bool, string) {
 	if g == nil {
 		return false, ""
 	}
@@ -276,6 +278,26 @@ func (g *Guard) CheckFile(rel string, id domain.FileIdentity) (bool, string) {
 		}
 		if HasDirPrefix(rel, root) {
 			return true, "subtree protected by " + p.Source
+		}
+	}
+	if ok, why := g.CheckAncestors(ancestors); ok {
+		return true, why
+	}
+	return false, ""
+}
+
+// CheckAncestors reports whether any of these directories is the protected
+// subtree root itself. The caller supplies them nearest-first, read through
+// verified descriptors.
+func (g *Guard) CheckAncestors(ancestors []domain.FileIdentity) (bool, string) {
+	if g == nil || len(g.subtreeID) == 0 {
+		return false, ""
+	}
+	for _, a := range ancestors {
+		if key := IdentityKey(a); key != "" {
+			if src, ok := g.subtreeID[key]; ok {
+				return true, "subtree protected by " + src + " (an ancestor is the protected directory)"
+			}
 		}
 	}
 	return false, ""

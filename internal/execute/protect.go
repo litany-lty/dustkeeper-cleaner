@@ -72,10 +72,50 @@ func (e *Executor) protected(ctx context.Context, sc *ScopeCtx, rel []byte, id d
 	if ok, why := policy.GlobalProtected(string(rel)); ok {
 		return true, "global protection: " + why, nil
 	}
-	if ok, why := e.Guard.CheckFile(string(rel), id); ok {
+	ancestors, err := ancestorIdentities(sc, rel)
+	if err != nil {
+		// A protected subtree whose ancestor chain cannot be walked is not evidence
+		// that the object is unprotected. Saying so would turn a permission problem
+		// into a quarantine.
+		return true, "", errs.Newf(errs.CodeProtectionAliasUnresolved,
+			"the directories above %q cannot all be resolved, so subtree protections cannot be compared by identity: %v", rel, err)
+	}
+	if ok, why := e.Guard.CheckFile(string(rel), id, ancestors...); ok {
 		return true, why, nil
 	}
 	return e.projectProtected(sc, rel)
+}
+
+// ancestorIdentities returns the identity of every directory above rel, nearest
+// first, read through verified descriptors.
+//
+// Subtree protections are recorded as paths, and a path is a spelling: on a
+// filesystem that treats "Folder" and "folder" as one directory, comparing
+// strings lets a protected subtree through. Comparing the identity of each
+// ancestor closes that, and it needs no case folding of its own - the kernel
+// already decided that "Folder/a.zip" lives inside "folder".
+func ancestorIdentities(sc *ScopeCtx, rel []byte) ([]domain.FileIdentity, error) {
+	parts, err := fsops.SplitRelative(rel)
+	if err != nil {
+		return nil, nil
+	}
+	out := make([]domain.FileIdentity, 0, len(parts))
+	for k := len(parts) - 1; k >= 0; k-- {
+		d, oerr := sc.Root.OpenDir([]byte(strings.Join(parts[:k], "/")))
+		if oerr != nil {
+			if errors.Is(oerr, unix.ENOENT) {
+				continue
+			}
+			return nil, oerr
+		}
+		id, _, serr := d.Stat()
+		d.Close()
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 // scopeGate refuses a new business operation on a scope that is no longer active.

@@ -614,28 +614,11 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 	return total, bytes, control, nil
 }
 
-// BuildGuard resolves protection identities with the kernel.
-//
-// A protection recorded as a path is only meaningful once the kernel says which
-// object currently sits there. Comparing strings would miss the APFS case alias
-// where "Keep/x.zip" and "keep/x.zip" are the same file.
+// BuildGuard resolves protection identities with the kernel. The work is done in
+// the executor so that the purge path can build the same guard for a historical
+// slot; this wrapper keeps the runner's call sites unchanged.
 func BuildGuard(ctx context.Context, st *store.Store, sc *execute.ScopeCtx) (*policy.Guard, error) {
-	ps, err := st.ListProtections(ctx, sc.Scope.ID, true)
-	if err != nil {
-		return nil, err
-	}
-	resolved := make([]policy.ResolvedProtection, 0, len(ps))
-	for _, p := range ps {
-		rp := policy.ResolvedProtection{RawRelative: p.RawRelative, MatchKind: p.MatchKind, Source: p.Source}
-		if parent, perr := sc.Root.OpenParent(p.RawRelative); perr == nil {
-			if id, _, serr := parent.StatAtNoFollow(); serr == nil {
-				rp.Identity = id
-			}
-			parent.Close()
-		}
-		resolved = append(resolved, rp)
-	}
-	return policy.NewGuard(resolved), nil
+	return execute.BuildGuard(ctx, st, sc)
 }
 
 // ClockTrust is kept for callers that only need the verdict, such as `doctor`.

@@ -115,7 +115,10 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 		reason := ""
 		if ok, r := policy.GlobalProtected(rel); ok {
 			protected, reason = true, "global protection: "+r
-		} else if ok, r := req.Guard.CheckExact(rel, id); ok {
+		} else if ok, r := req.Guard.CheckFile(rel, id, parent); ok {
+			// The planner asks the same question the executor asks, with the
+			// parent identity the scan recorded. CheckExact alone let a subtree
+			// protection added after a scan be ignored by a plan created after it.
 			protected, reason = true, r
 		}
 

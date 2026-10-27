@@ -19,6 +19,7 @@ type Capabilities struct {
 	FullBarrier     bool     `json:"full_barrier"`
 	XattrRead       bool     `json:"xattr_read"`
 	FileFlags       bool     `json:"file_flags"`
+	ACLQuery        bool     `json:"acl_query"`
 	NoFollow        bool     `json:"no_follow"`
 	Notes           []string `json:"notes"`
 }
@@ -106,7 +107,30 @@ func Probe(base string) Capabilities {
 	} else {
 		caps.Notes = append(caps.Notes, "extended attributes are not writable on this volume")
 	}
-	caps.FileFlags = runtime.GOOS == "darwin"
+	// File flags are observed, not inferred from the platform name: Linux answers
+	// FS_IOC_GETFLAGS on the filesystems mutation is allowed on, and macOS carries
+	// them in stat. Reporting "capable" because of GOOS is what R09 B warned
+	// about, since the two platforms' readers have different failure modes.
+	if bf, err := os.OpenFile(b, os.O_RDONLY, 0); err == nil {
+		if _, unsupported := fileFlags(int(bf.Fd())); unsupported == "" {
+			caps.FileFlags = true
+		} else {
+			caps.Notes = append(caps.Notes, "file flags cannot be read on this volume")
+		}
+		bf.Close()
+	}
+
+	// The native ACL query. It is not required for mutation, but a host that
+	// cannot answer it will keep every file that might carry an ACL, so the
+	// answer belongs in the report rather than in a comment.
+	if bf, err := os.OpenFile(b, os.O_RDONLY, 0); err == nil {
+		if _, _, reason := aclEvidence(int(bf.Fd())); reason == "" {
+			caps.ACLQuery = true
+		} else {
+			caps.Notes = append(caps.Notes, "native ACL cannot be queried: "+reason)
+		}
+		bf.Close()
+	}
 
 	// Symlink refusal.
 	link := filepath.Join(dir, "link")

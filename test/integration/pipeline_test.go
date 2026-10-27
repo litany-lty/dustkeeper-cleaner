@@ -363,7 +363,7 @@ func TestPurgeRefusesWhenTheKeeperIsGone(t *testing.T) {
 	if len(due) == 0 {
 		t.Fatal("no object became due")
 	}
-	if err := e.det.VerifyKeeper(context.Background(), due[0]); err == nil {
+	if _, err := e.det.VerifyKeeper(context.Background(), due[0]); err == nil {
 		t.Fatal("the keeper verification passed after the keeper was deleted")
 	}
 }

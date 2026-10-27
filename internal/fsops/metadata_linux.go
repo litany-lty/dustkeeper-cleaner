@@ -106,6 +106,13 @@ func readXattrEvidence(fd int) (MetadataEvidence, error) {
 	return ev, nil
 }
 
+// aclEvidence is satisfied on Linux by the attribute list itself: a POSIX ACL is
+// stored as system.posix_acl_access (or _default), which readXattrEvidence
+// already digests and classifies. There is no second, inode-resident ACL to ask
+// the kernel about, so this reports "nothing beyond the attributes" rather than
+// pretending to have looked somewhere else.
+func aclEvidence(int) (present bool, text string, reason string) { return false, "", "" }
+
 func splitNUL(b []byte) []string {
 	var out []string
 	start := 0

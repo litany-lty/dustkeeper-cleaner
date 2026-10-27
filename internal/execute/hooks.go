@@ -22,6 +22,21 @@ var TestHookPreRename func()
 // the state reconciliation has to converge.
 var TestHookPreCompensateRename func()
 
+// TestHookDuringCompare runs once inside CompareFiles, after the first block pair
+// has been compared. It exists because a test cannot otherwise reach the window
+// R09 A describes: the comparison has already read a region, an older write
+// descriptor changes that region, and the rest of the comparison still finds the
+// files equal. It clears itself after the first call so a comparison that runs
+// several times fires it once.
+var TestHookDuringCompare func()
+
+func runDuringCompareHook() {
+	if f := TestHookDuringCompare; f != nil {
+		TestHookDuringCompare = nil
+		f()
+	}
+}
+
 func runPreRenameHook() {
 	if TestHookPreRename != nil {
 		TestHookPreRename()

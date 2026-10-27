@@ -105,6 +105,7 @@ func CompareFiles(a, b *fsops.File, opt VerifyOptions) (bool, error) {
 				}
 			}
 			sleepUntilRate(total, started, opt.RatePerSec)
+			runDuringCompareHook()
 		}
 		endA := errors.Is(erra, io.EOF)
 		endB := errors.Is(errb, io.EOF)

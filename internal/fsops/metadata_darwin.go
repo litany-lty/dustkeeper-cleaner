@@ -15,8 +15,12 @@ import (
 // xattr names that carry semantics we cannot normalise in phase one. Their
 // presence is detected through the attribute list, so "not implemented" never
 // degrades into "assumed absent".
+//
+// The ACL is *not* one of them. com.apple.acl.text is a portable copy that some
+// tools write; the ACL that the kernel enforces on APFS lives in the inode and
+// is only visible through acl_get_fd_np. It is read by aclEvidence below, and an
+// empty attribute list is never taken as proof that there is no ACL.
 const (
-	xattrACL          = "com.apple.acl.text"
 	xattrResourceFork = "com.apple.ResourceFork"
 )
 
@@ -39,17 +43,16 @@ func readXattrEvidence(fd int) (MetadataEvidence, error) {
 		}
 		return ev, fmt.Errorf("fsops: listxattr: %w", err)
 	}
-	if sz == 0 {
-		ev.XattrDigest = emptyDigest()
-		return ev, nil
+	var names []string
+	if sz > 0 {
+		buf := make([]byte, sz)
+		n, err := unix.Flistxattr(fd, buf)
+		if err != nil {
+			return ev, fmt.Errorf("fsops: listxattr: %w", err)
+		}
+		names = splitNUL(buf[:n])
+		sort.Strings(names)
 	}
-	buf := make([]byte, sz)
-	n, err := unix.Flistxattr(fd, buf)
-	if err != nil {
-		return ev, fmt.Errorf("fsops: listxattr: %w", err)
-	}
-	names := splitNUL(buf[:n])
-	sort.Strings(names)
 
 	h := sha256.New()
 	total := 0
@@ -95,29 +98,40 @@ func readXattrEvidence(fd int) (MetadataEvidence, error) {
 		h.Write(value)
 		h.Write([]byte{0})
 
-		switch name {
-		case xattrACL:
-			if len(value) > 0 {
-				ev.HasACL = true
-			}
-		case xattrResourceFork:
-			if len(value) > 0 {
-				ev.HasResourceFork = true
-			}
+		if name == xattrResourceFork && len(value) > 0 {
+			ev.HasResourceFork = true
 		}
 		ev.XattrCount++
 	}
 
-	if ev.HasACL {
-		// A non-trivial ACL is a semantic difference we cannot normalise yet.
-		ev.Unsupported = "acl_present"
+	// The native ACL, asked of the kernel rather than inferred from the attribute
+	// list: on APFS an ACL is inode state, so "no com.apple.* attribute" is not
+	// "no ACL". An answer we cannot obtain keeps the file.
+	present, aclText, reason := aclEvidence(fd)
+	if reason != "" {
+		ev.Unsupported = reason
 		return ev, nil
 	}
+	if present {
+		ev.HasACL = true
+		h.Write([]byte("acl"))
+		h.Write([]byte{0})
+		h.Write([]byte(aclText))
+		h.Write([]byte{0})
+	}
+
 	if ev.HasResourceFork {
 		ev.Unsupported = "resource_fork_present"
 		return ev, nil
 	}
 	ev.XattrDigest = "sha256:" + hex.EncodeToString(h.Sum(nil))
+	if ev.HasACL {
+		// A native ACL is a semantic difference this phase does not normalise
+		// across volumes: an entry can deny deletion to the very user who is
+		// about to delete the other copy. The file is kept, with the reason.
+		ev.Unsupported = "acl_present"
+		return ev, nil
+	}
 	return ev, nil
 }
 
