@@ -47,17 +47,18 @@ type corpusEntry struct {
 
 // record is one line of the report.
 type record struct {
-	CorpusID      string `json:"corpus_id"`
-	PromptVersion string `json:"prompt_version"`
-	Provider      string `json:"provider"`
-	Model         string `json:"model"`
-	Input         string `json:"input"`
-	Answer        string `json:"answer,omitempty"`
-	Error         string `json:"error,omitempty"`
-	HostKind      string `json:"host_decision"`
-	Expected      string `json:"expected"`
-	Agrees        bool   `json:"agrees"`
-	Reviewed      bool   `json:"reviewed"` // a human sets this after reading it
+	CorpusID      string   `json:"corpus_id"`
+	PromptVersion string   `json:"prompt_version"`
+	Provider      string   `json:"provider"`
+	Model         string   `json:"model"`
+	Input         string   `json:"input"`
+	Answer        string   `json:"answer,omitempty"`
+	Error         string   `json:"error,omitempty"`
+	HostKind      string   `json:"host_decision"`
+	Expected      string   `json:"expected"`
+	Agrees        bool     `json:"agrees"`
+	Diffs         []string `json:"diffs,omitempty"`
+	Reviewed      bool     `json:"reviewed"` // a human sets this after reading it
 }
 
 func TestCorpusAgainstARealModel(t *testing.T) {
@@ -68,6 +69,13 @@ func TestCorpusAgainstARealModel(t *testing.T) {
 	modelName := os.Getenv("DUSTKEEPER_EVAL_MODEL")
 	if modelName == "" {
 		t.Skip("set DUSTKEEPER_EVAL_MODEL to name the model being evaluated")
+	}
+	out := os.Getenv("DUSTKEEPER_EVAL_OUT")
+	if out == "" {
+		// The report is the evidence. Writing it into a temporary directory that
+		// disappears with the run leaves a reviewer with a pass/fail line and
+		// nothing to read, so an evaluation run has to say where the report goes.
+		t.Fatal("set DUSTKEEPER_EVAL_OUT to the report path; the report is the evidence for this run")
 	}
 
 	m := *config.Default().Model
@@ -95,10 +103,6 @@ func TestCorpusAgainstARealModel(t *testing.T) {
 	}
 	promptVersion := promptDigest()
 
-	out := os.Getenv("DUSTKEEPER_EVAL_OUT")
-	if out == "" {
-		out = filepath.Join(t.TempDir(), "eval.jsonl")
-	}
 	f, err := os.Create(out)
 	if err != nil {
 		t.Fatalf("create report %s: %v", out, err)
@@ -108,6 +112,10 @@ func TestCorpusAgainstARealModel(t *testing.T) {
 
 	agree, disagree := 0, 0
 	for _, e := range entries {
+		want, werr := decodeExpected(e.Answer)
+		if werr != nil {
+			t.Fatalf("%s: %v", e.ID, werr)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		raw, callErr := provider.Draft(ctx, rules.DraftRequest{
 			Text:   e.Input,
@@ -125,23 +133,37 @@ func TestCorpusAgainstARealModel(t *testing.T) {
 			Answer:        string(raw),
 			Expected:      e.Expect,
 		}
+		var got judgment
 		if callErr != nil {
 			rec.Error = callErr.Error()
-			rec.HostKind = "error"
+			got.Kind = "error"
 		} else if draft, parseErr := rules.ParseDraft(raw, scopes); parseErr != nil {
 			// A rejection is a host decision too, and the most important one to
 			// record: "the model said something the host refused" is not a pass.
 			rec.Error = parseErr.Error()
-			rec.HostKind = "rejected"
+			got.Kind = "rejected"
 		} else {
-			rec.HostKind = draft.Kind
+			got.Kind = draft.Kind
+			if draft.Kind == rules.DraftKind {
+				rule, rerr := rules.Parse([]byte(draft.DSL), scopes)
+				if rerr != nil {
+					rec.Error = rerr.Error()
+					got.Kind = "rejected"
+				} else {
+					got.Rule = rule
+				}
+			}
 		}
-		rec.Agrees = rec.HostKind == e.Expect
+		rec.HostKind = got.Kind
+		// Comparing the decision alone let "90 days" become "30 days" and still
+		// count as agreement; the DSL is compared field by field instead.
+		rec.Agrees, rec.Diffs = compare(want, got)
 		if rec.Agrees {
 			agree++
 		} else {
 			disagree++
-			t.Logf("%s: expected %s, host recorded %s (model: %s)", e.ID, e.Expect, rec.HostKind, rec.Answer)
+			t.Logf("%s: expected %s, host recorded %s (diffs: %v, model: %s)",
+				e.ID, e.Expect, rec.HostKind, rec.Diffs, rec.Answer)
 		}
 		if err := enc.Encode(rec); err != nil {
 			t.Fatalf("write report: %v", err)

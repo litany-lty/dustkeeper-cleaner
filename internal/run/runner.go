@@ -451,10 +451,25 @@ func (r *Runner) automaticAuthority(ctx context.Context, it store.Item,
 }
 
 // ScanState reports how complete one scanning batch was.
+//
+// Complete is the only outcome that permits retiring unseen entries. Every other
+// field exists so the caller can say why the epoch is still open, without guessing
+// from a single boolean:
+//
+//	Interrupted  the batch stopped at a safe boundary because its budget ran out
+//	Incomplete   a directory could not be read (FailedDirs says how many)
+//	Interrupts   consecutive rounds this scope has been left unfinished
+//
+// Incomplete became a separate field from Interrupted because the two used to be
+// one: a failed directory was recorded as "done", so the run that failed it had
+// nothing to report and the next run had nothing to resume.
 type ScanState struct {
 	Complete         bool
 	Interrupted      bool
+	Incomplete       bool
+	FailedDirs       int
 	DeepScanRequired bool
+	Interrupts       int64
 }
 
 // ScanScope runs one scanning batch and reports whether the epoch completed.
@@ -484,20 +499,37 @@ func ScanScope(ctx context.Context, st *store.Store, clock domain.Clock, batch i
 	if err != nil {
 		return stats, ScanState{}, err
 	}
-	if stats.Interrupted || stats.Incomplete {
+	// A directory the filesystem refused is pending work, not finished work:
+	// ScanQueueStateOf counts 'failed' rows in Pending. One condition therefore
+	// covers both halves of R11 — work the budget did not reach, and work the
+	// filesystem would not give up. Neither may retire an observation.
+	if stats.Interrupted || state.Pending > 0 {
 		// Keep the dirs that were not finished in the queue. The next run
 		// resumes the same epoch instead of starting a new one that would never
 		// reach the tail of a large directory.
 		if _, err := st.RequeueActive(ctx, sc.Scope.ID, epoch); err != nil {
 			return stats, ScanState{}, err
 		}
-		return stats, ScanState{Interrupted: true, DeepScanRequired: state.Pending > 0}, nil
-	}
-	if state.Pending > 0 {
-		return stats, ScanState{}, nil
+		// The counter is the persistent half of "the last full pass did not
+		// finish". The run that observed the interruption is gone by the next
+		// one, and a report has to be able to say it without a live process.
+		interrupts, err := st.BumpScanInterrupts(ctx, sc.Scope.ID)
+		if err != nil {
+			return stats, ScanState{}, err
+		}
+		return stats, ScanState{
+			Interrupted:      stats.Interrupted,
+			Incomplete:       state.Failed > 0,
+			FailedDirs:       int(state.Failed),
+			DeepScanRequired: state.Pending > 0,
+			Interrupts:       interrupts,
+		}, nil
 	}
 	// Only a completed epoch may retire unseen entries.
 	if _, err := st.MarkStaleObservations(ctx, sc.Scope.ID, epoch); err != nil {
+		return stats, ScanState{}, err
+	}
+	if err := st.ResetScanInterrupts(ctx, sc.Scope.ID); err != nil {
 		return stats, ScanState{}, err
 	}
 	return stats, ScanState{Complete: true}, nil

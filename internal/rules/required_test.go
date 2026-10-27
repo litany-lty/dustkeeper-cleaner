@@ -8,10 +8,13 @@ import (
 	"dustkeeper/internal/errs"
 )
 
-// requiredPaths mirrors the field contract: every field the DSL documents is
-// mandatory. max_size_bytes is the single exception — it is nullable, and "absent"
-// and "null" both mean "no upper bound" because the DSL has no third spelling for
-// unlimited.
+// requiredPaths mirrors the field contract: every field the DSL documents must be
+// present, including max_size_bytes.
+//
+// max_size_bytes is nullable, not optional. The DSL has one spelling for "no
+// upper bound" and it is `null`; a field that is simply missing is a draft that
+// lost its ceiling, and accepting that turns "the model dropped the limit" into
+// "there is no limit".
 var requiredPaths = []string{
 	"dsl_version",
 	"scope_id",
@@ -19,6 +22,7 @@ var requiredPaths = []string{
 	"match",
 	"match.min_mtime_age_seconds",
 	"match.min_size_bytes",
+	"match.max_size_bytes",
 	"match.relative_dir_prefixes",
 	"match.basename_patterns",
 	"except",
@@ -83,10 +87,18 @@ func TestEveryDocumentedFieldIsRequired(t *testing.T) {
 	}
 }
 
+// nullablePaths lists the fields whose value may be null. Only max_size_bytes is
+// in it, and only because "unlimited" has to have a spelling.
+var nullablePaths = map[string]bool{"match.max_size_bytes": true}
+
 // "Field present but null" is not "field provided": binding null into a slice or
-// an object yields the same zero value as omitting it.
+// an object yields the same zero value as omitting it. The one documented
+// exception is a field whose null has a meaning of its own.
 func TestRequiredFieldsRejectNull(t *testing.T) {
 	for _, path := range requiredPaths {
+		if nullablePaths[path] {
+			continue
+		}
 		t.Run("null_"+path, func(t *testing.T) {
 			m := mutation(t)
 			obj, leaf := parentAndLeaf(t, m, path)
@@ -119,14 +131,17 @@ func TestEmptyCollectionsAreNotMissingFields(t *testing.T) {
 	}
 }
 
-// max_size_bytes is the documented nullable field: absent, null and a number all
-// have distinct meanings that the contract allows.
-func TestMaxSizeBytesIsTheOnlyOptionalField(t *testing.T) {
+// max_size_bytes must be present, and its value may be null or an integer.
+// "Absent" and "null" used to be the same thing here, which is how a dropped
+// ceiling became an unlimited one.
+func TestMaxSizeBytesMustBePresentButMayBeNull(t *testing.T) {
 	m := mutation(t)
 	obj, leaf := parentAndLeaf(t, m, "match.max_size_bytes")
 	delete(obj, leaf)
-	if _, err := Parse(encode(t, m), scopes()); err != nil {
-		t.Fatalf("an absent max_size_bytes was rejected: %v", err)
+	if _, err := Parse(encode(t, m), scopes()); err == nil {
+		t.Fatal("a rule without max_size_bytes was accepted")
+	} else if !strings.Contains(err.Error(), "max_size_bytes") {
+		t.Fatalf("the error does not name the missing field: %v", err)
 	}
 
 	m = mutation(t)

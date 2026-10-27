@@ -38,6 +38,10 @@ var (
 	ErrNoReplaceUnsupport = errors.New("fsops: exclusive rename is not supported here")
 	ErrExists             = errors.New("fsops: target already exists")
 	ErrUnsupportedObject  = errors.New("fsops: unsupported object type")
+	// ErrRootChanged means the root path no longer resolves to the directory this
+	// handle was verified for. It is a refusal, not a retry: the caller's whole
+	// basis (device number, identities under it) belonged to another object.
+	ErrRootChanged = errors.New("fsops: root directory was replaced")
 )
 
 // Limits for path validation. They are deliberately generous but bounded.
@@ -136,6 +140,7 @@ type Root struct {
 	fd     int
 	path   string
 	dev    uint64
+	ino    uint64
 	mu     sync.Mutex
 	closed bool
 }
@@ -160,6 +165,7 @@ func OpenRoot(p string) (*Root, error) {
 		fd:   fd,
 		path: p,
 		dev:  devOf(&st),
+		ino:  uint64(st.Ino),
 	}, nil
 }
 
@@ -297,11 +303,7 @@ func (d *Dir) Readdir(n int) ([]os.DirEntry, error) {
 // crossing a mount boundary. An empty rel returns a duplicate of the root.
 func (r *Root) OpenDir(rel []byte) (*Dir, error) {
 	if len(rel) == 0 {
-		dup, err := unix.Dup(r.fd)
-		if err != nil {
-			return nil, fmt.Errorf("fsops: dup root: %w", err)
-		}
-		return &Dir{f: os.NewFile(uintptr(dup), r.path), fd: dup, rel: "."}, nil
+		return r.openRoot()
 	}
 	parts, err := SplitRelative(rel)
 	if err != nil {
@@ -312,6 +314,37 @@ func (r *Root) OpenDir(rel []byte) (*Dir, error) {
 		return nil, err
 	}
 	return &Dir{f: os.NewFile(uintptr(child), path.Join(r.path, string(rel))), fd: child, rel: string(rel)}, nil
+}
+
+// openRoot opens an independent descriptor for enumerating the root.
+//
+// Duplicating r.fd is not enough, and that was a real defect: a duplicated
+// descriptor shares its file offset with the original, so the second listing of the
+// root started at end-of-directory and returned zero entries. An empty listing is
+// indistinguishable from an empty directory, so the scanner marked the directory
+// done, found nothing pending, and declared the epoch complete — retiring every
+// observation it had never read. Nothing failed; the scope just went quiet.
+//
+// Each listing therefore opens its own descriptor, which has its own offset, and
+// proves it is still the directory this handle was verified for. A re-created root
+// (same path, new inode) is refused rather than enumerated: every identity recorded
+// under the old root describes a different object.
+func (r *Root) openRoot() (*Dir, error) {
+	fd, err := unix.Open(r.path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("fsops: reopen root %q: %w", r.path, err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("fsops: stat reopened root: %w", err)
+	}
+	if devOf(&st) != r.dev || uint64(st.Ino) != r.ino {
+		unix.Close(fd)
+		return nil, fmt.Errorf("%w: %q is dev %d ino %d, expected dev %d ino %d",
+			ErrRootChanged, r.path, devOf(&st), uint64(st.Ino), r.dev, r.ino)
+	}
+	return &Dir{f: os.NewFile(uintptr(fd), r.path), fd: fd, rel: "."}, nil
 }
 
 // Parent is a verified parent directory plus one validated entry name.

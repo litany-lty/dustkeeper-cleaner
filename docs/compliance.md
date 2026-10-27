@@ -211,15 +211,16 @@ ContractJSON: `{"purpose":"miscapture_compensation"}`,
 | R08 | 崩溃对账的证据与持久化 | 关闭 | `plan/contract.go`（严格合同 + 必填字段）、`recovery/reconcile.go`（manifest 缺失/损坏/身份不一致一律拒绝，`ReadStable` 复核，`SyncAfterMove`/`SyncAfterUnlink`）；`TestReconcileRefusesAMissingManifest`、`TestReconcileRefusesACorruptManifest`、`TestReconcileRefusesDisagreeingEvidence`、`TestReconcileRefusesAContractWithoutEvidence`、`TestReconciledQuarantineStillReachesPurge` |
 | R09 | 精确重复与清空的证据链 | 关闭 | `dedup/dedup.go`：元数据摘要真实计算并写入计划、`VerifyKeeper` 核 nlink/权限/归属/mtime/元数据/逐字节、reference keeper 替换同样核验、一对一同范围/跨范围重复都能成组；`TestDuplicateIsHeldWhenTheKeeperPermissionsChange`（及 Metadata/Link/Bytes 三个变体）、`TestDuplicateIsPurgedWhenTheKeeperIsIntact`、`TestOneToOneCrossScopeDuplicateIsFound` |
 | R10 | 后台自动清空被零额度拦住 | 实现待补测 | `domain.ActionLedger` 分为 Q/P 两个独立账本，`runner.go` 用 `MaxAutoPurgeFiles/Bytes` 建 P 账本；`TestZeroBudgetForbidsTheAction`、`TestBudgetExhaustionLeavesTheRestAlone`。**缺**：双授权 → 到期 → 后台确实清空的端到端断言 |
-| R11 | 扫描中断被当成完成 | 实现待补测 | `scan.Report.Interrupted` 与 `Incomplete` 分开，`runner.go` 两者都影响后续判定。**缺**：`internal/scan` 至今没有包内测试 |
-| R12 | 自然语言能力与安全落地 | 关闭（5 项里 4 项） | 见 §7.2；`TestEveryDocumentedFieldIsRequired`、`TestRequiredFieldsRejectNull`、`TestEmptyCollectionsAreNotMissingFields`、`TestFieldsMustHaveTheDocumentedShape`、`TestModelDraftsGoThroughTheSameFieldContract`、`TestDraftVariantsAreJudgedByFieldPresence`、`TestDraftRequestCarriesTheAllowedScopes`、`TestDraftRequestBodyMatchesTheSnapshot`、`TestNormalCommandsNeverCallTheModel`、`test/eval` |
+| R11 | 扫描中断被当成完成 | 关闭（A19/A20） | `scan_queue` 增加 `failed`、`attempts`、`claim_seq`、`last_error`（migration 003），`scopes.scan_interrupts` 记录连续未完成轮次。失败的目录不再标 done：它留在队列里，`ScanQueueStateOf` 把它计入 pending，所以既不能完成 epoch，也不能退休自己的 observation。领取按 least-recently-claimed 排序，中断时把同批未被打开的目录 `ReleaseClaimed` 回 pending（`claim_seq=NULL`），超大目录因此不能每轮重新抢在最前。用例：`TestAFailedDirectoryCannotCompleteTheEpochOrRetireItsOwnObservations`（A19）、`TestAnInterruptedDirectoryDoesNotStarveTheOnesBehindIt`（A20）。顺带修掉 `OpenDir("")` 用 dup 共享文件偏移、第二次列举根目录返回空列表的缺陷（`fsops.Root.openRoot`，重开并核对 dev/ino）。**缺**：`internal/scan` 仍无包内单元测试，证据都在 `test/integration` |
+| R12 | 自然语言能力与安全落地 | 关闭（5 项里 5 项；A22 真实模型报告仍缺） | 见 §7.2；`TestEveryDocumentedFieldIsRequired`、`TestRequiredFieldsRejectNull`、`TestEmptyCollectionsAreNotMissingFields`、`TestFieldsMustHaveTheDocumentedShape`、`TestMaxSizeBytesMustBePresentButMayBeNull`、`TestParseDraftRejectsCaseVariantsOfItsOwnKeys`、`TestParseRejectsTwoSpellingsOfOneField`、`TestParseAcceptsTheExactFieldNames`、`TestModelDraftsGoThroughTheSameFieldContract`、`TestDraftVariantsAreJudgedByFieldPresence`、`TestDraftRequestCarriesTheAllowedScopes`、`TestDraftRequestBodyMatchesTheSnapshot`、`TestNormalCommandsNeverCallTheModel`、`test/eval`（`TestTheSemanticGateCatchesWhatTheReviewNames` 等） |
 | R13 | 脱离数据库的救援入口 | P1 关闭 / P2 未做 | `internal/rescue`（只读盘点，先于 `openStore`）、`cmd_object.go` 的 `recover inspect --root`；`TestManifestInventoryWorksWithoutTheDatabase`、`TestManifestInventoryNeedsNoStateDirectory`、`TestManifestInventoryListsUnexplainedEntries`、`TestManifestInventoryRefusesAnUnmanagedDirectory`。**未做**：run_id/op_id 结构化诊断、日志大小上限与轮转（全仓仍无 `log/slog`） |
 | R14 | 性能证据 | 未做 | 见 §7.3 |
 | R15 | 发布脚本与平台声明 | 关闭 | `build/build.sh` 区分 dev/release、声明四个必须产出的目标、签名与校验失败即退出、固定 musl 静态策略、`release-manifest.txt`；`TestReleaseFailsWhenACrossTargetHasNoCompiler`、`TestReleaseFailsWhenSigningFails`、`TestReleaseFailsWhenTheChecksumToolFails`、`TestReleaseFailsWhenATargetProducesNoArtifact`、`TestChecksumsCoverOnlyThisBuild`、`TestReleaseSucceedsWhenEverythingIsPresent`、`TestDevelopmentBuildMaySkipTargets`；`--label` 贯通与显式 00:00 由 `TestScheduleRenderHonoursMidnightAndLabel`、`TestScheduleRenderKeepsTheDocumentedDefault`、`TestLabelDrivesTheFileNames`、`TestExplicitMidnightIsHonoured` 覆盖 |
 
 ## 7.2 R12 的五项整改
 
-1. **必填字段与 absent/null/空集区分**：`strictjson.Inspect` 在 token 层记录每个对象成员的路径与形状（`presence.go`），`rules.ruleFields` 声明 12 个必填字段及其允许形状；`max_size_bytes` 是唯一的可空字段，absent 与 null 都表示"无上界"。绑定到 struct 之后再校验的老路被放弃，因为它把三者压成同一个零值。
+1. **必填字段与 absent/null/空集区分**：`strictjson.Inspect` 在 token 层记录每个对象成员的路径与形状（`presence.go`），`rules.ruleFields` 声明 12 个必填字段及其允许形状。`max_size_bytes` 必须出现、值可以是 `null` 或合法整数：上一版把它放进 `optionalFields`，等于把"模型漏写上限"接受成"没有上限"，违反"遗漏不得悄悄扩大匹配范围"的宿主合同。缺失现在是 `INVALID_ARGUMENT`，显式 `null` 才是"无上界"（`TestMaxSizeBytesMustBePresentButMayBeNull`）。
+   **同一个对象只认一套精确键名**：`strictjson.Allow` 按每个对象的精确键集拒绝大小写变体和别名重复（`Questions`/`SCOPE_ID` 这类能被 encoding/json 直接绑定的写法），`rule` 对象与 draft envelope 各有一套键集，import 与 draft 走同一个 `checkRuleFields`，所以两条路径不会一个严一个松（`TestParseDraftRejectsCaseVariantsOfItsOwnKeys`、`TestParseRejectsTwoSpellingsOfOneField`、`TestParseAcceptsTheExactFieldNames`）。
 2. **draft/needs_input/unsupported 按字段存在性判别**：`forbidFields` 让三种变体互斥到"字段出现即违规"，`questions: []`、`reason: ""`、`dsl: null` 都不再被当成没写。模型草稿的 `dsl` 以 `json.RawMessage` 交给 `rules.Parse`，与 `rule import` 走同一个校验器——测试 `TestModelDraftsGoThroughTheSameFieldContract` 用"删掉 except"这一条证明两条路径同源。
 3. **把允许的 scope 列表传给 provider**：`systemWithScopes` 把排序后的逻辑 scope ID 追加到系统提示；超过 64 个时拒绝请求而不是截断（截断等于让模型从看不见的集合里选）。
 4. **HTTP 请求体快照**：`internal/rules/testdata/draft_request.golden`，测试对请求体做规范化 JSON 比对，并单独断言"只有两段消息、用户消息等于原文、不含 `/srv/`、文件名、哈希"。
@@ -227,11 +228,12 @@ ContractJSON: `{"purpose":"miscapture_compensation"}`,
 
 另外发现并修掉一个文档没列、但让 R12 整体无法触达的缺陷：`config` 校验的 provider 名是 `chat_completions_json`，而适配器要求 `openai-compatible`，两个字符串不可能同时满足——**任何通过校验的配置都构造不出 provider**，`rule draft` 在真实二进制上直接 `INVALID_ARGUMENT: provider ... is not supported`。现在两处共用一个常量 `config.ProviderChatCompletionsJSON`，`TestTheDefaultConfigCanConstructAProvider` 用默认配置构造适配器。
 
-**R12 最低验收里还没做到的一条**：「两个年龄阈值」「不是所有」这类语义误解不得直接形成已激活规则。宿主能保证的是"缺字段即拒绝"，不能保证模型没有把双阈值悄悄写成单阈值；这一条只能靠 `test/eval` 的人工判定，报告里的 `reviewed` 字段就是留给它的，目前没有真实模型跑过的记录。
+**R12 最低验收里还没做到的一条**：「两个年龄阈值」「不是所有」这类语义误解不得直接形成已激活规则。宿主能保证的是"缺字段即拒绝"，不能保证模型没有把双阈值悄悄写成单阈值。为此 `test/eval` 的判定从"kind 相同"改成逐项语义比较（`test/eval/semantic.go`：scope、年龄阈值、大小上下界、match、except、保留期，外加"该澄清时是否澄清、该拒绝时是否拒绝"），并且报告路径 `DUSTKEEPER_EVAL_OUT` 现在是必填——写进 `t.TempDir()` 的报告随进程消失，等于没有证据。`TestTheSemanticGateCatchesWhatTheReviewNames` 用"90 天写成 30 天""丢掉 except""换一个仍合法的 scope""改保留期""凭空加上界""收窄模式"六种偏差证明这个门禁会失败。**但仍然没有真实模型跑过的报告**：这一条只能靠真实 provider 的输出，本轮环境没有可用的端点，因此 A22 记为未交付，不能算关闭。
 
 ## 7.3 仍未关闭
 
 - **R14 性能证据**：`test/bench` 只有 `TestScanMemoryIsBounded` 一条，尚未"先记完整 epoch 与有效记录数，再记 RSS/耗时"，10 万门槛仍是 256 MiB，`dedup` 的 bySize/byHash 仍是一次性分组。这一项没有任何新证据，按 §6.4-10 不能算关闭。
 - **R13 P2 运行可观测性**：结构化诊断（run_id/op_id）、最终汇总、日志上限与轮转都没做，全仓仍没有一行日志写入。
-- **R03/R04/R05/R06/R07/R10/R11 的专门失败测试**：代码已改、全量测试通过，但缺"能在旧版复现问题"的独立用例。按 §6.4-1 的标准，它们只能算"实现待补测"，不能算关闭。
+- **A22 真实模型评测报告**：门禁与报告格式已就位，缺真实 provider 的一次运行与逐条复核标记。
+- **R03/R04/R05/R06/R07/R10 的专门失败测试**：代码已改、全量测试通过，但缺"能在旧版复现问题"的独立用例。按 §6.4-1 的标准，它们只能算"实现待补测"，不能算关闭。
 - **真实平台闭环**：只有 darwin/arm64 跑过"注册 → 计划 → 隔离 → 不覆盖恢复 → 到期清空 → 重启对账"。linux-amd64、linux-arm64、darwin-amd64 只做过交叉编译，没有在目标机器上执行过，文档与 README 已按"实验性"标注。

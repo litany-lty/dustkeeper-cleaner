@@ -76,14 +76,29 @@ func New(st *store.Store, clock domain.Clock, guard *policy.Guard, batch int) *S
 	}
 }
 
-// dirState is the outcome for one directory.
-type dirState int
+// dirState is the outcome for one directory, with the reason a failure carries
+// into the queue so a later run and a report can both name it.
+type dirState struct {
+	kind   int
+	reason string
+}
 
 const (
-	dirDone dirState = iota
-	dirInterrupted
-	dirFailed
+	stateDone = iota
+	stateInterrupted
+	stateFailed
 )
+
+var (
+	dirDone        = dirState{kind: stateDone}
+	dirInterrupted = dirState{kind: stateInterrupted}
+)
+
+// dirFailedWith records why a directory could not be read. The reason is
+// written to the queue row so the next round, and any report built from the
+// database, can say which directory failed and why instead of only counting it
+// in one process's memory.
+func dirFailedWith(reason string) dirState { return dirState{kind: stateFailed, reason: reason} }
 
 // Run processes directories until the queue is empty or the run budget is spent.
 //
@@ -93,6 +108,11 @@ const (
 func (s *Scanner) Run(ctx context.Context, vs scope.VerifiedScope, epoch int64, run *domain.RunLedger) (Stats, error) {
 	var stats Stats
 	rootDev := vs.RootID.Runtime.Device
+	// failedHere remembers the directories this pass could not read. The claim
+	// loop offers every row it has not finished, and a failed row is one of those,
+	// so without this the pass would claim it, fail it, claim it again and fail it
+	// again until the budget expired — rewriting the same row the whole time.
+	failedHere := make(map[string]string)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -111,40 +131,69 @@ func (s *Scanner) Run(ctx context.Context, vs scope.VerifiedScope, epoch int64, 
 			return stats, nil
 		}
 
-		for _, rel := range dirs {
+		progressed := false
+		for i, rel := range dirs {
+			if reason, again := failedHere[string(rel)]; again {
+				if err := s.Store.MarkDirFailed(ctx, vs.Scope.ID, epoch, rel, reason); err != nil {
+					return stats, err
+				}
+				continue
+			}
 			state, err := s.scanDir(ctx, vs, epoch, rootDev, rel, run, &stats)
 			if err != nil {
 				return stats, err
 			}
-			switch state {
-			case dirDone:
+			switch state.kind {
+			case stateDone:
 				if err := s.Store.MarkDirDone(ctx, vs.Scope.ID, epoch, rel); err != nil {
 					return stats, err
 				}
 				stats.Dirs++
-			case dirFailed:
-				// A directory that cannot be read is not "empty" and not
-				// "done": it is counted, the epoch cannot call itself complete,
-				// and the next epoch will walk it again from the root. Marking
-				// it done here is what lets the queue advance instead of
-				// spinning on the same entry for ever.
-				if err := s.Store.MarkDirDone(ctx, vs.Scope.ID, epoch, rel); err != nil {
+				progressed = true
+			case stateFailed:
+				// A directory that cannot be read is not "empty" and not "done".
+				// It used to be marked done so the queue could advance, which
+				// kept the incompleteness in this run's memory only: the next
+				// round saw an empty pending set, called the epoch complete, and
+				// retired every observation inside that directory as stale.
+				//
+				// Recording it as failed keeps the fact in the queue. The epoch
+				// stays open, the directory is claimed again in a later round
+				// (least-recently-claimed first, so it cannot starve the rest),
+				// and only a successful pass over it lets the epoch complete.
+				if err := s.Store.MarkDirFailed(ctx, vs.Scope.ID, epoch, rel, state.reason); err != nil {
 					return stats, err
 				}
+				failedHere[string(rel)] = state.reason
 				stats.FailedDirs++
 				stats.Incomplete = true
-			case dirInterrupted:
-				// Leave it claimed. The next run requeues active directories and
-				// resumes this one instead of starting a new epoch that would
-				// never reach the tail.
+				progressed = true
+			case stateInterrupted:
+				// Leave this one claimed: the next pass requeues it and resumes
+				// here instead of starting a new epoch that would never reach the
+				// tail. The rest of the batch was claimed but never opened, so it
+				// goes back to pending without a claim sequence and will be picked
+				// before this directory next time.
+				if err := s.Store.ReleaseClaimed(ctx, vs.Scope.ID, epoch, dirs[i+1:]); err != nil {
+					return stats, err
+				}
 				stats.Interrupted = true
 				stats.Incomplete = true
 				return stats, nil
 			}
 			if run.TimeUp(s.Clock.Mono()) {
+				if err := s.Store.ReleaseClaimed(ctx, vs.Scope.ID, epoch, dirs[i+1:]); err != nil {
+					return stats, err
+				}
 				stats.Interrupted = true
 				return stats, nil
 			}
+		}
+		if !progressed {
+			// Everything this batch offered had already been tried in this pass.
+			// The failures stay in the queue for the next pass; stopping here is
+			// what keeps this one from spinning on them.
+			return stats, nil
 		}
 	}
 }
@@ -152,27 +201,44 @@ func (s *Scanner) Run(ctx context.Context, vs scope.VerifiedScope, epoch int64, 
 func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int64, rootDev uint64,
 	rel []byte, run *domain.RunLedger, stats *Stats) (dirState, error) {
 
+	if f := TestHookDirRead; f != nil {
+		if herr := f(string(rel)); herr != nil {
+			stats.Unreadable++
+			return dirFailedWith(herr.Error()), nil
+		}
+	}
+
 	dir, err := vs.Root.OpenDir(rel)
 	if err != nil {
 		// A directory that vanished, became a symlink or crossed a mount is
-		// skipped with a count. Treating it as "empty" would be a lie; treating
-		// it as fatal would stop the whole scope for one bad entry.
+		// done with: nothing inside it can be enumerated, and treating it as
+		// "empty" is not a lie because there is no reachable content left to
+		// list. Its own observations are retired when the epoch completes,
+		// which is correct — the path no longer holds a directory we manage.
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, fsops.ErrSymlink) || errors.Is(err, fsops.ErrCrossMount) {
 			stats.Unreadable++
 			return dirDone, nil
 		}
+		// A permission error is different: the directory is still there and
+		// still holds files we have observations for. It is failed, not done.
 		if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) {
 			stats.Unreadable++
-			return dirFailed, nil
+			return dirFailedWith("permission denied"), nil
 		}
-		return dirFailed, errs.Wrap(errs.CodeAccessDenied, err)
+		// A root that a path now resolves to a different inode for is not a
+		// directory this scan may report on at all: every identity underneath it
+		// was recorded against another object.
+		if errors.Is(err, fsops.ErrRootChanged) {
+			return dirFailedWith("root replaced"), errs.Wrap(errs.CodeScopeChanged, err)
+		}
+		return dirFailedWith("open failed"), errs.Wrap(errs.CodeAccessDenied, err)
 	}
 	defer dir.Close()
 
 	dirID, _, err := dir.Stat()
 	if err != nil {
 		stats.Unreadable++
-		return dirFailed, nil
+		return dirFailedWith("stat failed"), nil
 	}
 	if ok, _ := s.Guard.CheckSubtree(string(rel), dirID); ok {
 		stats.ProtectedDirs++
@@ -190,7 +256,7 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 
 	parentIdentityJSON, err := jsonIdentity(dirID)
 	if err != nil {
-		return dirFailed, err
+		return dirFailedWith("identity unavailable"), err
 	}
 
 	var (
@@ -225,10 +291,10 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 			// was seen and marking the directory finished would record a partial
 			// listing as complete.
 			if ferr := flush(); ferr != nil {
-				return dirFailed, ferr
+				return dirFailedWith("read error"), ferr
 			}
 			stats.Unreadable++
-			return dirFailed, nil
+			return dirFailedWith("read error"), nil
 		}
 		if len(entries) == 0 {
 			break
@@ -299,7 +365,7 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 
 		if len(obsBatch) >= s.Batch || len(dirBatch) >= s.Batch {
 			if err := flush(); err != nil {
-				return dirFailed, err
+				return dirFailedWith("flush failed"), err
 			}
 		}
 		if run.TimeUp(s.Clock.Mono()) {
@@ -314,7 +380,7 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 	}
 
 	if err := flush(); err != nil {
-		return dirFailed, err
+		return dirFailedWith("flush failed"), err
 	}
 	return dirDone, nil
 }

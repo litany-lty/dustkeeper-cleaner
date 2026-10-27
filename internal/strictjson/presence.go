@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 )
 
 // Shape is what kind of JSON value a field holds. It exists because binding a
@@ -108,6 +109,77 @@ func Require(presence map[string]Shape, fields []Field) error {
 type Field struct {
 	Path string
 	Only []Shape
+}
+
+// Allow rejects every member that the table does not name, using the *exact*
+// spelling the table uses.
+//
+// Require answers "the field I need is present". This answers "the field you sent
+// is one I know", and the two are not the same question because encoding/json
+// binds field names case-insensitively: a document carrying both "scope_id" and
+// "SCOPE_ID" satisfies Require, binds twice, and the second value wins. The same
+// hole let a model emit "Questions" instead of "questions": the struct bound it,
+// and a presence check that only looked for the lower-case spelling never saw it.
+//
+// The table is the same one Require uses, so presence and binding cannot describe
+// different documents.
+//
+// A path whose ancestor is named in the table and whose children the table does
+// not describe is allowed: "dsl" is an opaque object here, and its contents are
+// checked by the DSL's own contract rather than by this table.
+func Allow(presence map[string]Shape, fields []Field) error {
+	allowed := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
+		allowed[f.Path] = struct{}{}
+	}
+	// Sorted so the message is about the same field on every run; map order is
+	// not something a user should have to notice.
+	paths := make([]string, 0, len(presence))
+	for path := range presence {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		if _, ok := allowed[path]; ok {
+			continue
+		}
+		if opaqueParent(path, allowed) {
+			continue
+		}
+		return &Error{
+			Kind:   KindUnknown,
+			Detail: fmt.Sprintf("field %q is not part of this contract (names are case-sensitive)", path),
+		}
+	}
+	return nil
+}
+
+// opaqueParent reports whether path lives inside an object the table names but
+// does not describe.
+func opaqueParent(path string, allowed map[string]struct{}) bool {
+	for i := len(path) - 1; i > 0; i-- {
+		if path[i] != '.' {
+			continue
+		}
+		parent := path[:i]
+		if _, ok := allowed[parent]; !ok {
+			continue
+		}
+		// The parent is named. Is any of its children described?
+		prefix := parent + "."
+		described := false
+		for candidate := range allowed {
+			if len(candidate) > len(prefix) && candidate[:len(prefix)] == prefix {
+				described = true
+				break
+			}
+		}
+		if !described {
+			return true
+		}
+	}
+	return false
 }
 
 func joinShapes(shapes []Shape) string {

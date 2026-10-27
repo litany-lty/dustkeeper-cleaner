@@ -65,6 +65,21 @@ type envelope struct {
 	Reason    string           `json:"reason"`
 }
 
+// envelopeFields is the exact key set of a model answer.
+//
+// The names are case-sensitive here even though encoding/json would bind
+// "Questions" to the Questions field: the three variants are distinguished by
+// which fields are present, and a presence map that only knows lower-case keys
+// cannot see an upper-case one. A draft that carried "Questions" therefore lost
+// the questions the reviewer was supposed to answer, and a document carrying both
+// "scope_id" and "SCOPE_ID" bound twice with the last value winning.
+var envelopeFields = []strictjson.Field{
+	{Path: "kind", Only: []strictjson.Shape{strictjson.ShapeScalar}},
+	{Path: "dsl", Only: []strictjson.Shape{strictjson.ShapeObject}},
+	{Path: "questions", Only: []strictjson.Shape{strictjson.ShapeArray}},
+	{Path: "reason", Only: []strictjson.Shape{strictjson.ShapeScalar}},
+}
+
 // ParseDraft validates the model's answer under the strict contract.
 //
 // The three variants are mutually exclusive. A draft that also carries
@@ -90,6 +105,11 @@ func ParseDraft(raw []byte, allowedScopes map[string]bool) (Draft, error) {
 	if err != nil {
 		return Draft{}, errs.Newf(errs.CodeDSLInvalid,
 			"the model answer is not a strict JSON draft: %v", err)
+	}
+	// Presence and binding must describe the same document, so the key set is
+	// checked with the same table, in the exact spelling it uses.
+	if err := strictjson.Allow(presence, envelopeFields); err != nil {
+		return Draft{}, mapStrict(err)
 	}
 
 	switch env.Kind {

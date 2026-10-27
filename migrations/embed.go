@@ -20,6 +20,13 @@ var Schema001 string
 //go:embed 002.sql
 var Schema002 string
 
+// Schema003 lets the scan queue carry "failed" and remembers which directories an
+// epoch still has to prove, plus the ordering column that keeps one large
+// directory from starving the rest.
+//
+//go:embed 003.sql
+var Schema003 string
+
 // Step is one forward migration.
 type Step struct {
 	Version int
@@ -32,10 +39,11 @@ type Step struct {
 var Steps = []Step{
 	{Version: 1, SQL: Schema001, Note: "baseline"},
 	{Version: 2, SQL: Schema002, Note: "park phase, purge cursor index"},
+	{Version: 3, SQL: Schema003, Note: "failed scan dirs, claim order, interrupt count"},
 }
 
 // CurrentVersion is the schema version this binary writes and expects.
-const CurrentVersion = 2
+const CurrentVersion = 3
 
 // For returns the steps needed to move a database from `from` to
 // CurrentVersion.

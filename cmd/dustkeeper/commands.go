@@ -691,13 +691,19 @@ func cmdScan(ctx context.Context, a *app, args []string) (output, error) {
 			}
 			res.Code = errs.CodePartial
 		default:
+			// Not interrupted, and still not complete: directories the
+			// filesystem refused are queued, not retired.
 			res.Human = append(res.Human,
 				"  the queue drained but some directories could not be read; nothing was retired")
-			if st.FailedDirs > 0 {
-				res.Human = append(res.Human,
-					fmt.Sprintf("  unreadable directories: %d (the next epoch will try them again)", st.FailedDirs))
-			}
 			res.Code = errs.CodePartial
+		}
+		if scanState.FailedDirs > 0 {
+			res.Human = append(res.Human, fmt.Sprintf(
+				"  unreadable directories: %d (kept in the queue; a later batch retries them)", scanState.FailedDirs))
+		}
+		if scanState.Interrupts > 0 {
+			res.Human = append(res.Human, fmt.Sprintf(
+				"  consecutive unfinished batches for this scope: %d (cleared by a complete epoch)", scanState.Interrupts))
 		}
 		res.Next = []string{"dustkeeper rule preview --id <rule> --revision 1"}
 		return res, nil

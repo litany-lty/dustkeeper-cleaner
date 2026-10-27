@@ -160,10 +160,17 @@ UPDATE observations SET cached_hash=?, hash_token_json=? WHERE scope_id=? AND ra
 }
 
 // ScanQueueState reports the pending directory count for the current epoch.
+//
+// Pending counts every directory whose contents this epoch has not proven:
+// pending, active (a run was interrupted while holding it) and failed (a run
+// could not read it). Failed is included deliberately: an epoch that could not
+// read a directory must not be able to call itself complete, because completing
+// it retires every observation the epoch never saw.
 type ScanQueueState struct {
 	Epoch   int64
 	Pending int64
 	Done    int64
+	Failed  int64
 }
 
 // ScanQueueStateOf reads progress for one epoch.
@@ -185,6 +192,9 @@ SELECT status, COUNT(*) FROM scan_queue WHERE scope_id=? AND scan_epoch=? GROUP 
 		switch status {
 		case "pending", "active":
 			st.Pending += n
+		case "failed":
+			st.Pending += n
+			st.Failed = n
 		case "done":
 			st.Done = n
 		}
@@ -233,15 +243,36 @@ VALUES(?,?,?,'pending') ON CONFLICT(scope_id, scan_epoch, raw_relative_dir) DO N
 	})
 }
 
-// ClaimDirs takes up to limit pending directories and marks them active. A crash
-// leaves them active, which the next run requeues explicitly.
+// ClaimDirs takes up to limit directories and marks them active. A crash leaves
+// them active, which the next run requeues explicitly.
+//
+// Order is least-recently-claimed first, then path, with the rows that were never
+// really opened (NULL sequence) ahead of everything. Path order alone let one very
+// large directory consume the whole budget every round: it was claimed first,
+// interrupted, requeued, and claimed first again, so everything behind it in path
+// order never ran — for ever, because the epoch never advanced either.
+//
+// The sequence is assigned here, not read from the clock. A wall-clock column ties
+// every directory of one batch together, and ties fall back to path order, which is
+// the order that starved them: with a batch of [a, b, c] where a is interrupted,
+// the next round would begin at a again, every round.
+//
+// A failed directory is claimable again: the failure may have been a permission the
+// operator has since fixed.
 func (s *Store) ClaimDirs(ctx context.Context, scope domain.ScopeID, epoch int64, limit int) ([][]byte, error) {
 	var out [][]byte
 	err := s.write(ctx, func(tx *sql.Tx) error {
+		var next int64
+		if err := tx.QueryRowContext(ctx, `
+SELECT COALESCE(MAX(claim_seq), 0) + 1 FROM scan_queue WHERE scope_id=? AND scan_epoch=?`,
+			string(scope), epoch).Scan(&next); err != nil {
+			return errs.Wrap(errs.CodeDBError, err)
+		}
 		rows, err := tx.QueryContext(ctx, `
 SELECT raw_relative_dir FROM scan_queue
-WHERE scope_id=? AND scan_epoch=? AND status='pending'
-ORDER BY raw_relative_dir LIMIT ?`, string(scope), epoch, limit)
+WHERE scope_id=? AND scan_epoch=? AND status IN ('pending','failed')
+ORDER BY claim_seq IS NOT NULL, claim_seq, raw_relative_dir LIMIT ?`,
+			string(scope), epoch, limit)
 		if err != nil {
 			return errs.Wrap(errs.CodeDBError, err)
 		}
@@ -254,11 +285,12 @@ ORDER BY raw_relative_dir LIMIT ?`, string(scope), epoch, limit)
 			out = append(out, rel)
 		}
 		rows.Close()
-		for _, rel := range out {
+		nowNS := s.now()
+		for i, rel := range out {
 			if _, err := tx.ExecContext(ctx, `
-UPDATE scan_queue SET status='active'
+UPDATE scan_queue SET status='active', claim_seq=?, claimed_at_ns=?, attempts=attempts+1
 WHERE scope_id=? AND scan_epoch=? AND raw_relative_dir=?`,
-				string(scope), epoch, rel); err != nil {
+				next+int64(i), nowNS, string(scope), epoch, rel); err != nil {
 				return errs.Wrap(errs.CodeStateWriteFailed, err)
 			}
 		}
@@ -267,12 +299,101 @@ WHERE scope_id=? AND scan_epoch=? AND raw_relative_dir=?`,
 	return out, err
 }
 
+// ReleaseClaimed puts directories that were claimed ahead of an interruption back
+// to pending, without counting them as attempted.
+//
+// It is what makes the claim ordering mean something. A batch of eight directories
+// where the first one exhausts the budget would otherwise leave seven rows holding
+// a fresh sequence, so the next round would sort them behind the directory that was
+// actually interrupted — and the small directories behind a large one would still
+// wait for ever. Releasing them with no sequence says the truth: they were claimed,
+// nobody looked inside.
+func (s *Store) ReleaseClaimed(ctx context.Context, scope domain.ScopeID, epoch int64, dirs [][]byte) error {
+	if len(dirs) == 0 {
+		return nil
+	}
+	return s.write(ctx, func(tx *sql.Tx) error {
+		for _, rel := range dirs {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE scan_queue SET status='pending', claim_seq=NULL, claimed_at_ns=NULL
+WHERE scope_id=? AND scan_epoch=? AND raw_relative_dir=? AND status='active'`,
+				string(scope), epoch, rel); err != nil {
+				return errs.Wrap(errs.CodeStateWriteFailed, err)
+			}
+		}
+		return nil
+	})
+}
+
 // MarkDirDone retires a directory from the queue.
 func (s *Store) MarkDirDone(ctx context.Context, scope domain.ScopeID, epoch int64, rel []byte) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
-UPDATE scan_queue SET status='done' WHERE scope_id=? AND scan_epoch=? AND raw_relative_dir=?`,
+UPDATE scan_queue SET status='done', last_error=NULL
+WHERE scope_id=? AND scan_epoch=? AND raw_relative_dir=?`,
 			string(scope), epoch, rel)
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	})
+}
+
+// MarkDirFailed records that a directory could not be read, without retiring it.
+//
+// The row stays in the queue as 'failed', which keeps the epoch open and keeps its
+// observations from being retired as stale. The next round claims it again; when a
+// round finally reads it, MarkDirDone replaces this record.
+func (s *Store) MarkDirFailed(ctx context.Context, scope domain.ScopeID, epoch int64, rel []byte, reason string) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+UPDATE scan_queue SET status='failed', last_error=?
+WHERE scope_id=? AND scan_epoch=? AND raw_relative_dir=?`,
+			reason, string(scope), epoch, rel)
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	})
+}
+
+// FailedDirs lists the directories this epoch has not been able to read, so a
+// report can name them instead of counting them.
+func (s *Store) FailedDirs(ctx context.Context, scope domain.ScopeID, epoch int64) ([]string, error) {
+	rows, err := s.read(ctx, `
+SELECT raw_relative_dir FROM scan_queue
+WHERE scope_id=? AND scan_epoch=? AND status='failed' ORDER BY raw_relative_dir`,
+		string(scope), epoch)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var rel []byte
+		if err := rows.Scan(&rel); err != nil {
+			return nil, errs.Wrap(errs.CodeDBError, err)
+		}
+		out = append(out, string(rel))
+	}
+	return out, errs.Wrap(errs.CodeDBError, rows.Err())
+}
+
+// BumpScanInterrupts counts one more interrupted round for a scope and returns
+// the new value. It is the persistent half of "the last full pass did not
+// finish": the run that observed the interruption is gone by the next one.
+func (s *Store) BumpScanInterrupts(ctx context.Context, scope domain.ScopeID) (int64, error) {
+	var n int64
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE scopes SET scan_interrupts=scan_interrupts+1 WHERE scope_id=?", string(scope)); err != nil {
+			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		}
+		return errs.Wrap(errs.CodeDBError, tx.QueryRowContext(ctx,
+			"SELECT scan_interrupts FROM scopes WHERE scope_id=?", string(scope)).Scan(&n))
+	})
+	return n, err
+}
+
+// ResetScanInterrupts clears the counter after an epoch completed.
+func (s *Store) ResetScanInterrupts(ctx context.Context, scope domain.ScopeID) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			"UPDATE scopes SET scan_interrupts=0 WHERE scope_id=?", string(scope))
 		return errs.Wrap(errs.CodeStateWriteFailed, err)
 	})
 }
