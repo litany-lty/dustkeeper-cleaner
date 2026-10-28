@@ -30,6 +30,42 @@ var TestHookPreCompensateRename func()
 // several times fires it once.
 var TestHookDuringCompare func()
 
+// The two acceptance hooks bracket the window between "the file the plan
+// described was verified" and "the intent that acts on it committed". That
+// window is where a writer can touch the file after the check and before the
+// move, so a test that wants to prove the refusal has to act inside it.
+//
+// They clear themselves after the first call: a plan may hold several items, and
+// a test that set the hook once is describing one window, not every item.
+
+// TestHookBeforeStableRead runs between the comparison with the plan's recorded
+// identity and the stable read that produces the evidence for the manifest.
+var TestHookBeforeStableRead func()
+
+// TestHookBeforeAcceptance runs after the preparation manifest was written and
+// immediately before the last checks in front of the intent commit.
+var TestHookBeforeAcceptance func()
+
+// TestHookManifestDirSync fails the directory flush that follows the manifest
+// install. It is fault injection, not a crash boundary: the only way to reach
+// that branch is to make the flush fail, and it fails for nobody in particular.
+// Returning nil leaves the real flush to run.
+var TestHookManifestDirSync func() error
+
+func runBeforeStableReadHook() {
+	if f := TestHookBeforeStableRead; f != nil {
+		TestHookBeforeStableRead = nil
+		f()
+	}
+}
+
+func runBeforeAcceptanceHook() {
+	if f := TestHookBeforeAcceptance; f != nil {
+		TestHookBeforeAcceptance = nil
+		f()
+	}
+}
+
 func runDuringCompareHook() {
 	if f := TestHookDuringCompare; f != nil {
 		TestHookDuringCompare = nil

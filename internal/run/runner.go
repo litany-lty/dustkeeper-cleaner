@@ -118,6 +118,20 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	if err != nil {
 		return rep, err
 	}
+	// A reconciliation that could not write down what it decided has not
+	// finished, and it says so in RecordFailures rather than with a Go error.
+	// The objects are where that pass left them and their pending markers are
+	// intact, so planning new work on top of an unknown bookkeeping state is how
+	// a second attempt gets scheduled against a scope whose first outcome was
+	// never recorded. Read the counter, or the run calls itself a success.
+	bookkeepingBroken := rec.RecordFailures > 0
+	if bookkeepingBroken {
+		rep.Control = domain.ControlStopRun
+		rep.FailureCode = errs.CodeStateWriteFailed
+		rep.Failures = append(rep.Failures, fmt.Sprintf(
+			"reconcile: %d outcome(s) could not be recorded, so no scope was started; the objects were left as they are and their pending markers are intact",
+			rec.RecordFailures))
+	}
 
 	scopes, err := r.Store.ListScopes(ctx)
 	if err != nil {
@@ -129,7 +143,31 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	qLedger := domain.NewActionLedger(cfg.MaxAutoQuarantineFiles, cfg.MaxAutoQuarantineBytes)
 	pLedger := domain.NewActionLedger(cfg.MaxAutoPurgeFiles, cfg.MaxAutoPurgeBytes)
 
+	if bookkeepingBroken {
+		// Every schedulable scope is named, not silently omitted: a scheduler that
+		// sees no rows reads that as "nothing to do" rather than "the pass never
+		// started".
+		for _, sc := range ordered {
+			if sc.Kind == domain.KindReference {
+				continue
+			}
+			rep.Scopes = append(rep.Scopes, ScopeRun{
+				Scope:       sc.ID,
+				Control:     domain.ControlStopRun,
+				Skipped:     "reconciliation could not record its outcomes",
+				FailureCode: errs.CodeStateWriteFailed,
+			})
+			rep.UntouchedScopes++
+		}
+	}
+
 	for _, sc := range ordered {
+		// The guard sits at the top so that the loop below is byte-for-byte the
+		// normal path: one reason to start nothing new, and no second way to
+		// decide that a scope was skipped.
+		if bookkeepingBroken {
+			break
+		}
 		if ctx.Err() != nil {
 			rep.Control = domain.ControlStopRun
 			break
@@ -190,6 +228,13 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	}
 	// Recording the run is deliberately last: a run that could not finish its
 	// bookkeeping must not advance the trusted clock baseline.
+	//
+	// A failed pass in the sense of RecordFailures does not skip this, though.
+	// That pass still observed the wall clock, and an untrusted verdict has to be
+	// latched here - dropping the record because unrelated outcome writes failed
+	// would lose the anomaly and leave the next run free to start from a fresh
+	// baseline. What it may not do is call itself a success: that is FailureCode,
+	// which the CLI turns into a non-zero exit.
 	if err := guard.RecordRun(ctx, final); err != nil {
 		return rep, err
 	}

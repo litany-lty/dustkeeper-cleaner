@@ -366,8 +366,14 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 	}
 	expected := contract.ExpectedIdent
 
-	srcID, srcFound := statEntry(sc, it.RawRelative)
-	vaultID, vaultFound := statVault(sc, it.ObjectName)
+	srcID, srcFound, serr := statEntry(sc, it.RawRelative)
+	if serr != nil {
+		return r.recordFailure(ctx, po, out, "SOURCE_STAT_FAILED", serr)
+	}
+	vaultID, vaultFound, verr := statVault(sc, it.ObjectName)
+	if verr != nil {
+		return r.recordFailure(ctx, po, out, "VAULT_STAT_FAILED", verr)
+	}
 
 	switch {
 	case srcFound && !vaultFound:
@@ -404,12 +410,14 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 		//
 		// This branch used to write a plain hold. The consequence was a file the
 		// product could neither purge (no captured evidence) nor restore (no
-		// captured identity), preserved on disk but unreachable.
-		if why := r.holdCapturedObject(ctx, sc, po, out); why != "" {
-			out.Detail = "the vault holds an object that is not the planned one; " + why
-		} else {
-			out.Detail = "the vault holds an object that is not the planned one; its evidence was recorded so it can be restored"
+		// captured identity), preserved on disk but unreachable. It also used to
+		// end the operation when the object merely could not be opened for a
+		// moment; a read that failed is not a verdict, so that case parks and the
+		// next pass records the evidence.
+		if cerr := r.captureEvidence(ctx, sc, po); cerr != nil {
+			return r.recordFailure(ctx, po, out, "CAPTURE_EVIDENCE_UNREADABLE", cerr)
 		}
+		out.Detail = "the vault holds an object that is not the planned one; its evidence was recorded so it can be restored"
 		out.Outcome = "held"
 		if err := r.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld); err != nil {
 			out.RecordError = "the scope could not be marked held: " + err.Error()
@@ -438,29 +446,28 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 	}
 }
 
-// holdCapturedObject records a terminal hold together with the evidence of the
-// object that actually moved.
+// captureEvidence records the object that actually moved, together with the
+// evidence of what it is.
 //
 // The evidence is read from the object in the vault, never from the plan: the
 // plan describes what was expected, and repeating it here would produce a hold
-// whose "actual" record is a copy of the mistake. It returns a description of why
-// the evidence could not be read, or "" on success.
-func (r *Reconciler) holdCapturedObject(ctx context.Context, sc *execute.ScopeCtx,
-	po store.PendingOp, out Result) string {
+// whose "actual" record is a copy of the mistake. Every failure is returned as an
+// error with its own category, so the caller can park a temporary one instead of
+// ending an operation whose evidence simply could not be read yet.
+func (r *Reconciler) captureEvidence(ctx context.Context, sc *execute.ScopeCtx,
+	po store.PendingOp) error {
 
 	it := po.Item
 	objParent, err := sc.Objects.ParentOf(it.ObjectName)
 	if err != nil {
-		r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
-			"the vault object cannot be opened, so the object that moved cannot be described")
-		return "the object could not be opened"
+		return errs.Wrapf(errs.CodeAccessDenied, err,
+			"the vault object for %s cannot be opened, so the object that moved cannot be described", it.ID)
 	}
 	defer objParent.Close()
 	obj, err := fsops.OpenRegularAt(objParent, sc.RootDev)
 	if err != nil {
-		r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
-			"the vault object cannot be opened, so the object that moved cannot be described")
-		return "the object could not be opened"
+		return errs.Wrapf(errs.CodeAccessDenied, err,
+			"the vault object for %s cannot be opened, so the object that moved cannot be described", it.ID)
 	}
 	defer obj.Close()
 
@@ -470,9 +477,10 @@ func (r *Reconciler) holdCapturedObject(ctx context.Context, sc *execute.ScopeCt
 		quoteJSON(string(idJSON)) + `,"captured_token":` + quoteJSON(string(tokJSON)) + `}`
 	if err := r.Store.HoldIntentWithCapture(ctx, intentOf(po), "UNEXPECTED_VAULT_OBJECT",
 		payload, string(idJSON), string(tokJSON)); err != nil {
-		return "the evidence could not be recorded: " + err.Error()
+		return errs.Wrapf(errs.CodeStateWriteFailed, err,
+			"the evidence of the object that moved could not be recorded for %s", it.ID)
 	}
-	return ""
+	return nil
 }
 
 // completeQuarantine finishes a move that already happened.
@@ -497,12 +505,12 @@ func (r *Reconciler) completeQuarantine(ctx context.Context, sc *execute.ScopeCt
 	}
 	// The manifest is an independent record written before the move. A missing or
 	// damaged manifest means the two records cannot be cross-checked, which the
-	// review requires to be a refusal rather than a silent pass.
+	// review requires to be a refusal rather than a silent pass. A manifest that
+	// cannot be *read* is a third case: the file may be perfectly fine, so it is
+	// parked with its pending marker instead of ending the operation.
 	manifest, err := r.readManifest(sc, it.ObjectName)
 	if err != nil {
-		return "", errs.Newf(errs.CodeRecoveryRequired,
-			"the manifest for %s is missing or unreadable, so the move cannot be cross-checked: %v",
-			it.ID, err)
+		return "", err
 	}
 	if manifest.ObjectID != string(it.ID) {
 		return "", errs.Newf(errs.CodeRecoveryRequired,
@@ -606,15 +614,25 @@ func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx,
 	if cerr != nil {
 		return r.recordFailure(ctx, po, out, "RESTORE_CONTRACT_UNREADABLE", cerr)
 	}
-	backState := priorStateOf(contract, it)
+	// The state an aborted attempt returns to is read from the contract. When the
+	// contract predates that field there is no answer, and the old fallback -
+	// "it must have been quarantined" - is exactly how an object that was held
+	// came back purge-eligible.
+	backState, priorKnown := priorStateOf(contract)
 
 	captured, err := identityOf(ptrString(it.CapturedIdentityJSON))
 	if err != nil {
 		return r.recordFailure(ctx, po, out, "CAPTURED_IDENTITY_UNREADABLE", err)
 	}
 
-	destID, destFound := statEntry(sc, dest)
-	vaultID, vaultFound := statVault(sc, it.ObjectName)
+	destID, destFound, derr := statEntry(sc, dest)
+	if derr != nil {
+		return r.recordFailure(ctx, po, out, "DEST_STAT_FAILED", derr)
+	}
+	vaultID, vaultFound, verr := statVault(sc, it.ObjectName)
+	if verr != nil {
+		return r.recordFailure(ctx, po, out, "VAULT_STAT_FAILED", verr)
+	}
 
 	switch {
 	case destFound && destID.Equal(captured) && !vaultFound:
@@ -661,6 +679,10 @@ func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx,
 	case !destFound && vaultFound && vaultID.Equal(captured):
 		// The restore never happened. End the attempt and return the item to the
 		// state the contract says it came from: a hold stays a hold.
+		if !priorKnown {
+			return r.holdUnfixable(ctx, po, out, "PRIOR_STATE_UNKNOWN",
+				"the restore did not happen and its contract records no state to return to; the object stays in the vault and the item keeps its pending marker")
+		}
 		if err := r.Store.AbortIntent(ctx, intentOf(po), backState,
 			`{"source":"reconciled","result":"destination empty, object still in the vault","back_state":`+
 				quoteJSON(backState)+`}`); err != nil {
@@ -684,6 +706,22 @@ func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx,
 	}
 }
 
+// operationContract parses one operation's contract and checks the binding.
+//
+// Unlike restoreContract it has no legacy branch: the shapes it serves are the
+// ones this build writes, and a record that does not answer "what state did this
+// come from" is reported rather than guessed at.
+func (r *Reconciler) operationContract(po store.PendingOp) (plan.OperationContractV1, error) {
+	contract, err := plan.ParseContractFor(po.ContractJSON, po.Action)
+	if err != nil {
+		return contract, err
+	}
+	if err := checkContractBinding(po, contract); err != nil {
+		return contract, err
+	}
+	return contract, nil
+}
+
 // restoreContract reads what a restore-family operation needs: where the object
 // was going, and which state an aborted attempt returns to.
 //
@@ -705,9 +743,12 @@ func (r *Reconciler) restoreContract(po store.PendingOp) (*plan.OperationContrac
 
 	dest := po.Item.RawRelative
 	if legacy.RawRelativeB64 != "" {
-		if raw, err := decodeB64(legacy.RawRelativeB64); err == nil && len(raw) > 0 {
-			dest = raw
+		raw, err := decodeB64(legacy.RawRelativeB64)
+		if err != nil || len(raw) == 0 {
+			return nil, nil, errs.Newf(errs.CodeRecoveryRequired,
+				"the operation contract records a source path that is not valid base64: %v", err)
 		}
+		dest = raw
 	}
 	if legacy.BindingVersion == 0 {
 		// Pre-versioning record. The destination is the only field it can be
@@ -722,41 +763,90 @@ func (r *Reconciler) restoreContract(po store.PendingOp) (*plan.OperationContrac
 	if err != nil {
 		return nil, nil, err
 	}
-	if contract.RawRelativeB64 != "" {
-		if raw, berr := decodeB64(contract.RawRelativeB64); berr == nil && len(raw) > 0 {
-			dest = raw
-		}
+	if err := checkContractBinding(po, contract); err != nil {
+		return nil, nil, err
+	}
+	if raw, berr := decodeB64(contract.RawRelativeB64); berr == nil && len(raw) > 0 {
+		dest = raw
 	}
 	return &contract, dest, nil
 }
 
-// priorStateOf returns the state an aborted operation goes back to.
-func priorStateOf(contract *plan.OperationContractV1, it store.Item) string {
-	if contract != nil {
-		switch contract.PriorState {
-		case domain.StateQuarantined, domain.StateHeld, domain.StateUnknown:
-			return contract.PriorState
-		}
+// checkContractBinding verifies that the contract describes this pending
+// operation and not a neighbouring one.
+//
+// A contract is the only record of what was meant to happen, and reconciliation
+// compares it with the filesystem. A contract for another item, another scope or
+// another path would compare the wrong two things and still "succeed"; the review
+// asks for the binding to be checked before either branch consumes it.
+func checkContractBinding(po store.PendingOp, c plan.OperationContractV1) error {
+	if c.ItemID != string(po.Item.ID) {
+		return errs.Newf(errs.CodeRecoveryRequired,
+			"the contract names item %q, but the pending operation is for %q", c.ItemID, po.Item.ID)
 	}
-	// The item row is the fallback: it says where the operation started, and for
-	// a restore of a quarantined object that is the only sensible answer.
-	switch it.State {
-	case domain.StateRIntent, domain.StateQuarantined:
-		return domain.StateQuarantined
+	if c.ScopeID != string(po.Item.ScopeID) {
+		return errs.Newf(errs.CodeRecoveryRequired,
+			"the contract names scope %q, but the item belongs to %q", c.ScopeID, po.Item.ScopeID)
 	}
-	return domain.StateHeld
+	if c.ObjectName != po.Item.ObjectName {
+		return errs.Newf(errs.CodeRecoveryRequired,
+			"the contract names vault object %q, but the item is %q", c.ObjectName, po.Item.ObjectName)
+	}
+	raw, err := decodeB64(c.RawRelativeB64)
+	if err != nil || len(raw) == 0 {
+		return errs.Newf(errs.CodeRecoveryRequired,
+			"the contract records a source path that is not valid base64: %v", err)
+	}
+	if string(raw) != string(po.Item.RawRelative) {
+		return errs.Newf(errs.CodeRecoveryRequired,
+			"the contract names path %q, but the item is %q", string(raw), string(po.Item.RawRelative))
+	}
+	return nil
+}
+
+// priorStateOf returns the state an aborted operation goes back to, and whether
+// the record actually says.
+//
+// The item row is deliberately not consulted as a fallback. Its state at this
+// point is "an intent is open", which is the same for a restore of a quarantined
+// object and for a restore that started from a hold; deriving one from the other
+// is how a held object came back as "quarantined" and started down the purge path.
+func priorStateOf(contract *plan.OperationContractV1) (string, bool) {
+	if contract == nil {
+		return "", false
+	}
+	switch contract.PriorState {
+	case domain.StateQuarantined, domain.StateHeld, domain.StateUnknown:
+		return contract.PriorState, true
+	}
+	return "", false
 }
 
 // reconcilePurge implements the P_INTENT rows of the matrix.
+//
+// The contract is read and checked once, before the two branches, and both of them
+// consume that result. The previous version passed the error away with `_` and
+// only looked at the contract on the "object still there" branch, so a purge whose
+// contract was damaged or bound to another item could be recorded as
+// RECONCILED_ABSENT - a completion based on no evidence at all.
 func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
 	it := po.Item
 	out := Result{Item: it.ID, OpID: po.OpID, Action: "purge"}
+
+	contract, cerr := r.operationContract(po)
+	if cerr != nil {
+		return r.recordFailure(ctx, po, out, "PURGE_CONTRACT_UNREADABLE", cerr)
+	}
+	backState, priorKnown := priorStateOf(&contract)
 
 	captured, err := identityOf(ptrString(it.CapturedIdentityJSON))
 	if err != nil {
 		return r.recordFailure(ctx, po, out, "CAPTURED_IDENTITY_UNREADABLE", err)
 	}
-	vaultID, vaultFound := statVault(sc, it.ObjectName)
+	vaultID, vaultFound, verr := statVault(sc, it.ObjectName)
+	if verr != nil {
+		return r.recordFailure(ctx, po, out, "VAULT_STAT_FAILED", verr)
+	}
 
 	if vaultFound {
 		// The unlink did not happen (or did not take effect). Return the item to
@@ -766,13 +856,17 @@ func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, p
 			return r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
 				"the vault object is not the recorded object")
 		}
-		contract, _, _ := r.restoreContract(po)
-		if err := r.Store.AbortIntent(ctx, intentOf(po), priorStateOf(contract, it),
-			`{"source":"reconciled","result":"object still present, purge not confirmed"}`); err != nil {
+		if !priorKnown {
+			return r.holdUnfixable(ctx, po, out, "PRIOR_STATE_UNKNOWN",
+				"the purge did not happen and its contract records no state to return to; the object stays in the vault and the item keeps its pending marker")
+		}
+		if err := r.Store.AbortIntent(ctx, intentOf(po), backState,
+			`{"source":"reconciled","result":"object still present, purge not confirmed","back_state":`+
+				quoteJSON(backState)+`}`); err != nil {
 			return r.recordFailure(ctx, po, out, "ABORT_FAILED", err)
 		}
 		out.Outcome = "aborted"
-		out.Detail = "the purge did not happen; the object is still quarantined"
+		out.Detail = "the purge did not happen; the object is still in " + backState
 		return out
 	}
 
@@ -796,52 +890,76 @@ func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, p
 	return out
 }
 
+// readManifest reads the manifest of one vault object and classifies why it could
+// not be used.
+//
+// Three outcomes, three meanings: absent is a contradiction (the manifest is
+// written before the rename, so a moved object without one has lost its record),
+// unreadable JSON is a damaged record, and a read error is an environment problem
+// that may clear. Only the last one keeps the operation open; the first two are
+// verdicts and carry CodeRecoveryRequired, which the caller turns into a hold.
 func (r *Reconciler) readManifest(sc *execute.ScopeCtx, objectID string) (execute.ManifestV1, error) {
 	var m execute.ManifestV1
 	data, err := readManifestFile(sc, objectID)
 	if err != nil {
-		return m, err
+		if errors.Is(err, unix.ENOENT) {
+			return m, errs.Newf(errs.CodeRecoveryRequired,
+				"the object was moved but its manifest is gone, so the move cannot be cross-checked: %v", err)
+		}
+		return m, errs.Wrapf(errs.CodeIOError, err,
+			"the manifest could not be read; the completion is retried when it can be")
 	}
-	err = json.Unmarshal(data, &m)
-	return m, err
+	if err := json.Unmarshal(data, &m); err != nil {
+		return m, errs.Newf(errs.CodeRecoveryRequired,
+			"the manifest is not readable JSON: %v", err)
+	}
+	return m, nil
 }
 
 // statEntry reports whether rel exists, and its identity when it does.
-// A permission error is not "absent": it returns found=true with a zero identity
-// so the caller treats it as unexplainable rather than empty.
-func statEntry(sc *execute.ScopeCtx, rel []byte) (domain.FileIdentity, bool) {
+//
+// A permission or I/O error is not "absent" and it is not "present but odd"
+// either: it is "this was not checked". The previous shape returned found=true
+// with a zero identity, which turned an unavailable check into an identity
+// contradiction and let the caller record a verdict about a file nobody had
+// looked at. The third return value says so, and the caller parks instead.
+func statEntry(sc *execute.ScopeCtx, rel []byte) (domain.FileIdentity, bool, error) {
 	parent, err := sc.Root.OpenParent(rel)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
-			return domain.FileIdentity{}, false
+			return domain.FileIdentity{}, false, nil
 		}
-		return domain.FileIdentity{}, true
+		return domain.FileIdentity{}, false, errs.Wrap(errs.CodeAccessDenied, err)
 	}
 	defer parent.Close()
 	id, _, err := parent.StatAtNoFollow()
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
-			return domain.FileIdentity{}, false
+			return domain.FileIdentity{}, false, nil
 		}
-		return domain.FileIdentity{}, true
+		return domain.FileIdentity{}, false, errs.Wrap(errs.CodeAccessDenied, err)
 	}
-	return id, true
+	return id, true, nil
 }
 
-func statVault(sc *execute.ScopeCtx, name string) (domain.FileIdentity, bool) {
+// statVault is statEntry for the object inside the vault.
+func statVault(sc *execute.ScopeCtx, name string) (domain.FileIdentity, bool, error) {
 	parent, err := sc.Objects.ParentOf(name)
 	if err != nil {
-		return domain.FileIdentity{}, true
+		if errors.Is(err, unix.ENOENT) {
+			return domain.FileIdentity{}, false, nil
+		}
+		return domain.FileIdentity{}, false, errs.Wrap(errs.CodeAccessDenied, err)
 	}
 	defer parent.Close()
 	id, _, err := parent.StatAtNoFollow()
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
-			return domain.FileIdentity{}, false
+			return domain.FileIdentity{}, false, nil
 		}
-		return domain.FileIdentity{}, true
+		return domain.FileIdentity{}, false, errs.Wrap(errs.CodeAccessDenied, err)
 	}
-	return id, true
+	return id, true, nil
 }
 
 func intentOf(po store.PendingOp) store.Intent {

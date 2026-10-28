@@ -511,8 +511,13 @@ func TestWrongCaptureIsPutBackWithProtections(t *testing.T) {
 	if gerr != nil {
 		t.Fatalf("get item: %v", gerr)
 	}
-	if got.State != domain.StateHeld {
-		t.Fatalf("a wrong capture left the item %s", got.State)
+	// The compensation is a convergence, not a verdict: the object is back, the
+	// slot is protected, nothing is pending, so the item is restored. Leaving it
+	// held made it permanent - reconciliation only looks at pending rows, restore
+	// has no vault object left to work with, and the scope gate read the
+	// historical hold as unfinished work for ever.
+	if got.State != domain.StateRestored {
+		t.Fatalf("a compensated wrong capture left the item %s", got.State)
 	}
 	// The compensation ran, so the wrong object is back where it came from.
 	if data, rerr := os.ReadFile(srcPath); rerr != nil {

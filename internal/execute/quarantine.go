@@ -210,6 +210,7 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 
 	opt := e.VerifyOpt(src.Token.Size)
 	opt.Budget = budget
+	runBeforeStableReadHook()
 	preEv, err := ReadStable(src, opt)
 	if err != nil {
 		if errors.Is(err, ErrUnstableObject) {
@@ -228,6 +229,16 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	}
 	preHash := preEv.Content
 	metaHash := preEv.Metadata
+
+	// The read proved that the file did not change while it was being read. It
+	// did not prove that it read the file the plan described: between the
+	// comparison above and this read the object can have been replaced or
+	// touched, and everything below (the manifest, the contract, the move) would
+	// then describe a file that is no longer the eligible one.
+	if ok, why := sameStableObject(preEv.Identity, preEv.Token, preID, preTok); !ok {
+		return res, errs.Newf(errs.CodePlanStale,
+			"%q changed before it could be accepted (%s); nothing was moved", it.RawRelative, why)
+	}
 
 	manifest := ManifestV1{
 		FormatVersion:    1,
@@ -315,6 +326,23 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 
 	// The pause check and the intent commit share one critical section, so a
 	// pause either lands before this item is accepted or after it converges.
+	//
+	// Before it, the same evidence the manifest was built from is re-read once
+	// more. A writer that only touches the file changes ctime without changing
+	// identity or content, so the identity-and-token comparison before the rename
+	// would let it through - and a file touched a second ago no longer satisfies
+	// the age condition the plan approved. Failure here abandons the preparation,
+	// so the manifest this call wrote does not block the next attempt.
+	runBeforeAcceptanceHook()
+	if err := ConfirmUnchanged(src, preEv); err != nil {
+		return res, e.abandonPreparation(sc, it, changedAfterVerification(it.RawRelative, err))
+	}
+	// The volume the bytes are about to land on is asked again here, at the last
+	// point where the answer can still stop the move. The earlier check can be
+	// minutes old by the time a large file has been hashed twice.
+	if err := e.checkQuarantineSpace(sc); err != nil {
+		return res, e.abandonPreparation(sc, it, err)
+	}
 	if err := e.Gate.CheckAndCommit(func() error { return e.Store.BeginIntent(ctx, intent) }); err != nil {
 		return res, e.abandonPreparation(sc, it, err)
 	}
@@ -495,8 +523,14 @@ func (e *Executor) miscapture(ctx context.Context, sc *ScopeCtx, it store.Item,
 
 	compensated, detail := e.tryCompensate(ctx, sc, it, obj)
 	if compensated {
+		// The object is back in its slot and the slot is protected, so the item
+		// is no longer an open question: it is restored. Leaving it `held` with
+		// no pending marker made it permanent - reconciliation only looks at
+		// pending rows, restore needs a vault object that is gone, and the scope
+		// gate treated the historical hold as unfinished work for ever.
+		res.State = domain.StateRestored
 		res.Code = string(errs.CodeHeld)
-		res.Message = "the wrong object was captured and has been put back; the scope is held"
+		res.Message = "the wrong object was captured and has been put back; the scope needs re-approval before new work"
 	} else {
 		res.Code = string(errs.CodeHeld)
 		res.Message = "the wrong object was captured; nothing was overwritten and the captured object can be restored explicitly"
@@ -629,14 +663,25 @@ func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Ite
 		}
 	}
 
-	// The attempt ends where it started: held. A compensated miscapture never
-	// regains purge eligibility on its own.
-	if err := e.Store.AbortIntent(ctx, comp, domain.StateHeld,
-		`{"source":"compensated","result":"original slot restored; item remains held"}`); err != nil {
+	// The attempt ends where the file is: back in place. "Restored" is the state
+	// that says so - the object has been verified at its destination and the
+	// destination carries a protection record - and it is what lets the scope
+	// work again once its status has been re-approved. It still never regains
+	// purge eligibility on its own: a restored item is not purge-eligible.
+	if err := e.Store.AbortIntent(ctx, comp, domain.StateRestored,
+		`{"source":"compensated","result":"original slot restored; item settled as restored"}`); err != nil {
 		return false, "the object was put back but the record could not be closed; reconcile will finish it"
 	}
 	if err := e.Store.ReleaseItemKeeperPin(ctx, it.ID); err != nil {
 		return true, "put back, but the keeper pin could not be released: " + err.Error()
+	}
+	// The scope was marked held when the miscapture was detected. The reason for
+	// that hold is gone - the wrong object is back, its slot is protected, and
+	// nothing is pending - so it becomes "needs re-approval" rather than staying
+	// held, which `scope resume` refuses to clear.
+	if err := e.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeNeedsReapproval); err != nil {
+		return true, "put back, but the scope status could not be updated (" + err.Error() +
+			"); it stays held until the status write succeeds"
 	}
 	return true, "put back"
 }

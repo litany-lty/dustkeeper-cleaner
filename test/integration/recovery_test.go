@@ -35,9 +35,16 @@ type crashFixture struct {
 // stageCrashedQuarantine builds a durable manifest, a committed intent and an
 // already-moved file, then lets the caller adjust the records before they land.
 func (e *env) stageCrashedQuarantine(t *testing.T, adjust func(*crashFixture)) *crashFixture {
+	return e.stageCrashedQuarantineAt(t, "a.zip", adjust)
+}
+
+// stageCrashedQuarantineAt is stageCrashedQuarantine with a chosen relative path,
+// so a case that needs the object to live in a subdirectory - "the source parent
+// cannot even be opened" - does not have to rebuild the fixture.
+func (e *env) stageCrashedQuarantineAt(t *testing.T, rel string, adjust func(*crashFixture)) *crashFixture {
 	t.Helper()
 	sc := e.addScope("exports", domain.KindManagedDisposable)
-	e.writeFile("exports", "a.zip", "payload", 40*24*time.Hour)
+	e.writeFile("exports", rel, "payload", 40*24*time.Hour)
 	e.scan(sc.ID)
 	r := e.rule(sc.ID, "rule-1", []string{"*.zip"}, nil, 30*24*time.Hour, 30*24*time.Hour)
 	res := e.planFor(sc, r, 100)
@@ -66,7 +73,7 @@ func (e *env) stageCrashedQuarantine(t *testing.T, adjust func(*crashFixture)) *
 		item:          it,
 		plan:          &res.Plan,
 		sctx:          sctx,
-		srcPath:       filepath.Join(e.base, "trees", "exports", "a.zip"),
+		srcPath:       filepath.Join(e.base, "trees", "exports", rel),
 		vaultRaw:      filepath.Join(e.base, "trees", "exports", ".dustkeeper", "objects", it.ObjectName),
 		writeManifest: true,
 		manifest: execute.ManifestV1{

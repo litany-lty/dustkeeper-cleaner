@@ -56,6 +56,20 @@ func (e *Executor) checkQuarantineSpace(sc *ScopeCtx) error {
 	return nil
 }
 
+// changedAfterVerification turns the last-moment "the object changed" refusal
+// into a plan-level answer.
+//
+// The check itself reports HELD because it is about an object that no longer
+// matches its evidence. At this point in the quarantine nothing has moved, so the
+// honest conclusion is the same one an unstable read produces: the plan no longer
+// describes the file, and the next scan plans it again. Stopping the whole scope
+// would be a heavier statement than the facts support.
+func changedAfterVerification(rel []byte, cause error) error {
+	return errs.Newf(errs.CodePlanStale,
+		"%q changed between verification and acceptance (%v); nothing was moved, and the preparation record was withdrawn so a fresh scan can plan it again",
+		rel, cause)
+}
+
 // abandonPreparation undoes the only durable thing a refused quarantine wrote:
 // its own manifest. The payload was never touched, so there is nothing else to
 // undo, and the next attempt is not blocked by a leftover preparation record.

@@ -155,6 +155,15 @@ type ManifestV1 struct {
 
 // WriteManifest persists a manifest: write to a private temp file, fsync it,
 // install it without replacing anything, then fsync the directory.
+//
+// The two failure points after the rename are different facts and are reported as
+// such. Before the rename nothing is installed, so removing the temp file leaves
+// the vault exactly as it was. After the rename the manifest *is* installed - and
+// because RenameNoReplace cannot have replaced anything, it is certainly the one
+// this call wrote - so a failure to flush the directory withdraws it again. The
+// alternative was a plan that could never be retried: the caller returned the
+// error without an intent, reconciliation had no pending row to converge, and the
+// next attempt of the same plan met EEXIST for ever.
 func (c *ScopeCtx) WriteManifest(m ManifestV1) error {
 	body, err := json.Marshal(m)
 	if err != nil {
@@ -180,10 +189,20 @@ func (c *ScopeCtx) WriteManifest(m ManifestV1) error {
 	}
 
 	if err := fsops.RenameNoReplace(c.Tmp, tmpName, c.Manifests, name); err != nil {
+		// Nothing was installed. A temp file left behind is ours and unused, and
+		// removing it is best effort: the install failed, which is what the
+		// caller has to hear about.
+		_ = fsops.UnlinkAt(c.Tmp, tmpName)
 		return errs.Wrap(errs.CodeStateWriteFailed, err)
 	}
-	if err := fsops.DurableDir(c.Manifests); err != nil {
-		return errs.Wrap(errs.CodeDurabilityFailed, err)
+	if err := durableManifestsDir(c.Manifests); err != nil {
+		if rerr := c.RemoveManifest(m.ObjectID); rerr != nil {
+			return errs.Wrapf(errs.CodeDurabilityFailed, err,
+				"the manifest was installed but the directory could not be flushed (%v); withdrawing it also failed (%v), so it was left in place and will block a retry of the same plan",
+				err, rerr)
+		}
+		return errs.Wrapf(errs.CodeDurabilityFailed, err,
+			"the manifest directory could not be flushed; this attempt's manifest was withdrawn, so the same plan can be retried")
 	}
 	return nil
 }
@@ -191,6 +210,23 @@ func (c *ScopeCtx) WriteManifest(m ManifestV1) error {
 // manifestPath is used by reporting; it never drives an action.
 func manifestPath(root string, objectID string) string {
 	return filepath.Join(root, domain.VaultManifests, objectID+".json")
+}
+
+// durableManifestsDir flushes the manifest directory, with one fault-injection
+// seam in front of the real call.
+//
+// The branch that withdraws a manifest after a failed flush is the only place
+// that repairs "installed but not durable", and a real directory flush does not
+// fail on demand. A test asks for the failure here; production never sets it, and
+// a hook that returns nil still performs the flush.
+func durableManifestsDir(dir *fsops.Dir) error {
+	if h := TestHookManifestDirSync; h != nil {
+		TestHookManifestDirSync = nil
+		if err := h(); err != nil {
+			return err
+		}
+	}
+	return fsops.DurableDir(dir)
 }
 
 // RemoveManifest deletes one object's manifest and flushes the directory.
