@@ -11,7 +11,7 @@
 ## 1. FINAL 状态表
 
 本轮五个提交：F1 `50c9df3`（去重/adopt 退出）、F2 `1c7b1ec`（启用原子化）、F3 `754a21d`（执行闭环）、
-F4 `0f9a371`（扫描/日志/盘点如实）、F5（两个原生目标发布 + 文档收口，提交号见 `git log -1 --oneline`）。
+F4 `0f9a371`（扫描/日志/盘点如实）、F5 `82c29ee`（两个原生目标发布 + 文档收口）。
 
 | ID | 验收组 | 判定 | 证据（commit / 命令 / 结果） |
 |---|---|---|---|
@@ -80,7 +80,7 @@ release is incomplete: linux-amd64 produced no acceptable artifact
 
 | 制品 | checksum | 本机真实执行过的动作 | 源码测试能证明的 |
 |---|---|---|---|
-| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=77f2f13bd12f977beba0796fab7734ba143673534cbbc501bcd8a75213b78f9a`（`commit=0f9a371`） | `version`；临时目录内 `init → scope add → scan → rule import → rule preview → rule activate → plan create → plan apply → quarantine list → quarantine restore`，并核对文件回到原位 | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、日志与盘点拒绝 |
+| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=5f365a463b9caa9f7694f8f323f8b6debed12749deed33993124627ca592cf0b`（`commit=82c29ee`） | `version`；临时目录内 `init → scope add → scan → rule import → rule preview → rule activate → plan create → plan apply → quarantine list → quarantine restore`，并核对文件回到原位 | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、日志与盘点拒绝 |
 | `dustkeeper-1.0.0-phase1-linux-amd64` | 本机未产出（见 §2） | 无 | 同上（同源测试在 linux 容器里通过） |
 
 这张表的作用是防止一种常见夸大：源码测试通过不等于"每个 checksum 都跑过 Q/R"。

@@ -141,7 +141,7 @@ scope / plan / object ID。退出码：`0` 成功（含「无候选」）、`2` 
 
 | 目标 | 构建入口 | 本机验证到哪一步 |
 |---|---|---|
-| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | 产物 `sha256=77f2f13b…78f9a`；`version` 与临时目录内 Q/R 冒烟在本机真实执行通过 |
+| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | 产物 `sha256=5f365a46…2cf0b`；`version` 与临时目录内 Q/R 冒烟在本机真实执行通过 |
 | `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | 制品在本机构建，`readelf` 复核 x86-64、无 PT_INTERP、无 DT_NEEDED；Q/R 冒烟需原生 x86_64 宿主，见下 |
 
 `build.sh` 是单目标构建：它在**它所在的那台机器上**编译，产物架构从产物本身读回来，不接受 GOOS/GOARCH 覆盖。
