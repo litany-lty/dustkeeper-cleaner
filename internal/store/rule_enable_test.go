@@ -386,3 +386,115 @@ func itemRow(t *testing.T, s *Store, id domain.ItemID) map[string]string {
 	}
 	return out
 }
+
+// legacyActiveGrant inserts an active row the way an older build could: straight
+// into the table, bypassing the replacement rule. It exists to describe a state
+// that is already on disk, not to describe how this build writes.
+func legacyActiveGrant(t *testing.T, f enableFixture, id domain.GrantID, capability string,
+	digest domain.Digest, approvedAt int64) {
+
+	t.Helper()
+	if _, err := f.Store.db.Exec(`
+INSERT INTO grants(grant_id, scope_id, rule_id, rule_revision, capability,
+                   binding_json, digest, status, approved_at_ns)
+VALUES(?,?,?,?,?,?,?, 'active', ?)`,
+		string(id), string(enableScopeID), string(enableRuleID), enableRuleRev,
+		capability, `{"legacy":true}`, string(digest), approvedAt); err != nil {
+		t.Fatalf("insert a legacy grant: %v", err)
+	}
+}
+
+// TestSlimOneActiveGrantPerCapability is D01: the approval the user confirmed last
+// is the one that is active. Two active grants for one capability are refused
+// rather than resolved by whichever row a query returns first.
+func TestSlimOneActiveGrantPerCapability(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a smaller approval retires the larger one", func(t *testing.T) {
+		f := newEnableFixture(t)
+		big := purgeGrant("grant_p100")
+		big.Digest = domain.Digest("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		if _, err := f.Store.ReplaceGrant(ctx, big); err != nil {
+			t.Fatalf("grant the larger ceiling: %v", err)
+		}
+		small := purgeGrant("grant_p10")
+		small.Digest = domain.Digest("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+		kept, err := f.Store.ReplaceGrant(ctx, small)
+		if err != nil {
+			t.Fatalf("grant the smaller ceiling: %v", err)
+		}
+		if kept.ID != "grant_p10" {
+			t.Fatalf("the smaller approval came back as %s", kept.ID)
+		}
+		old, err := f.Store.GetGrant(ctx, "grant_p100")
+		if err != nil {
+			t.Fatalf("GetGrant: %v", err)
+		}
+		if old.Status != domain.GrantRevoked {
+			t.Fatalf("the superseded grant is %s; confirming 10 files must not leave 100 in force", old.Status)
+		}
+		if n := countGrants(t, f, domain.CapAutoPurge, domain.GrantActive); n != 1 {
+			t.Fatalf("%d active purge grants after the smaller approval, want 1", n)
+		}
+		active, err := f.Store.ActiveGrant(ctx, enableScopeID, enableRuleID, enableRuleRev, domain.CapAutoPurge)
+		if err != nil {
+			t.Fatalf("ActiveGrant: %v", err)
+		}
+		if active.ID != "grant_p10" {
+			t.Fatalf("the active purge grant is %s, want the one just confirmed", active.ID)
+		}
+	})
+
+	t.Run("reusing an identical approval retires a leftover row", func(t *testing.T) {
+		f := newEnableFixture(t)
+		if _, err := f.Store.EnableRule(ctx, f.request(quarantineGrant("grant_q"))); err != nil {
+			t.Fatalf("enable: %v", err)
+		}
+		// An older build could leave a second active row with the same digest.
+		legacyActiveGrant(t, f, "grant_q_old", domain.CapAutoQuarantine, enableGrantHash, 1)
+		if n := countGrants(t, f, domain.CapAutoQuarantine, domain.GrantActive); n != 2 {
+			t.Fatalf("setup produced %d active grants, want 2", n)
+		}
+
+		// Confirming the same screen again reuses the existing approval; the row
+		// it did not choose must not stay active beside it.
+		if _, err := f.Store.EnableRule(ctx, f.request(quarantineGrant(""))); err != nil {
+			t.Fatalf("re-enable: %v", err)
+		}
+		if n := countGrants(t, f, domain.CapAutoQuarantine, domain.GrantActive); n != 1 {
+			t.Fatalf("%d active quarantine grants after the retry, want 1", n)
+		}
+	})
+
+	t.Run("two active grants are refused, not picked", func(t *testing.T) {
+		f := newEnableFixture(t)
+		legacyActiveGrant(t, f, "grant_a", domain.CapAutoPurge, enablePurgeHash, 1)
+		other := domain.Digest("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+		legacyActiveGrant(t, f, "grant_b", domain.CapAutoPurge, other, 2)
+
+		got, err := f.Store.ActiveGrant(ctx, enableScopeID, enableRuleID, enableRuleRev, domain.CapAutoPurge)
+		if err == nil {
+			t.Fatalf("an ambiguous pair was resolved to %s", got.ID)
+		}
+		if code := errs.CodeOf(err); code != errs.CodeGrantRequired {
+			t.Fatalf("code = %s, want %s", code, errs.CodeGrantRequired)
+		}
+		if !strings.Contains(err.Error(), "grant_a") || !strings.Contains(err.Error(), "grant_b") {
+			t.Fatalf("the refusal does not name both rows: %v", err)
+		}
+	})
+
+	t.Run("a single active grant still resolves", func(t *testing.T) {
+		f := newEnableFixture(t)
+		if _, err := f.Store.EnableRule(ctx, f.request(quarantineGrant("grant_q"))); err != nil {
+			t.Fatalf("enable: %v", err)
+		}
+		got, err := f.Store.ActiveGrant(ctx, enableScopeID, enableRuleID, enableRuleRev, domain.CapAutoQuarantine)
+		if err != nil {
+			t.Fatalf("ActiveGrant: %v", err)
+		}
+		if got.ID != "grant_q" {
+			t.Fatalf("ActiveGrant returned %s", got.ID)
+		}
+	})
+}

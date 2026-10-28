@@ -196,16 +196,31 @@ func revokeUnselectedTx(ctx context.Context, tx *sql.Tx, req EnableRuleRequest) 
 	return nil
 }
 
-// keepOrInsertGrantTx reuses the id of an identical active grant, and creates a
-// new one otherwise.
+// keepOrInsertGrantTx installs one selected capability inside the enable
+// transaction. It delegates to replaceGrantTx so that the enable path and the
+// single-capability authorize path cannot disagree about what "one active grant"
+// means.
+func keepOrInsertGrantTx(ctx context.Context, tx *sql.Tx, g Grant) (Grant, error) {
+	return replaceGrantTx(ctx, tx, g)
+}
+
+// replaceGrantTx leaves exactly one active grant for one capability.
+//
+// The order matters and used to be wrong: the identical-approval case returned
+// before the loop that retires the other active grants, so an earlier, larger
+// approval stayed active next to the one the user had just confirmed. The
+// replacement now happens first and the reuse happens afterwards, which makes
+// "keep the id I already have" and "retire what I replaced" the same transaction
+// rather than two branches one of which skipped the retirement.
 //
 // Only `active` counts. A revoked grant stays revoked even when the same
 // capability is approved again with identical numbers: reviving the old id would
 // make "which approval is this object running under" unanswerable, because the
 // old id was recorded on objects that were stopped by the revocation.
-func keepOrInsertGrantTx(ctx context.Context, tx *sql.Tx, g Grant) (Grant, error) {
+func replaceGrantTx(ctx context.Context, tx *sql.Tx, g Grant) (Grant, error) {
 	rows, err := tx.QueryContext(ctx, "SELECT "+grantColumns+
-		" FROM grants WHERE rule_id=? AND rule_revision=? AND capability=? AND status='active'",
+		" FROM grants WHERE rule_id=? AND rule_revision=? AND capability=? AND status='active'"+
+		" ORDER BY approved_at_ns, grant_id",
 		string(g.RuleID), g.RuleRevision, g.Capability)
 	if err != nil {
 		return Grant{}, errs.Wrap(errs.CodeDBError, err)
@@ -225,19 +240,31 @@ func keepOrInsertGrantTx(ctx context.Context, tx *sql.Tx, g Grant) (Grant, error
 	}
 	rows.Close()
 
+	// The same approval, already active. Keep its identity and its original
+	// approval time - a retry must not look like a fresh grant - and retire any
+	// other active row for this capability, which is what an older build could
+	// leave behind.
 	for _, existing := range actives {
-		if existing.Digest == g.Digest {
-			// The same approval, already active. Keep its identity and its original
-			// approval time: a retry must not look like a fresh grant.
-			return existing, nil
+		if existing.Digest != g.Digest {
+			continue
 		}
+		for _, other := range actives {
+			if other.ID == existing.ID {
+				continue
+			}
+			if err := revokeGrantTx(ctx, tx, other.ID); err != nil {
+				return Grant{}, err
+			}
+		}
+		return existing, nil
 	}
-	// Any other active grant for this capability is stale - it was granted for a
-	// different ceiling or binding - and goes away in the same transaction.
+
+	// A different approval replaces every active grant of this capability: it was
+	// granted for a different ceiling or binding, and keeping it would leave the
+	// authority the user did not just confirm in place.
 	for _, existing := range actives {
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE grants SET status='revoked' WHERE grant_id=?", string(existing.ID)); err != nil {
-			return Grant{}, errs.Wrap(errs.CodeStateWriteFailed, err)
+		if err := revokeGrantTx(ctx, tx, existing.ID); err != nil {
+			return Grant{}, err
 		}
 	}
 
@@ -254,6 +281,15 @@ func keepOrInsertGrantTx(ctx context.Context, tx *sql.Tx, g Grant) (Grant, error
 		return Grant{}, err
 	}
 	return g, nil
+}
+
+// revokeGrantTx retires one grant row.
+func revokeGrantTx(ctx context.Context, tx *sql.Tx, id domain.GrantID) error {
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE grants SET status='revoked' WHERE grant_id=?", string(id)); err != nil {
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	return nil
 }
 
 // grantIDTaken reports whether a grant id is already in use, whatever its

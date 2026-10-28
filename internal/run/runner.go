@@ -635,11 +635,20 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 		if rule.Status != domain.RuleActive {
 			continue
 		}
-		qg, err := r.Store.ActiveGrant(ctx, sc.Scope.ID, rule.ID, rule.Revision, domain.CapAutoQuarantine)
-		if err != nil {
-			continue
+		// No active grant is "no authority" and skips this rule. Anything else -
+		// including the ambiguous multiple-active-grant refusal - is a state this
+		// scope cannot act on, so it stops instead of being skipped silently.
+		qg, qerr := r.Store.ActiveGrant(ctx, sc.Scope.ID, rule.ID, rule.Revision, domain.CapAutoQuarantine)
+		if qerr != nil {
+			if errs.CodeOf(qerr) == errs.CodeGrantRequired {
+				continue
+			}
+			return total, bytes, domain.ControlStopScope, qerr
 		}
 		pg, pgErr := r.Store.ActiveGrant(ctx, sc.Scope.ID, rule.ID, rule.Revision, domain.CapAutoPurge)
+		if pgErr != nil && errs.CodeOf(pgErr) != errs.CodeGrantRequired {
+			return total, bytes, domain.ControlStopScope, pgErr
+		}
 
 		// The rule's own grant and the run's shared ledger both apply. Taking
 		// only the grant let two rules each spend the configured maximum.

@@ -585,7 +585,14 @@ func ruleAuthorize(ctx context.Context, a *app, args []string) (output, error) {
 		return output{}, err
 	}
 
+	// An identical approval that is already active is reported, not re-written.
+	// Anything other than "there is no active grant" is an error: two active
+	// grants for one capability means the authority is ambiguous, and picking one
+	// here would answer "which approval does this run use" by accident.
 	existing, gerr := a.store.ActiveGrant(ctx, sc.ID, r.ID, r.Revision, capability)
+	if gerr != nil && errs.CodeOf(gerr) != errs.CodeGrantRequired {
+		return output{}, gerr
+	}
 	if gerr == nil && existing.Digest == grantDigest {
 		out := ok()
 		out.ScopeID = string(sc.ID)
@@ -647,14 +654,18 @@ func ruleAuthorize(ctx context.Context, a *app, args []string) (output, error) {
 		Status:       domain.GrantActive,
 		ApprovedAtNS: a.clock.Wall().UnixNano(),
 	}
-	if err := a.store.InsertGrant(ctx, grant); err != nil {
+	// The store retires whatever approval this one replaces, in the same
+	// transaction. Authorising a smaller ceiling must not leave the larger one
+	// active beside it.
+	stored, err := a.store.ReplaceGrant(ctx, grant)
+	if err != nil {
 		return output{}, err
 	}
 
 	out := ok()
 	out.ScopeID = string(sc.ID)
 	out.Data = map[string]any{
-		"grant_id":   string(grant.ID),
+		"grant_id":   string(stored.ID),
 		"capability": capability,
 		"digest":     string(grantDigest),
 		"max_files":  files,
@@ -662,7 +673,7 @@ func ruleAuthorize(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	out.Human = []string{
 		fmt.Sprintf("granted %s for rule %s revision %d", capability, r.ID, r.Revision),
-		"  grant: " + string(grant.ID),
+		"  grant: " + string(stored.ID),
 	}
 	if capability == domain.CapAutoPurge {
 		out.Human = append(out.Human, "  permanent deletion still requires the retention window to elapse and a fresh verification")

@@ -238,12 +238,35 @@ type Grant struct {
 	ApprovedAtNS int64
 }
 
-// InsertGrant stores a new grant. The three authority switches stay separate:
-// scope mutability, auto quarantine and auto purge.
+// InsertGrant stores a new grant and retires the ones it replaces.
+//
+// "Stores a grant" used to mean exactly that: an insert. Two commands could then
+// leave two active grants for the same capability - one approval for 100 files
+// and a later one for 10 - and "what did the user last approve" had two answers.
+// The write now goes through the same replacement helper the enable transaction
+// uses (see replaceGrantTx), so one capability has at most one active grant.
 func (s *Store) InsertGrant(ctx context.Context, g Grant) error {
-	return s.write(ctx, func(tx *sql.Tx) error {
-		return insertGrantTx(ctx, tx, g)
+	_, err := s.ReplaceGrant(ctx, g)
+	return err
+}
+
+// ReplaceGrant installs one capability and returns the grant that is active
+// afterwards, which is not necessarily the one passed in: an identical approval
+// that is already active keeps its identity and its original approval time.
+func (s *Store) ReplaceGrant(ctx context.Context, g Grant) (Grant, error) {
+	var out Grant
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		kept, err := replaceGrantTx(ctx, tx, g)
+		if err != nil {
+			return err
+		}
+		out = kept
+		return nil
 	})
+	if err != nil {
+		return Grant{}, err
+	}
+	return out, nil
 }
 
 func insertGrantTx(ctx context.Context, tx *sql.Tx, g Grant) error {
@@ -289,19 +312,46 @@ func (s *Store) GetGrant(ctx context.Context, id domain.GrantID) (Grant, error) 
 
 // ActiveGrant returns the active grant for one capability, or a GRANT_REQUIRED
 // error. Callers must treat absence as "no authority", never as "default".
+//
+// More than one active grant for the same capability is not a tie to break: it
+// means two approvals exist for one action, and whichever row a SELECT happened
+// to return first would become the authority the object runs under. The rows are
+// therefore read in full and a second one is refused rather than picked.
 func (s *Store) ActiveGrant(ctx context.Context, scope domain.ScopeID, rule domain.RuleID, rev int64, capability string) (Grant, error) {
 	rows, err := s.read(ctx, "SELECT "+grantColumns+` FROM grants
-WHERE scope_id=? AND rule_id=? AND rule_revision=? AND capability=? AND status='active'`,
+WHERE scope_id=? AND rule_id=? AND rule_revision=? AND capability=? AND status='active'
+ORDER BY approved_at_ns, grant_id`,
 		string(scope), string(rule), rev, capability)
 	if err != nil {
 		return Grant{}, err
 	}
 	defer rows.Close()
-	if !rows.Next() {
+	var found []Grant
+	for rows.Next() {
+		g, serr := scanGrant(rows)
+		if serr != nil {
+			return Grant{}, errs.Wrap(errs.CodeDBError, serr)
+		}
+		found = append(found, g)
+	}
+	if err := rows.Err(); err != nil {
+		return Grant{}, errs.Wrap(errs.CodeDBError, err)
+	}
+	switch len(found) {
+	case 0:
 		return Grant{}, errs.Newf(errs.CodeGrantRequired,
 			"no active %s grant for rule %s revision %d", capability, rule, rev)
+	case 1:
+		return found[0], nil
+	default:
+		ids := make([]string, 0, len(found))
+		for _, g := range found {
+			ids = append(ids, string(g.ID))
+		}
+		return Grant{}, errs.Newf(errs.CodeGrantRequired,
+			"%d active %s grants exist for rule %s revision %d (%v); the authority is ambiguous, so no action is taken - re-enable the rule to keep exactly the approval that was last confirmed",
+			len(found), capability, rule, rev, ids)
 	}
-	return scanGrant(rows)
 }
 
 // SetGrantStatus changes a grant's state.

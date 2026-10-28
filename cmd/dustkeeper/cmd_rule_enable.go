@@ -129,6 +129,7 @@ func ruleEnable(ctx context.Context, a *app, args []string) (output, error) {
 			}
 			out.Human = []string{
 				fmt.Sprintf("enable rule %s revision %d on scope %s (%s)", r.ID, r.Revision, sc.ID, sc.Kind),
+				"  root:             " + displayPathBytes(sc.RawRoot),
 				"  mode:             " + enableModeLabel(*mode),
 				"  rule digest:      " + string(r.Digest),
 				fmt.Sprintf("  retention:        %d seconds (%d days)", parsed.RetentionSeconds, parsed.RetentionSeconds/86400),
@@ -138,8 +139,31 @@ func ruleEnable(ctx context.Context, a *app, args []string) (output, error) {
 					g.Capability, g.ApprovedMaxFiles, g.ApprovedMaxLogicalBytes))
 			}
 			out.Human = append(out.Human,
+				"  what the rule matches:",
+			)
+			for _, line := range parsed.Explain() {
+				out.Human = append(out.Human, "    "+line)
+			}
+			out.Human = append(out.Human,
 				"  effective ceiling is the smaller of these and the local configuration; zero forbids the action",
 				fmt.Sprintf("  candidates:       %d match(es)%s", matched, truncationNote(truncated)),
+			)
+			// The sample is the same bounded list the JSON carries. Printing the
+			// count without it made the screen say "the files listed above" while
+			// listing nothing.
+			const humanSample = 5
+			for i, item := range sample {
+				if i >= humanSample {
+					out.Human = append(out.Human, fmt.Sprintf("    ... %d more not shown", len(sample)-humanSample))
+					break
+				}
+				rel, _ := item["relative_path"].(string)
+				out.Human = append(out.Human, "    "+rel)
+			}
+			if len(sample) == 0 {
+				out.Human = append(out.Human, "    (no file currently matches)")
+			}
+			out.Human = append(out.Human,
 				scanCompletenessNote(complete, scanState),
 				"",
 				"this approves the rule and its permissions for future matches, not the files listed above",
@@ -147,17 +171,14 @@ func ruleEnable(ctx context.Context, a *app, args []string) (output, error) {
 				"enable digest (repeat it to commit):",
 				"  "+string(enableDigest),
 			)
-			out.Next = []string{
-				fmt.Sprintf("dustkeeper rule enable --id %s --revision %d --mode %s --digest %s",
-					r.ID, r.Revision, *mode, enableDigest),
-			}
+			out.Next = []string{enableConfirmCommand(r, *mode, ceilings, string(enableDigest))}
 			return out, nil
 		}
 
 		if domain.Digest(*digest) != enableDigest {
 			return output{}, errs.Newf(errs.CodePlanStale,
-				"the enable digest does not match the current rule and scope state; run `dustkeeper rule enable --id %s --revision %d --mode %s` again (current digest %s)",
-				r.ID, r.Revision, *mode, enableDigest)
+				"the enable digest does not match the current rule and scope state; run `%s` again (current digest %s)",
+				enableConfirmCommand(r, *mode, ceilings, ""), enableDigest)
 		}
 
 		rbJSON, err := json.Marshal(rb)
@@ -188,8 +209,8 @@ func ruleEnable(ctx context.Context, a *app, args []string) (output, error) {
 				"capability": g.Capability,
 				"status":     g.Status,
 				"digest":     string(g.Digest),
-				"max_files":  ceilingOf(ceilings, g.Capability).files,
-				"max_bytes":  ceilingOf(ceilings, g.Capability).bytes,
+				"max_files":  ceilingOf(ceilings, g.Capability).Files,
+				"max_bytes":  ceilingOf(ceilings, g.Capability).Bytes,
 			})
 		}
 		out.Data = map[string]any{
@@ -206,7 +227,7 @@ func ruleEnable(ctx context.Context, a *app, args []string) (output, error) {
 		}
 		for _, g := range stored {
 			out.Human = append(out.Human, fmt.Sprintf("  %s grant: %s (%d file(s), %d bytes)",
-				g.Capability, g.ID, ceilingOf(ceilings, g.Capability).files, ceilingOf(ceilings, g.Capability).bytes))
+				g.Capability, g.ID, ceilingOf(ceilings, g.Capability).Files, ceilingOf(ceilings, g.Capability).Bytes))
 		}
 		out.Human = append(out.Human,
 			"  objects already isolated keep their own approval; this enable does not reach back to them")
@@ -215,9 +236,37 @@ func ruleEnable(ctx context.Context, a *app, args []string) (output, error) {
 	})
 }
 
-type enableCeiling struct {
-	files int
-	bytes int64
+// Ceiling is the approved allowance for one capability, as shown and as stored.
+//
+// The fields are exported with JSON tags because the preview prints them: an
+// unexported struct encoded to `{}` per capability, which read as "no ceiling
+// was approved" in a screen whose whole purpose is to show the numbers.
+type Ceiling struct {
+	Files int   `json:"files"`
+	Bytes int64 `json:"bytes"`
+}
+
+// enableConfirmCommand builds the command that commits exactly the screen the
+// user just read, ceilings included.
+//
+// The omissions this replaces were a real failure of the normal path: a preview
+// with `--purge-max-files 10` printed a follow-up command without that flag, so
+// copying it recomputed the digest with the configured default and the commit was
+// refused as stale. The numbers are therefore always passed explicitly; passing a
+// ceiling that happens to equal the default produces the same digest.
+func enableConfirmCommand(r store.Rule, mode string, ceilings map[string]Ceiling, digest string) string {
+	cmd := fmt.Sprintf("dustkeeper rule enable --id %s --revision %d --mode %s",
+		r.ID, r.Revision, mode)
+	if c, ok := ceilings[domain.CapAutoQuarantine]; ok {
+		cmd += fmt.Sprintf(" --max-files %d --max-bytes %d", c.Files, c.Bytes)
+	}
+	if c, ok := ceilings[domain.CapAutoPurge]; ok {
+		cmd += fmt.Sprintf(" --purge-max-files %d --purge-max-bytes %d", c.Files, c.Bytes)
+	}
+	if digest != "" {
+		cmd += " --digest " + digest
+	}
+	return cmd
 }
 
 // enableGrants builds the selected capabilities with their own ceilings.
@@ -228,7 +277,7 @@ type enableCeiling struct {
 // is a different action with a different risk.
 func enableGrants(a *app, sc store.Scope, r store.Rule, rb plan.ReviewBindingV1, parsed *rules.Rule,
 	mode string, maxFiles int, maxBytes int64, purgeFiles int, purgeBytes int64,
-) ([]plan.GrantBindingV1, []store.Grant, map[string]enableCeiling, error) {
+) ([]plan.GrantBindingV1, []store.Grant, map[string]Ceiling, error) {
 
 	capabilities := []string{domain.CapAutoQuarantine}
 	if mode == enableModeCleanup {
@@ -237,7 +286,7 @@ func enableGrants(a *app, sc store.Scope, r store.Rule, rb plan.ReviewBindingV1,
 
 	bindings := make([]plan.GrantBindingV1, 0, len(capabilities))
 	rows := make([]store.Grant, 0, len(capabilities))
-	ceilings := make(map[string]enableCeiling, len(capabilities))
+	ceilings := make(map[string]Ceiling, len(capabilities))
 	nowNS := a.clock.Wall().UnixNano()
 
 	for _, capability := range capabilities {
@@ -259,7 +308,7 @@ func enableGrants(a *app, sc store.Scope, r store.Rule, rb plan.ReviewBindingV1,
 			return nil, nil, nil, errs.Wrap(errs.CodeStateWriteFailed, err)
 		}
 		bindings = append(bindings, gb)
-		ceilings[capability] = enableCeiling{files: files, bytes: bytes}
+		ceilings[capability] = Ceiling{Files: files, Bytes: bytes}
 		rows = append(rows, store.Grant{
 			ScopeID:      sc.ID,
 			RuleID:       r.ID,
@@ -388,6 +437,6 @@ func truncationNote(truncated bool) string {
 	return ""
 }
 
-func ceilingOf(ceilings map[string]enableCeiling, capability string) enableCeiling {
+func ceilingOf(ceilings map[string]Ceiling, capability string) Ceiling {
 	return ceilings[capability]
 }
