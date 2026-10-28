@@ -26,7 +26,7 @@ F4 `0f9a371`（扫描/日志/盘点如实）、F5 `82c29ee`（两个原生目标
 | A09 | 故障可收敛 | 部分 | 已有：`TestReconcileRetriesEveryActionUntilTheScopeIsFree`（临时故障连续两轮不终结，解除后完成）、`TestReconcileCompletesACrashedQuarantine`（中断恢复）、`TestCrashDiscoveredMiscaptureRecordsTheActualObject`、`TestWrongCaptureIsPutBackWithProtections`、`TestCompensationCrashReturnsToTheHold`、`TestSlimTwoPurgeRoutesAgree`（同一初始状态下 `purge apply` 与 `plan apply` 逐字段相同）。**未覆盖**：Q/R/P 各自"系统调用成功后注入同步/complete 失败"的完整矩阵——`internal/testkit` 故障注入点仍不存在，现有用例只在现有协议点上手工插入中断。按最终计划 §6.4-1 的口径，这一组只能算部分。 |
 | A10 | 扫描完整性诚实 | 通过 | F4 `0f9a371`：`TestSlimIncompleteScanKeepsTheEpochOpen`（去掉 `unverifiedCount > 0` 分支后报 "an entry that could not be inspected completed the epoch"）、`TestSlimVanishedEntryIsNotAFailure`（ENOENT 只记 vanished，目录照常完成）、`TestSlimIncompleteScopeStartsNoAutomaticQuarantine`（去掉 `!scanState.Complete` 分支后报 "collected 2 objects"）、`TestAFailedDirectoryCannotCompleteTheEpochOrRetireItsOwnObservations`。 |
 | A11 | 诊断不修改他人文件、不虚报缺失 | 通过 | F4 `0f9a371`：`internal/diag` 六个拒绝用例（symlink / FIFO / 宽权限 / 硬链 / 目录 / 设备，全部 `ErrNotPrivate` 且原对象字节与 mode 不变）+ `TestAPrivateLogIsCreatedAndStillRotates`；`internal/rescue`：`TestSlimRescueEntryLevelUnverified`、`TestSlimRescueDirectoryLevelUnverified`（回退成 `read` 即报 `object_state="read", want "partial"`）、`TestSlimRescuePartialManifestsDoNotBecomeOrphans`、`TestAnUnreadableObjectsDirectoryDoesNotClaimTheObjectsAreGone`。 |
-| A12 | 有限发布证据 | 部分 | `darwin-arm64`：本机发布件 + checksum + `version` + 临时目录内 Q/R 冒烟全部真实执行（§3）。`linux-amd64`：本机构建成功、`readelf` 复核 x86-64/无 `PT_INTERP`/无 `DT_NEEDED`，但 Q/R 冒烟在本机运行时无法执行（amd64 容器在 arm64 宿主经 Rosetta 运行，`openat2` 返回 `ENOSYS`），因此**本机不产出该制品，也不宣称它跑过**；该目标的执行证据需要原生 x86_64 宿主，CI 的 `ubuntu-latest` job 就是为此写的（`.github/workflows/ci.yml`，构建前先断言 runner 实际架构等于声明目标）。10 万文件扫描完成性成立：wall 39.6 s、峰值 RSS 30.8 MiB ≤ 256 MiB（§2）。模型固定语料**未验收**：本机没有获准端点，`test/eval` 保持 skip，不以 skip 当通过。 |
+| A12 | 有限发布证据 | 部分 | 两个目标都有本轮 checksum 与真实执行记录（§3）：`darwin-arm64` 在本机产出并冒烟；`linux-amd64` 在 CI 的原生 x86_64 runner 上产出并冒烟（`gh run 40642359982`，两 job 均 success）。两个平台的 `build`/`vet`/`test`/`race` 分别在本机与 CI 跑过，CI 每个 job 构建前先断言 runner 实际架构等于声明目标。10 万文件扫描完成性成立：wall 39.6 s、峰值 RSS 30.8 MiB ≤ 256 MiB（§2）。**仍差一项**：真实模型的固定语料报告——本机没有获准端点，`test/eval` 保持 skip，不以 skip 当通过，因此这一组记部分。 |
 
 结论：12 组里 **9 组通过、2 组部分（A09、A12）、0 组未验收**；A09 的部分是故障注入矩阵未建，
 A12 的部分是 `linux-amd64` 的执行证据不在本机。这两条都写在这里，不用"结构齐全"顶替。
@@ -74,17 +74,41 @@ release is incomplete: linux-amd64 produced no acceptable artifact
 这是设计的结果，不是被吞掉的失败：构建、`version`、ELF 复核都通过，冒烟跑不动就整轮失败，
 `dist/` 里不留下这个目标任何产物（`fail_target` 会删掉半成品）。原因已定位到运行时而非制品：
 同一镜像在原生 arm64 容器里 `openat2` 正常（`errno=18 EXDEV` 是路径跨挂载的预期返回），
-在 amd64 容器里是 `errno=38 ENOSYS`。
+在 amd64 容器里是 `errno=38 ENOSYS`（arm64 宿主上的 Rosetta）。
+
+### 2.1 同一个脚本在原生 x86_64 上：CI（`gh run 40642359982`）
+
+`ubuntu-latest`（x86_64）跑 `./build/build-linux-release.sh` 的结果，两个 job 均 success：
+
+```
+digest: sha256:88750ccd…daf9d9   (固定 builder 镜像)
+go:   go version go1.26.10 linux/amd64
+musl: x86_64-linux-gnu-gcc (Debian 12.2.0-14+deb12u1) 12.2.0
+dustkeeper-1.0.0-phase1-linux-amd64: machine=Advanced Micro Devices X86-64 interp=0 needed=0
+linux_libc=musl-static
+target=linux-amd64 format=elf arch=amd64 linkage=static toolchain=x86_64-linux-gnu
+  compiler=musl-gcc musl_evidence=/usr/include/x86_64-linux-musl
+  artifact=[format=elf machine=amd64 linkage=static interp=none needed=0]
+target=linux-amd64 smoke=ok smoke_output="dustkeeper 1.0.0-phase1 (linux/amd64, SQLite 3.53.4, commit d823542)"
+target=linux-amd64 smoke_qr=ok flow="init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore"
+sha256=1fa83ce4e35553b07d37e273e501abf4515f27855fb1ac2448e4ae066633ffd6
+dustkeeper-1.0.0-phase1-linux-amd64 sha256=1fa83ce4…ffd6 (matches the manifest)
+```
+
+这套门禁第一次跑就抓到两个真问题，两个都修了而不是绕开：容器内 `go build ./build/verify-artifact`
+因 VCS stamping 退出 128（挂载点属另一个 uid，git 拒绝该仓库）；以及制品 `version` 当时显示
+`commit unknown`（同一个 git 拒绝让 `git rev-parse` 落空）。前者补 `-buildvcs=false`，后者只把
+`/src` 加进容器内的 `safe.directory`——commit 仍由 git 给出，不由调用方注入。
 
 ## 3. 制品执行过哪些动作（与源码测试分开记录）
 
-| 制品 | checksum | 本机真实执行过的动作 | 源码测试能证明的 |
+| 制品 | checksum | 在哪里、真实执行过什么 | 源码测试能证明的 |
 |---|---|---|---|
-| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=5f365a463b9caa9f7694f8f323f8b6debed12749deed33993124627ca592cf0b`（`commit=82c29ee`） | `version`；临时目录内 `init → scope add → scan → rule import → rule preview → rule activate → plan create → plan apply → quarantine list → quarantine restore`，并核对文件回到原位 | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、日志与盘点拒绝 |
-| `dustkeeper-1.0.0-phase1-linux-amd64` | 本机未产出（见 §2） | 无 | 同上（同源测试在 linux 容器里通过） |
+| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=5f365a463b9caa9f7694f8f323f8b6debed12749deed33993124627ca592cf0b`（`commit=82c29ee`） | 本机（darwin/arm64）：`version`；临时目录内 `init → scope add → scan → rule import → rule preview → rule activate → plan create → plan apply → quarantine list → quarantine restore`，并核对文件回到原位 | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、日志与盘点拒绝 |
+| `dustkeeper-1.0.0-phase1-linux-amd64` | `sha256=1fa83ce4e35553b07d37e273e501abf4515f27855fb1ac2448e4ae066633ffd6`（`commit=d823542`） | CI 的 `ubuntu-latest`（x86_64）容器内，同一串动作 + `readelf` 断言 X86-64 / `interp=0` / `needed=0` | 同上（同一套源码测试在 linux 容器 ext4 上 18 包 ok） |
 
 这张表的作用是防止一种常见夸大：源码测试通过不等于"每个 checksum 都跑过 Q/R"。
-本机只有一个 checksum 真的跑过冒烟，另一个连制品都没有产出，两者都不写成"已验证"。
+两个 checksum 各自在一个能执行它的环境里跑过完整 Q/R，本机不能执行的那个不在本机宣称。
 
 ## 4. 历史记录：第三轮核对（2026-10-26）
 

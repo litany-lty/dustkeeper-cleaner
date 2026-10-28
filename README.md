@@ -8,8 +8,8 @@
 
 一期是一个 Go + 原生 SQLite 的可执行文件：无常驻进程、无后台模型、不依赖 Python/Java。
 
-> **状态：FINAL-1.0 收口完成，`darwin-arm64` 已本机验收；`linux-amd64` 的制品在本机构建并做了 ELF 复核，
-> 但它的 Q/R 冒烟需要原生 x86_64 环境（见「支持平台」），不在本机宣称通过。**
+> **状态：FINAL-1.0 收口完成。`darwin-arm64` 在开发机上产出并冒烟验收；`linux-amd64` 在 CI 的原生
+> x86_64 runner 上产出并冒烟（这台 arm64 机器不能执行它，见「支持平台」）。模型能力仍未验收。**
 > 逐条结论见 [`docs/compliance.md`](docs/compliance.md) 的 FINAL 状态表（A01–A12）。
 > 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
 
@@ -142,15 +142,15 @@ scope / plan / object ID。退出码：`0` 成功（含「无候选」）、`2` 
 | 目标 | 构建入口 | 本机验证到哪一步 |
 |---|---|---|
 | `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | 产物 `sha256=5f365a46…2cf0b`；`version` 与临时目录内 Q/R 冒烟在本机真实执行通过 |
-| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | 制品在本机构建，`readelf` 复核 x86-64、无 PT_INTERP、无 DT_NEEDED；Q/R 冒烟需原生 x86_64 宿主，见下 |
+| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | 由 CI 的 `ubuntu-latest`（x86_64）产出：`readelf` 复核 X86-64 / `interp=0` / `needed=0`，`version` 与临时目录内 Q/R 冒烟通过，`sha256=1fa83ce4…ffd6` |
 
 `build.sh` 是单目标构建：它在**它所在的那台机器上**编译，产物架构从产物本身读回来，不接受 GOOS/GOARCH 覆盖。
 一台不是发布目标的机器仍然能做开发构建，但产物不会被叫作受支持，也不会写发布清单。
 
 `linux-amd64` 的制品必须在能真正执行它的环境里冒烟：本实现用 `openat2` 解析路径、用 `renameat2` 移动文件，
-而在 arm64 机器上以模拟方式跑 amd64 容器时 `openat2` 返回 `ENOSYS`（Rosetta），冒烟会失败并如实报出这个原因。
-因此 linux 发布件由原生 x86_64 宿主产出：那台机器自己，或 CI 的 `ubuntu-latest`（见 `.github/workflows/ci.yml`，
-它在构建前先断言 runner 的实际架构就是本次声明的目标）。
+而在 arm64 机器上以模拟方式跑 amd64 容器时 `openat2` 返回 `ENOSYS`（Rosetta），冒烟会失败并如实报出这个原因——
+开发机上因此不产出该目标的制品（也不留半成品）。它由原生 x86_64 宿主产出：CI 的 `ubuntu-latest`
+（见 `.github/workflows/ci.yml`，构建前先断言 runner 的实际架构就是本次声明的目标）。
 
 构建脚本会记录它自己看到的事实：目标、Go 与 musl 版本、编译器 triple、`musl_evidence`、产物头信息、
 checksum、这份制品实际跑过哪些动作。发布清单来自这些事实，不来自常量。
