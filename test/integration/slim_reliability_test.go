@@ -289,18 +289,24 @@ func TestAnUnreadableVaultObjectParksTheCapture(t *testing.T) {
 // found=true with a zero identity, which fell through to the branch that completes
 // a quarantine - a completion decided without looking at the source at all.
 func TestASourceThatCannotBeStattedIsNotTreatedAsPresent(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode bits do not deny access")
+	}
 	ctx := context.Background()
 	e := newEnv(t)
 	f := e.stageCrashedQuarantineAt(t, "sub/a.zip", nil)
 	e.closeScopeCtxs()
 
+	// The directory still opens - that only needs search permission on its
+	// parent - but the entry inside it cannot be examined, because "sub" itself
+	// lost its search bit. That is "this was not checked", not "the file is not
+	// there"; the old code wrote it down as "present with no identity", which fell
+	// through to the branch that completes a quarantine.
 	sub := filepath.Join(e.base, "trees", "exports", "sub")
-	if err := os.Rename(sub, sub+".moved"); err != nil {
-		t.Fatalf("move the source directory aside: %v", err)
+	if err := os.Chmod(sub, 0o600); err != nil {
+		t.Fatalf("chmod the source directory: %v", err)
 	}
-	if err := os.WriteFile(sub, []byte("not a directory"), 0o644); err != nil {
-		t.Fatalf("replace the source directory with a file: %v", err)
-	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o755) })
 
 	rep, err := e.rec.Run(ctx)
 	if err != nil {
