@@ -382,6 +382,11 @@ func rulePreview(ctx context.Context, a *app, args []string) (output, error) {
 		Config:   a.cfg,
 		NowNS:    a.clock.Wall().UnixNano(),
 		DryRun:   true,
+		// The plan compares the same ancestry the executor will compare, so a
+		// preview cannot offer an object the run would refuse.
+		AncestorsOf: func(dir string) ([]domain.FileIdentity, error) {
+			return execute.AncestorIdentities(sctx, []byte(dir))
+		},
 	})
 	if err != nil {
 		return output{}, err

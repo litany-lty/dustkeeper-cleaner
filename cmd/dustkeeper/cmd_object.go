@@ -747,10 +747,21 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			for _, r := range rep.Results {
 				out.Human = append(out.Human, fmt.Sprintf("  %-28s %-8s %-10s %s", r.Item, r.Action, r.Outcome, r.Detail))
 			}
-			if len(rep.Scopes) > 0 {
-				out.Human = append(out.Human, "  scopes held: "+fmt.Sprint(rep.Scopes))
+			if len(rep.BlockedScopes) > 0 {
+				out.Human = append(out.Human, "  scopes blocked from new work: "+fmt.Sprint(rep.BlockedScopes))
+			}
+			if rep.RecordFailures > 0 {
+				// A pass that could not write down what it decided has not
+				// finished, whatever the other counters say.
+				out.Human = append(out.Human,
+					fmt.Sprintf("  %d outcome(s) could not be recorded; the items keep their pending marker", rep.RecordFailures))
 			}
 			switch {
+			case rep.RecordFailures > 0:
+				out.Code = errs.CodeStateWriteFailed
+				out.Status = string(errs.StatusOf(errs.CodeStateWriteFailed))
+				out.Message = "some outcomes could not be recorded; the objects were left as they are and the pending markers are intact"
+				out.Next = []string{"dustkeeper recover reconcile"}
 			case rep.Held > 0:
 				// A hold is a verdict: nothing is retried, so the operator needs
 				// to be told what the exits are.

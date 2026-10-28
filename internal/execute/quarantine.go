@@ -411,14 +411,27 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 // hold freezes an item after the namespace changed but the outcome could not be
 // verified, or after a state that cannot be explained. A held item never becomes
 // purge-eligible automatically.
+//
+// A failure to write the hold is returned, not swallowed. The item keeps its
+// pending marker either way, so the difference the caller sees is whether the
+// verdict was recorded or whether the operation is still open - and reporting
+// "held" for the second case would tell an operator that a decision exists when
+// none was written.
 func (e *Executor) hold(ctx context.Context, in store.Intent, code string, cause error) error {
 	detail := ""
 	if cause != nil {
 		detail = cause.Error()
 	}
 	payload := `{"hold_code":` + quoteJSON(code) + `,"detail":` + quoteJSON(detail) + `,"source":"observed"}`
-	_ = e.Store.HoldIntent(ctx, in, code, payload)
-	_ = e.Store.SetHoldCode(ctx, in.ItemID, code)
+	if err := e.Store.HoldIntent(ctx, in, code, payload); err != nil {
+		return errs.Newf(errs.CodeStateWriteFailed,
+			"item %s could not be recorded as held (%s): %v; the operation stays pending for `recover reconcile`",
+			in.ItemID, code, err)
+	}
+	if err := e.Store.SetHoldCode(ctx, in.ItemID, code); err != nil {
+		return errs.Newf(errs.CodeStateWriteFailed,
+			"item %s is on hold (%s) but the hold code could not be stored: %v", in.ItemID, code, err)
+	}
 	return errs.Newf(errs.CodeHeld, "item %s is on hold: %s", in.ItemID, code)
 }
 
@@ -435,7 +448,11 @@ func (e *Executor) park(ctx context.Context, in store.Intent, code string, cause
 	}
 	payload := `{"hold_code":` + quoteJSON(code) + `,"detail":` + quoteJSON(detail) +
 		`,"source":"observed","after_move":true,"pending":true}`
-	_ = e.Store.ParkIntent(ctx, in, code, payload)
+	if err := e.Store.ParkIntent(ctx, in, code, payload); err != nil {
+		return errs.Newf(errs.CodeStateWriteFailed,
+			"item %s moved but could not be recorded as parked (%s): %v; the operation stays pending for `recover reconcile`",
+			in.ItemID, code, err)
+	}
 	return errs.Newf(errs.CodeHeld,
 		"item %s moved but its outcome could not be proven (%s); run recover reconcile", in.ItemID, code)
 }
@@ -460,9 +477,21 @@ func (e *Executor) miscapture(ctx context.Context, sc *ScopeCtx, it store.Item,
 	tokJSON, _ := json.Marshal(obj.Token)
 	payload := `{"hold_code":"MISCAPTURE","captured_identity":` + quoteJSON(string(actualJSON)) +
 		`,"captured_token":` + quoteJSON(string(tokJSON)) + `,"source":"observed"}`
-	_ = e.Store.HoldIntentWithCapture(ctx, in, "MISCAPTURE", payload,
-		string(actualJSON), string(tokJSON))
-	_ = e.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld)
+	// The evidence of the object that actually moved is written before anything
+	// else, and a failure to write it is returned as a storage failure: the
+	// object sits in the vault with no product path back, which is worse than a
+	// hold whose reason is merely recorded.
+	if err := e.Store.HoldIntentWithCapture(ctx, in, "MISCAPTURE", payload,
+		string(actualJSON), string(tokJSON)); err != nil {
+		return res, errs.Newf(errs.CodeStateWriteFailed,
+			"item %s: the object at that path was not the planned object, and the evidence of what did move could not be recorded: %v",
+			it.ID, err)
+	}
+	if err := e.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld); err != nil {
+		return res, errs.Newf(errs.CodeStateWriteFailed,
+			"item %s: the wrong object was captured and its evidence was recorded, but the scope could not be marked held: %v",
+			it.ID, err)
+	}
 
 	compensated, detail := e.tryCompensate(ctx, sc, it, obj)
 	if compensated {
@@ -565,8 +594,11 @@ func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Ite
 	}
 	runCompensateHook()
 	if err := fsops.RenameNoReplace(sc.Objects, it.ObjectName, parent, parent.Name()); err != nil {
-		_ = e.Store.AbortIntent(ctx, comp, domain.StateHeld,
-			`{"source":"observed","reason":"compensation rename failed"}`)
+		if aerr := e.Store.AbortIntent(ctx, comp, domain.StateHeld,
+			`{"source":"observed","reason":"compensation rename failed"}`); aerr != nil {
+			return false, "the compensation move failed and the attempt could not be closed (" +
+				aerr.Error() + "); reconcile will finish it"
+		}
 		return false, "the compensation move failed; the captured object stays in the vault"
 	}
 
@@ -603,7 +635,9 @@ func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Ite
 		`{"source":"compensated","result":"original slot restored; item remains held"}`); err != nil {
 		return false, "the object was put back but the record could not be closed; reconcile will finish it"
 	}
-	_ = e.Store.ReleaseItemKeeperPin(ctx, it.ID)
+	if err := e.Store.ReleaseItemKeeperPin(ctx, it.ID); err != nil {
+		return true, "put back, but the keeper pin could not be released: " + err.Error()
+	}
 	return true, "put back"
 }
 

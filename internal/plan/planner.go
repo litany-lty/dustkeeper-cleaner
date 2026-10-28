@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"dustkeeper/internal/config"
@@ -37,6 +38,21 @@ type RulePlanRequest struct {
 	QuarantineGrant *store.Grant
 	PurgeGrant      *store.Grant
 	Config          config.Config
+	// AncestorsOf returns the identity of a directory and of every directory
+	// above it, nearest first, read through the scope's verified descriptors.
+	//
+	// The observation index records only the immediate parent, which is enough
+	// for an exact protection and for a subtree protection spelled the same way.
+	// It is not enough for a subtree protection several levels up whose spelling
+	// differs from the one the scan produced - on a case-insensitive volume those
+	// are one directory, and only the kernel can say so. The caller supplies the
+	// walk because only it holds the scope's descriptors; a plan package that
+	// opened its own would be deciding which directory it is looking at.
+	//
+	// A nil function keeps the older behaviour (compare the recorded parent
+	// only); an error means the ancestry cannot be inspected at all, which makes
+	// the object ineligible rather than unprotected.
+	AncestorsOf func(dir string) ([]domain.FileIdentity, error)
 	// NowNS is the evaluation instant. File age is always measured from the
 	// start of the scan batch, not from some later moment.
 	NowNS int64
@@ -81,6 +97,26 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 		ordinal int
 	)
 
+	// The ancestry of a candidate depends only on the directory that holds it, so
+	// one walk serves every file in that directory. Without the cache a large
+	// tree would be walked once per file.
+	type ancestry struct {
+		ids []domain.FileIdentity
+		err error
+	}
+	walks := map[string]ancestry{}
+	ancestorsOf := func(dir string) ([]domain.FileIdentity, error) {
+		if req.AncestorsOf == nil {
+			return nil, nil
+		}
+		if got, ok := walks[dir]; ok {
+			return got.ids, got.err
+		}
+		ids, werr := req.AncestorsOf(dir)
+		walks[dir] = ancestry{ids: ids, err: werr}
+		return ids, werr
+	}
+
 	err = p.Store.IterateObservations(ctx, req.Scope.ID, func(o store.Observation) error {
 		res.Scanned++
 		if len(items) >= req.MaxFiles {
@@ -111,14 +147,37 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 			return nil
 		}
 
+		// The whole chain above the object, not only the recorded parent: a
+		// subtree protection recorded for a directory several levels up is
+		// invisible from the immediate parent, and the executor honours it. A
+		// plan that offered the object anyway would promise an action the run
+		// then refuses. When the chain cannot be read at all, the protection
+		// cannot be ruled out, which is also a refusal.
+		//
+		// With no protections at all there is nothing to compare, and walking
+		// would only make an unreadable directory look like protection that does
+		// not exist.
+		ancestors := []domain.FileIdentity{parent}
+		if !req.Guard.Empty() {
+			got, aerr := ancestorsOf(dirOf(rel))
+			if aerr != nil {
+				res.Reasons[policy.ReasonProtected]++
+				return nil
+			}
+			if len(got) > 0 {
+				ancestors = got
+			}
+		}
+
 		protected := false
 		reason := ""
 		if ok, r := policy.GlobalProtected(rel); ok {
 			protected, reason = true, "global protection: "+r
-		} else if ok, r := req.Guard.CheckFile(rel, id, parent); ok {
+		} else if ok, r := req.Guard.CheckFile(rel, id, ancestors...); ok {
 			// The planner asks the same question the executor asks, with the
-			// parent identity the scan recorded. CheckExact alone let a subtree
-			// protection added after a scan be ignored by a plan created after it.
+			// parent identity the scan recorded and the identities of every
+			// directory above it. CheckExact alone let a subtree protection added
+			// after a scan be ignored by a plan created after it.
 			protected, reason = true, r
 		}
 
@@ -473,4 +532,13 @@ func DescribeDiff(want, got domain.Digest) string {
 		return "identical"
 	}
 	return fmt.Sprintf("expected %s, got %s", want, got)
+}
+
+// dirOf returns the directory part of a scope-relative path, in the form the
+// ancestry walk expects: no trailing slash, and empty for the scope root.
+func dirOf(rel string) string {
+	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
+		return rel[:i]
+	}
+	return ""
 }

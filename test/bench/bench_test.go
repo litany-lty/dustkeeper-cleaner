@@ -41,8 +41,8 @@ const (
 	defaultFanout = 1000 // leaf directories
 	defaultMaxRSS = 256  // MiB
 	// defaultDupRate is the fraction of files that are byte-identical to an
-	// earlier one. It matters for the dedup map peak, which is the one place a
-	// full in-memory index is still used.
+	// earlier one. Nothing dedups them any more, so the duplicates are simply
+	// part of the tree shape a scan has to walk.
 	defaultDupRate = 0.30
 )
 
@@ -310,7 +310,6 @@ type evidence struct {
 	Shape        treeShape        `json:"tree"`
 	Scan         scanFacts        `json:"full_scan"`
 	Resume       resumeFacts      `json:"resume"`
-	Dedup        dedupFacts       `json:"dedup"`
 	Limits       map[string]int64 `json:"limits"`
 }
 
@@ -347,15 +346,6 @@ type resumeFacts struct {
 	MaxRSSBytes      int64   `json:"peak_rss_bytes"`
 	LongestBatchMS   int64   `json:"longest_batch_ms"`
 	FinalComplete    bool    `json:"final_epoch_complete"`
-}
-
-type dedupFacts struct {
-	WallMS      int64 `json:"wall_ms"`
-	MaxRSSBytes int64 `json:"peak_rss_bytes"`
-	Groups      int64 `json:"content_groups"`
-	Plannable   int64 `json:"plannable_groups"`
-	LogicalByte int64 `json:"logical_bytes"`
-	ExpectedDup int   `json:"expected_duplicate_files"`
 }
 
 func maxRSSBytes(ps *os.ProcessState) int64 {
@@ -440,11 +430,15 @@ func (b *benchEnv) setRunSoftSeconds(seconds int) {
 
 // TestLargeTreeScanEvidence produces the section 5.12 table.
 //
-// Four questions, in order:
+// Three questions, in order:
 //  1. did the scan actually finish the tree, and how much did it cost?
 //  2. after a budget stop, does resuming make progress without re-reading?
 //  3. is the resident set still bounded when the tree is very large?
-//  4. what does the one remaining in-memory index (dedup) cost?
+//
+// There used to be a fourth: what the whole-tree dedup index cost. The capability
+// is gone, so the measurement is gone with it; a benchmark for a feature the
+// product no longer has would be the only place in the repository that still
+// claimed it existed.
 func TestLargeTreeScanEvidence(t *testing.T) {
 	b := newBenchEnv(t)
 	leafDirs := defaultFanout
@@ -489,7 +483,6 @@ func TestLargeTreeScanEvidence(t *testing.T) {
 	}
 	ev.Resume = b.resumeFacts(t, shape)
 	ev.Scan = b.fullScanFacts(t, shape)
-	ev.Dedup = b.dedupFacts(t, shape)
 
 	// The scan ceiling is the section 15 target and it must not be relaxed to
 	// make the table look good: a scan whose memory grows with the file count is
@@ -497,27 +490,6 @@ func TestLargeTreeScanEvidence(t *testing.T) {
 	if ev.Scan.MaxRSSBytes > ev.Limits["max_rss_bytes"] {
 		t.Errorf("scan peak RSS %d bytes exceeds the %d byte ceiling; a scan must not grow with the file count",
 			ev.Scan.MaxRSSBytes, ev.Limits["max_rss_bytes"])
-	}
-
-	// Dedup is measured, not excused. It keeps one candidate per indexed file
-	// and one group per duplicate set, so its peak is linear in the tree; the
-	// measurement below is the evidence for that statement. Section 15's 256 MiB
-	// is a scan target, so failing this test against it would conflate two
-	// different requirements - but reporting the number without a ceiling would
-	// hide a real limit, so an explicit opt-in ceiling exists for anyone who
-	// wants the test to enforce one.
-	t.Logf("dedup peak RSS %.1f MiB for %d files (%.0f bytes/file); this is linear in the tree, not bounded by the duplicate count",
-		float64(ev.Dedup.MaxRSSBytes)/(1<<20), ev.Shape.Files,
-		float64(ev.Dedup.MaxRSSBytes)/float64(maxInt(ev.Shape.Files, 1)))
-	if v := os.Getenv("DUSTKEEPER_BENCH_DEDUP_MAX_RSS_MB"); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || n <= 0 {
-			t.Fatalf("DUSTKEEPER_BENCH_DEDUP_MAX_RSS_MB=%q is not a positive integer", v)
-		}
-		if ev.Dedup.MaxRSSBytes > n<<20 {
-			t.Errorf("dedup peak RSS %.1f MiB exceeds the requested %.0f MiB ceiling",
-				float64(ev.Dedup.MaxRSSBytes)/(1<<20), float64(n))
-		}
 	}
 
 	writeEvidence(t, ev)
@@ -660,43 +632,6 @@ func (b *benchEnv) fullScanFacts(t *testing.T, shape treeShape) scanFacts {
 	return facts
 }
 
-// dedupFacts measures the one stage that still builds a whole-season index in
-// memory. bySize groups are cheap; byHash has to open and read each candidate, so
-// this is also the check on "how many bytes does it actually read".
-func (b *benchEnv) dedupFacts(t *testing.T, shape treeShape) dedupFacts {
-	t.Helper()
-	m := b.run("dedup", "plan", "--scope", "bench", "--json")
-	if code, _ := m.JSONEnv["code"].(string); code != "OK" && code != "NO_CANDIDATES" {
-		t.Fatalf("dedup plan ended with %q: %v\n%s", code, m.Err, m.Output)
-	}
-	data := objOf(m.JSONEnv, "data")
-	facts := dedupFacts{
-		WallMS:      m.Wall.Milliseconds(),
-		MaxRSSBytes: m.MaxRSS,
-		Groups:      numOf(data, "groups"),
-		Plannable:   numOf(data, "plannable"),
-		LogicalByte: numOf(data, "logical_bytes"),
-		ExpectedDup: shape.DupFiles,
-	}
-	t.Logf("dedup: %d content groups (%d plannable), %.1f MiB logical in %d ms, peak RSS %.1f MiB, expected %d duplicate files",
-		facts.Groups, facts.Plannable, float64(facts.LogicalByte)/(1<<20),
-		facts.WallMS, float64(facts.MaxRSSBytes)/(1<<20), shape.DupFiles)
-	// A tree built without duplicates must produce no group; a tree built with
-	// them must produce at least one. Both directions are asserted because a
-	// detector that finds nothing would otherwise look fast and correct.
-	if shape.DupFiles > 0 && facts.Groups == 0 {
-		t.Fatalf("the tree was built with %d duplicate files but dedup found no content group", shape.DupFiles)
-	}
-	if shape.DupFiles == 0 && facts.Plannable != 0 {
-		t.Fatalf("the tree has no duplicate bytes but dedup planned %d copies", facts.Plannable)
-	}
-	// "How much would this plan free?" must not be answered with zero.
-	if facts.Plannable > 0 && facts.LogicalByte == 0 {
-		t.Fatalf("%d plannable copies were reported with 0 logical bytes", facts.Plannable)
-	}
-	return facts
-}
-
 // repoRoot walks up from the working directory to the directory holding go.mod.
 func repoRoot() (string, error) {
 	dir, err := os.Getwd()
@@ -794,16 +729,8 @@ func markdown(ev evidence) string {
 	row("各批峰值 RSS", humanBytes(ev.Resume.MaxRSSBytes))
 	row("最终 epoch 完整", yesNo(ev.Resume.FinalComplete))
 
-	b.WriteString("\n## 4. 去重\n\n| 项目 | 数值 |\n|---|---|\n")
-	row("按大小分组（含哈希）/ 可规划组", fmt.Sprintf("%d / %d", ev.Dedup.Groups, ev.Dedup.Plannable))
-	row("逻辑字节", humanBytes(ev.Dedup.LogicalByte))
-	row("wall", fmt.Sprintf("%d ms", ev.Dedup.WallMS))
-	row("峰值 RSS", humanBytes(ev.Dedup.MaxRSSBytes))
-	row("预期重复文件", humanInt(ev.Dedup.ExpectedDup))
-
 	b.WriteString("\n扫描上限取自 `DUSTKEEPER_BENCH_MAX_RSS_MB`（默认 256 MiB），突破即失败，")
-	b.WriteString("不放宽门槛。去重峰值只报告、不套用扫描门槛：它按设计每个索引文件留一个候选、")
-	b.WriteString("每个重复组留两个成员，因此随文件数线性增长（`DUSTKEEPER_BENCH_DEDUP_MAX_RSS_MB` 可显式设限）。")
+	b.WriteString("不放宽门槛。")
 	b.WriteString("`Rusage inblock` 在 APFS 上常为 0（页面缓存命中，且扫描只读元数据）。\n")
 	return b.String()
 }

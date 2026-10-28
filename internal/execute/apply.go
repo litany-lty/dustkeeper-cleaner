@@ -130,14 +130,18 @@ func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID
 		res, execErr := e.Quarantine(ctx, sc, p, it, budget)
 		if execErr != nil {
 			out.Failed++
-			res.Control = strongerControl(res.Control, controlOf(string(errs.CodeOf(execErr))))
+			// The per-item record has to name the reason. Without this the caller
+			// sees failed_count rise and every result row carry an empty code, so
+			// "which item, and why" is only answerable by re-running the command.
+			res = annotateFailure(res, execErr)
+			res.Control = strongerControl(res.Control, ControlOf(string(errs.CodeOf(execErr))))
 			out.Results = append(out.Results, res)
 			code := errs.CodeOf(execErr)
 			if stopCode(string(code)) {
 				stopped = true
 				out.Code = string(code)
 				out.Message = execErr.Error()
-				out.Control = strongerControl(out.Control, controlOf(out.Code))
+				out.Control = strongerControl(out.Control, ControlOf(out.Code))
 			}
 			continue
 		}
@@ -242,14 +246,15 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 		})
 		if execErr != nil {
 			out.Failed++
-			res.Control = strongerControl(res.Control, controlOf(string(errs.CodeOf(execErr))))
+			res = annotateFailure(res, execErr)
+			res.Control = strongerControl(res.Control, ControlOf(string(errs.CodeOf(execErr))))
 			out.Results = append(out.Results, res)
 			code := errs.CodeOf(execErr)
 			if stopCode(string(code)) {
 				stopped = true
 				out.Code = string(code)
 				out.Message = execErr.Error()
-				out.Control = strongerControl(out.Control, controlOf(out.Code))
+				out.Control = strongerControl(out.Control, ControlOf(out.Code))
 			}
 			continue
 		}
@@ -273,6 +278,24 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 		out.Code = string(errs.CodePartial)
 	}
 	return out, nil
+}
+
+// annotateFailure puts the reason on the item's own record.
+//
+// The batch already carries a code, but only for the condition that stopped it.
+// A failed item used to be appended with an empty code, so a script reading
+// results could not tell a stale plan from a full disk from a held scope.
+func annotateFailure(res domain.OperationResult, err error) domain.OperationResult {
+	if res.Code == "" {
+		res.Code = string(errs.CodeOf(err))
+	}
+	if res.Message == "" {
+		res.Message = err.Error()
+	}
+	if res.Control == "" {
+		res.Control = ControlOf(res.Code)
+	}
+	return res
 }
 
 func summarise(r ApplyResult) string {

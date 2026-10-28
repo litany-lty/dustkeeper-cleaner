@@ -44,6 +44,12 @@ type Result struct {
 	// Scope names the scope that has to stop taking new actions when Outcome is
 	// "blocked". It is carried so the report can be read without a second lookup.
 	Scope string `json:"scope_id,omitempty"`
+	// RecordError says that this outcome could not be written down.
+	//
+	// The object may be in a perfectly fine state, but the record of what was
+	// decided is missing. A caller that prints "parked" without this would claim
+	// that a retry was scheduled when nothing was recorded to retry from.
+	RecordError string `json:"record_error,omitempty"`
 }
 
 // Report summarises a reconciliation pass.
@@ -63,7 +69,13 @@ type Report struct {
 	Blocked   int      `json:"blocked"`
 	Unknown   int      `json:"unknown"`
 	Results   []Result `json:"results"`
-	Scopes    []string `json:"scopes_held,omitempty"`
+	// BlockedScopes lists the scopes that must stop taking new actions. It is
+	// named for the fact rather than for the field it used to share with holds.
+	BlockedScopes []string `json:"blocked_scopes,omitempty"`
+	// RecordFailures counts outcomes that could not be written down. A pass with
+	// a non-zero count here has not finished its work, whatever the other
+	// counters say, so the caller must not report success.
+	RecordFailures int `json:"record_failures"`
 }
 
 // Inspect lists pending operations without changing anything.
@@ -109,15 +121,21 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 				}
 				// A scope that cannot be verified has not been observed either.
 				// The scope status records the problem; the item keeps its
-				// pending marker so the next pass can still finish it.
-				_ = r.Store.SetScopeStatus(ctx, po.Item.ScopeID, domain.ScopeHeld)
-				rep.Blocked++
-				if !containsScope(rep.Scopes, string(po.Item.ScopeID)) {
-					rep.Scopes = append(rep.Scopes, string(po.Item.ScopeID))
+				// pending marker so the next pass can still finish it -
+				// unless the status itself cannot be written, and then the
+				// caller has to hear about it.
+				blocked := Result{Item: po.Item.ID, OpID: po.OpID, Action: po.Action,
+					Scope:   string(po.Item.ScopeID),
+					Outcome: "blocked", Detail: "the scope root could not be verified: " + err.Error()}
+				if serr := r.Store.SetScopeStatus(ctx, po.Item.ScopeID, domain.ScopeHeld); serr != nil {
+					blocked.RecordError = "the scope could not be marked held: " + serr.Error()
+					rep.RecordFailures++
 				}
-				rep.Results = append(rep.Results, Result{Item: po.Item.ID, OpID: po.OpID, Action: po.Action,
-					Scope: string(po.Item.ScopeID),
-					Outcome: "blocked", Detail: "the scope root could not be verified: " + err.Error()})
+				rep.Blocked++
+				if !containsScope(rep.BlockedScopes, string(po.Item.ScopeID)) {
+					rep.BlockedScopes = append(rep.BlockedScopes, string(po.Item.ScopeID))
+				}
+				rep.Results = append(rep.Results, blocked)
 				continue
 			}
 			scopes[po.Item.ScopeID] = opened
@@ -141,9 +159,12 @@ func (r *Reconciler) Run(ctx context.Context) (Report, error) {
 			// it was and the scope has to stop taking new actions until an
 			// operator decides what the record means.
 			rep.Blocked++
-			if res.Scope != "" && !containsScope(rep.Scopes, res.Scope) {
-				rep.Scopes = append(rep.Scopes, res.Scope)
+			if res.Scope != "" && !containsScope(rep.BlockedScopes, res.Scope) {
+				rep.BlockedScopes = append(rep.BlockedScopes, res.Scope)
 			}
+		}
+		if res.RecordError != "" {
+			rep.RecordFailures++
 		}
 		rep.Results = append(rep.Results, res)
 	}
@@ -203,12 +224,30 @@ func (r *Reconciler) blockPending(ctx context.Context, po store.PendingOp, out R
 	if err := r.Store.SetScopeStatus(ctx, po.Item.ScopeID, domain.ScopeHeld); err != nil {
 		// The block is the point, so a failure to record it cannot be reported as
 		// success. The pending marker is still there, which is what the shared
-		// gate reads.
-		out.Detail = code + ": " + detail + "; the scope could not be marked held: " + err.Error()
+		// gate reads, but the caller is told that the scope was not actually
+		// stopped.
+		out.Detail = code + ": " + detail
+		out.RecordError = "the scope could not be marked held: " + err.Error()
 		return out
 	}
 	out.Detail = code + ": " + detail
 	return out
+}
+
+// releasePin clears the keeper pin this item may hold.
+//
+// A quarantine records that a path is the keeper of the object it isolated, and
+// the pin is what stops the surviving copy from being taken next. Finishing the
+// operation without releasing it leaves the path unusable by any later plan - so
+// a failure here is recorded rather than ignored, even though the object itself
+// is fine.
+func (r *Reconciler) releasePin(ctx context.Context, it store.Item, out *Result) {
+	if err := r.Store.ReleaseItemKeeperPin(ctx, it.ID); err != nil {
+		if out.RecordError != "" {
+			out.RecordError += "; "
+		}
+		out.RecordError += "the keeper pin could not be released: " + err.Error()
+	}
 }
 
 // containsScope reports whether a scope is already listed.
@@ -267,10 +306,14 @@ func (r *Reconciler) parkAttempt(ctx context.Context, po store.PendingOp, out Re
 		attempts = n + 1
 	}
 	if err := r.Store.NoteParked(ctx, po.Item.ID, code, detail, attempts); err != nil {
-		// Failing to write the note does not make the object explainable. The
-		// pending marker is still in place, which is the fact that matters.
+		// Failing to write the note does not make the object unexplainable - the
+		// pending marker is still in place, which is the fact that matters - but
+		// it does mean this pass did not record what it decided. The caller is
+		// told so that a scheduler does not read "parked" as "a retry will find
+		// the attempt count I just wrote".
 		out.Outcome = "parked"
-		out.Detail = detail + "; the attempt could not be recorded: " + err.Error()
+		out.Detail = detail
+		out.RecordError = "the attempt could not be recorded: " + err.Error()
 		return out
 	}
 	out.Outcome = "parked"
@@ -290,8 +333,12 @@ func (r *Reconciler) holdUnfixableDetail(ctx context.Context, po store.PendingOp
 	if err := r.Store.HoldIntent(ctx, intentOf(po), code,
 		`{"source":"reconciled","result":"held without an automatic repair","detail":`+
 			quoteJSON(detail)+`}`); err != nil {
+		// Nothing was recorded, so this is not a hold: the pending marker is
+		// still there and the next pass will meet the same state. Reporting
+		// "held" here would claim a verdict that does not exist.
 		out.Outcome = "unknown"
-		out.Detail = detail + "; the hold could not be recorded: " + err.Error()
+		out.Detail = detail
+		out.RecordError = "the hold could not be recorded: " + err.Error()
 		return out
 	}
 	out.Outcome = "held"
@@ -311,7 +358,7 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 	it := po.Item
 	out := Result{Item: it.ID, OpID: po.OpID, Action: "quarantine"}
 
-	contract, err := plan.ParseContract(po.ContractJSON)
+	contract, err := plan.ParseContractFor(po.ContractJSON, "quarantine")
 	if err != nil {
 		// The contract is the record of what was meant to move. Without it there
 		// is nothing to compare against, so this is a verdict, not a retry.
@@ -329,7 +376,7 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 			`{"source":"reconciled","result":"source still present, vault empty"}`); err != nil {
 			return r.recordFailure(ctx, po, out, "ABORT_FAILED", err)
 		}
-		_ = r.Store.ReleaseItemKeeperPin(ctx, it.ID)
+		r.releasePin(ctx, it, &out)
 		out.Outcome = "aborted"
 		out.Detail = "the file was never moved"
 		return out
@@ -364,7 +411,9 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 			out.Detail = "the vault holds an object that is not the planned one; its evidence was recorded so it can be restored"
 		}
 		out.Outcome = "held"
-		_ = r.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld)
+		if err := r.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld); err != nil {
+			out.RecordError = "the scope could not be marked held: " + err.Error()
+		}
 		return out
 
 	case !srcFound && !vaultFound:
@@ -604,7 +653,7 @@ func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx,
 		if err := r.Store.CompleteRestore(ctx, intentOf(po), `{"source":"reconciled"}`); err != nil {
 			return r.recordFailure(ctx, po, out, "COMPLETE_FAILED", err)
 		}
-		_ = r.Store.ReleaseItemKeeperPin(ctx, it.ID)
+		r.releasePin(ctx, it, &out)
 		out.Outcome = "completed"
 		out.Detail = "the restore had already happened; its record was completed"
 		return out
@@ -666,7 +715,10 @@ func (r *Reconciler) restoreContract(po store.PendingOp) (*plan.OperationContrac
 		return nil, dest, nil
 	}
 
-	contract, err := plan.ParseContract(po.ContractJSON)
+	// The contract is checked against the action that wrote it: a restore without
+	// a destination directory cannot be verified against the directory the
+	// operator approved, and a purge must not be asked for one.
+	contract, err := plan.ParseContractFor(po.ContractJSON, po.Action)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -738,7 +790,7 @@ func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, p
 		`{"source":"reconciled","result":"RECONCILED_ABSENT"}`); err != nil {
 		return r.recordFailure(ctx, po, out, "COMPLETE_FAILED", err)
 	}
-	_ = r.Store.ReleaseItemKeeperPin(ctx, it.ID)
+	r.releasePin(ctx, it, &out)
 	out.Outcome = "completed"
 	out.Detail = "the object was already absent; recorded as RECONCILED_ABSENT, not as a verified unlink"
 	return out

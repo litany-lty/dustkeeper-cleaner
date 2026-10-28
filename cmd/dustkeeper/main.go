@@ -100,6 +100,18 @@ func messageOf(err error) string {
 }
 
 func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return dispatchWith(ctx, args, stdout, stderr, nil)
+}
+
+// dispatchWith is dispatch with an injectable business clock.
+//
+// Production calls dispatch, which passes nil and therefore gets the system
+// clock. There is deliberately no flag and no environment variable that moves the
+// clock: "run as if it were thirty days later" is not a capability the product
+// should have. The parameter exists so a test can drive the same parsing and the
+// same routing at a controlled date, because that is the only way to prove that a
+// retention window elapses rather than asserting that the code was written.
+func dispatchWith(ctx context.Context, args []string, stdout, stderr io.Writer, clk domain.Clock) int {
 	// --json is global and may appear anywhere; strip it before the command
 	// flag sets see the arguments.
 	jsonOut := false
@@ -114,7 +126,10 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	args = filtered
 
-	a := &app{json: jsonOut, runID: domain.NewID("run"), stdout: stdout, stderr: stderr, clock: domain.NewSystemClock()}
+	if clk == nil {
+		clk = domain.NewSystemClock()
+	}
+	a := &app{json: jsonOut, runID: domain.NewID("run"), stdout: stdout, stderr: stderr, clock: clk}
 
 	paths, err := config.ResolvePaths()
 	if err != nil {

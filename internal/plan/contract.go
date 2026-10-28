@@ -31,7 +31,71 @@ func ParseContract(raw string) (OperationContractV1, error) {
 	return c, nil
 }
 
-// validate names the fields reconciliation depends on.
+// ParseContractFor decodes the contract of one action and checks the fields that
+// action cannot be reasoned about without.
+//
+// The generic check answers "is this record readable". This one answers "is it
+// readable *as a restore*": a restore whose contract records no destination
+// directory cannot be checked against the directory the operator approved, and
+// the old code silently skipped that comparison because the field was optional
+// for everyone. A purge, by contrast, has no destination and must not be asked
+// for one.
+func ParseContractFor(raw, action string) (OperationContractV1, error) {
+	c, err := ParseContract(raw)
+	if err != nil {
+		return c, err
+	}
+	if err := c.validateForAction(action); err != nil {
+		return c, err
+	}
+	return c, nil
+}
+
+// validateForAction names what each action requires beyond the common fields.
+func (c OperationContractV1) validateForAction(action string) error {
+	var wantNext string
+	switch action {
+	case "quarantine":
+		wantNext = domain.StateQIntent
+	case "restore", "compensate":
+		wantNext = domain.StateRIntent
+	case "purge":
+		wantNext = domain.StatePIntent
+	default:
+		return errs.Newf(errs.CodeRecoveryRequired,
+			"no contract shape is defined for operation %q, so it cannot be reconciled", action)
+	}
+	if c.NextState != wantNext {
+		return errs.Newf(errs.CodeRecoveryRequired,
+			"the %s contract records next state %q; a %s ends in %q",
+			action, c.NextState, action, wantNext)
+	}
+
+	switch action {
+	case "quarantine":
+		// Both hashes are the evidence a later purge compares against. A
+		// quarantine cannot be completed without them, so discovering that at
+		// completion time - after the file has already moved - is too late.
+		if _, err := c.ContentDigest(); err != nil {
+			return err
+		}
+		if _, err := c.MetadataDigest(); err != nil {
+			return err
+		}
+	case "restore", "compensate":
+		// The destination is what makes "did the object land where it was
+		// approved" answerable. Without it the only remaining answer would be
+		// re-derived from the item row, which describes where the object came
+		// from.
+		if c.DestParentIdentity == nil || c.DestParentIdentity.IsZero() {
+			return errs.New(errs.CodeRecoveryRequired,
+				"the "+action+" contract records no destination directory, so the place the object was meant to land cannot be checked")
+		}
+	}
+	return nil
+}
+
+// validate names the fields reconciliation depends on, whatever the action.
 func (c OperationContractV1) validate() error {
 	switch {
 	case c.BindingVersion != BindingVersion:

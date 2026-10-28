@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/scope"
 )
@@ -27,10 +28,22 @@ type result struct {
 	env    map[string]any
 }
 
+// cli runs one command through the real dispatcher with the system clock.
 func cli(t *testing.T, args ...string) result {
 	t.Helper()
+	return cliClock(t, nil, args...)
+}
+
+// cliClock runs the same command with a controlled business clock.
+//
+// It goes through dispatchWith, so flag parsing, routing, the instance lock and
+// the JSON envelope are the production ones. Only the clock differs. Nothing a
+// user can type reaches this: there is no flag and no environment variable for
+// the clock, and this helper lives in the test binary.
+func cliClock(t *testing.T, clk domain.Clock, args ...string) result {
+	t.Helper()
 	var out, errb bytes.Buffer
-	code := dispatch(context.Background(), args, &out, &errb)
+	code := dispatchWith(context.Background(), args, &out, &errb, clk)
 	r := result{code: code, stdout: out.String(), stderr: errb.String()}
 	if strings.Contains(out.String(), "{") {
 		var env map[string]any

@@ -56,6 +56,10 @@ type ScopeRun struct {
 	IdentityWeak      string `json:"root_identity_weak,omitempty"`
 	Control           string `json:"control,omitempty"`
 	Message           string `json:"message,omitempty"`
+	// FailureCode names why this scope's work stopped, on the scope's own row.
+	// The run-level failure code only carries the first one, so with two failing
+	// scopes the second reason had nowhere to appear.
+	FailureCode errs.Code `json:"failure_code,omitempty"`
 }
 
 // Report is the machine-readable result of `run`.
@@ -148,11 +152,12 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		result, runErr := r.runScope(ctx, sc, runLedger, qLedger, pLedger, guard, verdict)
 		if runErr != nil {
 			result.Message = runErr.Error()
+			result.FailureCode = errs.CodeOf(runErr)
 			rep.Failures = append(rep.Failures, string(sc.ID)+": "+runErr.Error())
 			if rep.FailureCode == "" {
 				rep.FailureCode = errs.CodeOf(runErr)
 			}
-			rep.Control = strongerControl(rep.Control, controlOfError(runErr))
+			rep.Control = strongerControl(rep.Control, ControlOfError(runErr))
 		}
 		rep.Scopes = append(rep.Scopes, result)
 		rep.Quarantined += result.Quarantined
@@ -380,7 +385,7 @@ collect:
 	phase := domain.NewPhaseBudget(runLedger, ledger, ledger.RemainingFiles(), ledger.RemainingBytes())
 	res, err := r.Exec.ApplyPurgePlan(ctx, sc, p.ID, p.Digest, phase, guard.Assert)
 	if err != nil {
-		return res.Completed, 0, refused, controlOfError(err), err
+		return res.Completed, 0, refused, ControlOfError(err), err
 	}
 
 	var bytes int64
@@ -395,7 +400,29 @@ collect:
 			}
 		}
 	}
+	if stopErr := batchStop(res); stopErr != nil {
+		return res.Completed, bytes, refused, strongerControl(res.Control, ControlOfError(stopErr)), stopErr
+	}
 	return res.Completed, bytes, refused, res.Control, nil
+}
+
+// batchStop turns a stopped batch back into the reason it stopped.
+//
+// Apply reports a per-item stop condition as a code on the result, not as a Go
+// error, so a runner that only checked err printed "control: stop_scope" with an
+// empty message: an operator could see that something stopped but not what. The
+// condition is turned back into an error only when it stops the scope or the run;
+// a dead plan belongs to its own rule and must not stop the others.
+func batchStop(res execute.ApplyResult) error {
+	switch execute.ControlOf(res.Code) {
+	case domain.ControlStopScope, domain.ControlStopRun:
+		message := res.Message
+		if message == "" {
+			message = "the batch stopped with " + res.Code
+		}
+		return errs.Newf(errs.Code(res.Code), "%s", message)
+	}
+	return nil
 }
 
 // grantQuota is the ceiling one approval carries.
@@ -623,6 +650,11 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 			PurgeGrant:      pickGrant(pg, pgErr),
 			Config:          r.Config,
 			NowNS:           r.Clock.Wall().UnixNano(),
+			// Same ancestry as the executor will walk, so a plan never offers an
+			// object the execution then refuses as protected.
+			AncestorsOf: func(dir string) ([]domain.FileIdentity, error) {
+				return execute.AncestorIdentities(sc, []byte(dir))
+			},
 		})
 		if err != nil {
 			if errs.CodeOf(err) == errs.CodeNoCandidates {
@@ -647,7 +679,10 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 			}
 		}
 		if err != nil {
-			return total, bytes, strongerControl(control, controlOfError(err)), err
+			return total, bytes, strongerControl(control, ControlOfError(err)), err
+		}
+		if stopErr := batchStop(applied); stopErr != nil {
+			return total, bytes, strongerControl(control, applied.Control), stopErr
 		}
 	}
 	return total, bytes, control, nil
@@ -835,7 +870,7 @@ func strongerControl(a, b string) string {
 	return a
 }
 
-func controlOfError(err error) string {
+func ControlOfError(err error) string {
 	switch errs.CodeOf(err) {
 	case errs.CodePaused, errs.CodeHeld, errs.CodeScopeChanged, errs.CodeProtectionAliasUnresolved:
 		return domain.ControlStopScope

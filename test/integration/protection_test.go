@@ -174,6 +174,75 @@ func TestACaseVariantOfTheProtectedSubtreeStillProtects(t *testing.T) {
 	}
 }
 
+// TestASubtreeProtectionIsHonouredAtAnyDepth is the same kernel fact one level
+// further down, which is where the plan used to disagree with the executor.
+//
+// The observation index records the immediate parent, so a protection on the
+// directory *above* that parent was invisible to planning: the preview offered
+// the object, the executor refused it, and the operator was left with a plan that
+// could never complete. The plan now walks the same chain the executor walks.
+func TestASubtreeProtectionIsHonouredAtAnyDepth(t *testing.T) {
+	if !caseInsensitiveVolume(t) {
+		t.Skip("this volume distinguishes case, so the two spellings are two directories")
+	}
+	e := newEnv(t)
+	sc := e.addScope("exports", domain.KindManagedDisposable)
+	e.writeFile("exports", "Folder/sub/a.zip", "payload-a", 40*24*time.Hour)
+	e.scan(sc.ID)
+
+	r := e.rule(sc.ID, "rule-1", []string{"*.zip"}, nil, 30*24*time.Hour, 30*24*time.Hour)
+	e.insertProtection(sc, "folder", domain.MatchSubtree)
+
+	res, err := e.planForMayFail(sc, r, 10)
+	requireCode(t, err, errs.CodeNoCandidates)
+	if res.Reasons[policy.ReasonProtected] != 1 {
+		t.Fatalf("the object two levels below the differently spelled subtree was not recorded as protected: %+v",
+			res.Reasons)
+	}
+	if !e.exists("exports", "Folder/sub/a.zip") {
+		t.Fatal("the object under the differently spelled subtree was moved")
+	}
+}
+
+// TestAPlanDoesNotOfferAnObjectWhoseAncestryCannotBeInspected is the preview side
+// of the same clause. The executor refuses an object whose ancestry cannot be
+// walked (see TestSlimUninspectableProtectionRefusesThePurge); a plan that still
+// offered it would promise an action the run then refuses, and the operator would
+// be told the wrong reason for it.
+func TestAPlanDoesNotOfferAnObjectWhoseAncestryCannotBeInspected(t *testing.T) {
+	e := newEnv(t)
+	sc := e.addScope("exports", domain.KindManagedDisposable)
+	e.writeFile("exports", "sub/a.zip", "payload", 40*24*time.Hour)
+	e.scan(sc.ID)
+	r := e.rule(sc.ID, "rule-1", []string{"*.zip"}, nil, 30*24*time.Hour, 30*24*time.Hour)
+	// One protection elsewhere in the scope is what makes a purge or a plan
+	// compare identities at all; without it there is nothing to compare and
+	// "the ancestry is unreadable" would not be a question.
+	e.insertProtection(sc, "keep/a.zip", domain.MatchExact)
+
+	// The object leaves through a different door and the directory takes its
+	// place as a regular file. The index still describes "sub/a.zip"; the walk
+	// cannot inspect "sub" any more, and the failure is not ENOENT - which is the
+	// one error the walk deliberately steps over.
+	sub := filepath.Join(e.base, "trees", "exports", "sub")
+	if err := os.Rename(filepath.Join(sub, "a.zip"), filepath.Join(e.base, "trees", "exports", "a.zip")); err != nil {
+		t.Fatalf("move the object out: %v", err)
+	}
+	if err := os.Remove(sub); err != nil {
+		t.Fatalf("remove the directory: %v", err)
+	}
+	if err := os.WriteFile(sub, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("replace it with a file: %v", err)
+	}
+
+	res, err := e.planForMayFail(sc, r, 10)
+	requireCode(t, err, errs.CodeNoCandidates)
+	if res.Reasons[policy.ReasonProtected] != 1 {
+		t.Fatalf("the object whose ancestry cannot be inspected was not recorded as protected: %+v",
+			res.Reasons)
+	}
+}
+
 // TestANameThatDiffersOnlyByNormalisationFreezesThePurge covers "隔离后新增
 // Unicode exact": the object is already in the vault, and the protection that
 // arrives afterwards is the same name written in the other normal form. Nothing

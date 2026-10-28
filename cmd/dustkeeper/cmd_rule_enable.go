@@ -353,6 +353,9 @@ func (a *app) enableSample(ctx context.Context, sc store.Scope, r store.Rule, pa
 		Config:   a.cfg,
 		NowNS:    a.clock.Wall().UnixNano(),
 		DryRun:   true,
+		AncestorsOf: func(dir string) ([]domain.FileIdentity, error) {
+			return execute.AncestorIdentities(sctx, []byte(dir))
+		},
 	})
 	if err != nil {
 		if errs.CodeOf(err) == errs.CodeNoCandidates {

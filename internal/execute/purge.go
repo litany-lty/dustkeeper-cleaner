@@ -239,13 +239,14 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		if errors.Is(err, unix.ENOENT) {
 			// The object vanished without our unlink; that is not a purge we
 			// performed, so it must be reconciled rather than declared success.
-			_ = e.Store.HoldIntent(ctx, intent, "OBJECT_VANISHED",
+			herr := e.Store.HoldIntent(ctx, intent, "OBJECT_VANISHED",
 				`{"source":"observed","result":"object was gone before unlink"}`)
-			return res, errs.New(errs.CodeHeld, "the object was already gone; reconcile this item")
+			return res, recordOr(herr, errs.New(errs.CodeHeld, "the object was already gone; reconcile this item"))
 		}
-		_ = e.Store.AbortIntent(ctx, intent, domain.StateQuarantined,
+		aerr := e.Store.AbortIntent(ctx, intent, domain.StateQuarantined,
 			`{"reason":"unlink failed","detail":`+quoteJSON(err.Error())+`}`)
-		return res, errs.Newf(errs.CodeIOError, "unlink failed; the object is still quarantined: %v", err)
+		return res, recordOr(aerr,
+			errs.Newf(errs.CodeIOError, "unlink failed; the object is still quarantined: %v", err))
 	}
 
 	if err := fsops.DurableDir(sc.Objects); err != nil {

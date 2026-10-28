@@ -613,7 +613,15 @@ func (r *Registrar) OpenVerified(ctx context.Context, id domain.ScopeID) (Verifi
 	}
 	if verdict.Changed != "" {
 		root.Close()
-		_ = r.Store.SetScopeStatus(ctx, id, domain.ScopeHeld)
+		// Marking the scope held is what tells every other entry point that this
+		// scope is not usable. If that write fails, this caller is still refused,
+		// but the operator has to know the durable answer is missing rather than
+		// assume the scope was frozen for them.
+		if serr := r.Store.SetScopeStatus(ctx, id, domain.ScopeHeld); serr != nil {
+			return VerifiedScope{}, errs.Newf(errs.CodeScopeChanged,
+				"scope %s no longer matches its registration: %s; re-register after checking the path (and the scope could not be marked held: %v)",
+				id, verdict.Changed, serr)
+		}
 		return VerifiedScope{}, errs.Newf(errs.CodeScopeChanged,
 			"scope %s no longer matches its registration: %s; re-register after checking the path",
 			id, verdict.Changed)

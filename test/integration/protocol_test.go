@@ -109,22 +109,28 @@ func TestReconcileRetriesEveryActionUntilTheScopeIsFree(t *testing.T) {
 		}
 
 		release := e.holdScopeLock(t, "exports")
-		rep, err := e.rec.Run(ctx)
-		if err != nil {
-			t.Fatalf("reconcile while busy: %v", err)
-		}
-		if rep.Busy != 1 || rep.Completed != 0 || rep.Held != 0 {
-			t.Fatalf("a busy scope was not reported as busy: %+v", rep)
-		}
-		if got := e.pendingOf(t, f.item.ID); got != opID {
-			t.Fatalf("the pending operation was dropped while the scope was busy: %q -> %q", opID, got)
-		}
-		if it, _ := e.st.GetItem(ctx, f.item.ID); it.State != domain.StateQIntent {
-			t.Fatalf("a busy scope changed the item state to %s", it.State)
+		// Two consecutive rounds, because "the marker survives one failure" is
+		// not the property that matters: a scheduled installation meets the same
+		// blocked scope every morning until somebody fixes it.
+		for round := 1; round <= 2; round++ {
+			rep, err := e.rec.Run(ctx)
+			if err != nil {
+				t.Fatalf("reconcile while busy (round %d): %v", round, err)
+			}
+			if rep.Busy != 1 || rep.Completed != 0 || rep.Held != 0 {
+				t.Fatalf("round %d: a busy scope was not reported as busy: %+v", round, rep)
+			}
+			if got := e.pendingOf(t, f.item.ID); got != opID {
+				t.Fatalf("round %d: the pending operation was dropped while the scope was busy: %q -> %q",
+					round, opID, got)
+			}
+			if it, _ := e.st.GetItem(ctx, f.item.ID); it.State != domain.StateQIntent {
+				t.Fatalf("round %d: a busy scope changed the item state to %s", round, it.State)
+			}
 		}
 
 		release()
-		rep, err = e.rec.Run(ctx)
+		rep, err := e.rec.Run(ctx)
 		if err != nil {
 			t.Fatalf("second reconcile: %v", err)
 		}
@@ -172,19 +178,27 @@ func TestReconcileRetriesEveryActionUntilTheScopeIsFree(t *testing.T) {
 		}
 
 		release := e.holdScopeLock(t, "exports")
-		rep, err := e.rec.Run(ctx)
-		if err != nil {
-			t.Fatalf("reconcile while busy: %v", err)
-		}
-		if rep.Busy != 1 {
-			t.Fatalf("a busy scope was not reported as busy: %+v", rep)
-		}
-		if got := e.pendingOf(t, it.ID); got != string(opID) {
-			t.Fatalf("the pending restore was dropped while the scope was busy: %q", got)
+		// Two rounds for the same reason as the quarantine case: a scheduled
+		// installation meets the same blocked scope every morning until somebody
+		// fixes it, so the pending marker has to survive more than one attempt.
+		for round := 1; round <= 2; round++ {
+			rep, err := e.rec.Run(ctx)
+			if err != nil {
+				t.Fatalf("reconcile while busy (round %d): %v", round, err)
+			}
+			if rep.Busy != 1 {
+				t.Fatalf("round %d: a busy scope was not reported as busy: %+v", round, rep)
+			}
+			if got := e.pendingOf(t, it.ID); got != string(opID) {
+				t.Fatalf("round %d: the pending restore was dropped while the scope was busy: %q", round, got)
+			}
+			if got, _ := e.st.GetItem(ctx, it.ID); got.State != domain.StateRIntent {
+				t.Fatalf("round %d: a busy scope changed the item state to %s", round, got.State)
+			}
 		}
 
 		release()
-		rep, err = e.rec.Run(ctx)
+		rep, err := e.rec.Run(ctx)
 		if err != nil {
 			t.Fatalf("second reconcile: %v", err)
 		}
@@ -226,19 +240,24 @@ func TestReconcileRetriesEveryActionUntilTheScopeIsFree(t *testing.T) {
 		}
 
 		release := e.holdScopeLock(t, "exports")
-		rep, err := e.rec.Run(ctx)
-		if err != nil {
-			t.Fatalf("reconcile while busy: %v", err)
-		}
-		if rep.Busy != 1 {
-			t.Fatalf("a busy scope was not reported as busy: %+v", rep)
-		}
-		if got := e.pendingOf(t, it.ID); got != string(opID) {
-			t.Fatalf("the pending purge was dropped while the scope was busy: %q", got)
+		for round := 1; round <= 2; round++ {
+			rep, err := e.rec.Run(ctx)
+			if err != nil {
+				t.Fatalf("reconcile while busy (round %d): %v", round, err)
+			}
+			if rep.Busy != 1 {
+				t.Fatalf("round %d: a busy scope was not reported as busy: %+v", round, rep)
+			}
+			if got := e.pendingOf(t, it.ID); got != string(opID) {
+				t.Fatalf("round %d: the pending purge was dropped while the scope was busy: %q", round, got)
+			}
+			if got, _ := e.st.GetItem(ctx, it.ID); got.State != domain.StatePIntent {
+				t.Fatalf("round %d: a busy scope changed the item state to %s", round, got.State)
+			}
 		}
 
 		release()
-		rep, err = e.rec.Run(ctx)
+		rep, err := e.rec.Run(ctx)
 		if err != nil {
 			t.Fatalf("second reconcile: %v", err)
 		}

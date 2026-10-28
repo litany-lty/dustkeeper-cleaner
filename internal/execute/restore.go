@@ -180,14 +180,14 @@ func (e *Executor) Restore(ctx context.Context, sc *ScopeCtx, itemID domain.Item
 
 	if err := fsops.RenameNoReplace(sc.Objects, it.ObjectName, destParent, destParent.Name()); err != nil {
 		if errors.Is(err, fsops.ErrExists) {
-			_ = e.Store.AbortIntent(ctx, intent, it.State,
+			aerr := e.Store.AbortIntent(ctx, intent, it.State,
 				`{"reason":"destination appeared during restore","source":"observed"}`)
-			return res, errs.Newf(errs.CodeRestoreConflict,
-				"a file appeared at the destination; nothing was overwritten (object %s is still quarantined)", it.ID)
+			return res, recordOr(aerr, errs.Newf(errs.CodeRestoreConflict,
+				"a file appeared at the destination; nothing was overwritten (object %s is still quarantined)", it.ID))
 		}
-		_ = e.Store.AbortIntent(ctx, intent, it.State,
+		aerr := e.Store.AbortIntent(ctx, intent, it.State,
 			`{"reason":"rename failed","detail":`+quoteJSON(err.Error())+`}`)
-		return res, errs.Newf(errs.CodeIOError, "restore did not move the object: %v", err)
+		return res, recordOr(aerr, errs.Newf(errs.CodeIOError, "restore did not move the object: %v", err))
 	}
 
 	// Re-open what actually landed. A failure here used to be ignored, which
@@ -199,10 +199,10 @@ func (e *Executor) Restore(ctx context.Context, sc *ScopeCtx, itemID domain.Item
 	}
 	if !back.Identity.Equal(capturedID) {
 		_ = back.Close()
-		_ = e.Store.HoldIntent(ctx, intent, "RESTORE_IDENTITY_MISMATCH",
+		herr := e.Store.HoldIntent(ctx, intent, "RESTORE_IDENTITY_MISMATCH",
 			`{"source":"observed","result":"restored object identity differs from the record"}`)
-		return res, errs.New(errs.CodeHeld,
-			"the restored object is not the recorded object; the scope is held")
+		return res, recordOr(herr, errs.New(errs.CodeHeld,
+			"the restored object is not the recorded object; the scope is held"))
 	}
 	if err := back.Sync(); err != nil {
 		_ = back.Close()

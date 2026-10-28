@@ -96,6 +96,9 @@ func planCreate(ctx context.Context, a *app, args []string) (output, error) {
 			MaxBytes: bytes,
 			Config:   a.cfg,
 			NowNS:    a.clock.Wall().UnixNano(),
+			AncestorsOf: func(dir string) ([]domain.FileIdentity, error) {
+				return execute.AncestorIdentities(sctx, []byte(dir))
+			},
 		})
 		if perr != nil {
 			return output{}, perr
@@ -343,4 +346,3 @@ func planBytes(items []store.Item) int64 {
 	}
 	return total
 }
-

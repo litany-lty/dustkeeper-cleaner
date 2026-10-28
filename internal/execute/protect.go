@@ -99,9 +99,43 @@ func ancestorIdentities(sc *ScopeCtx, rel []byte) ([]domain.FileIdentity, error)
 	if err != nil {
 		return nil, nil
 	}
-	out := make([]domain.FileIdentity, 0, len(parts))
-	for k := len(parts) - 1; k >= 0; k-- {
-		d, oerr := sc.Root.OpenDir([]byte(strings.Join(parts[:k], "/")))
+	if len(parts) == 0 {
+		return nil, nil
+	}
+	return AncestorIdentities(sc, []byte(strings.Join(parts[:len(parts)-1], "/")))
+}
+
+// AncestorIdentities returns the identity of dir and of every directory above it,
+// nearest first, read through verified descriptors of the scope root.
+//
+// It is exported because planning has to ask the same question the executor asks.
+// The observation index records only the immediate parent, so a subtree
+// protection recorded three levels up was invisible to a plan and honoured by the
+// executor: the preview promised an action the execution then refused. Passing
+// the whole chain - rather than the recorded parent alone - is what makes "the
+// preview says the same thing the run will do" true for a protection anywhere
+// above the object.
+//
+// One walk costs one openat per level, and the planner caches it per directory,
+// so the price is paid once per directory rather than once per file.
+func AncestorIdentities(sc *ScopeCtx, dir []byte) ([]domain.FileIdentity, error) {
+	// The scope root has no relative spelling of its own; it is still an
+	// ancestor, and a subtree protection recorded for it still matters.
+	var parts []string
+	if len(dir) > 0 {
+		var err error
+		parts, err = fsops.SplitRelative(dir)
+		if err != nil {
+			return nil, err
+		}
+	}
+	out := make([]domain.FileIdentity, 0, len(parts)+1)
+	for k := len(parts); k >= 0; k-- {
+		prefix := []byte("")
+		if k > 0 {
+			prefix = []byte(strings.Join(parts[:k], "/"))
+		}
+		d, oerr := sc.Root.OpenDir(prefix)
 		if oerr != nil {
 			if errors.Is(oerr, unix.ENOENT) {
 				continue
@@ -163,9 +197,13 @@ func (e *Executor) scopeGate(ctx context.Context, sc *ScopeCtx) error {
 	return nil
 }
 
-// controlOf maps a stop condition onto the control axis so the caller does not
+// ControlOf maps a stop condition onto the control axis so the caller does not
 // have to infer "may I continue" from a nil error.
-func controlOf(code string) string {
+//
+// It is exported because the runner reads batch results, where a stop condition
+// is a code on the result and not a Go error. Two copies of this table would let
+// a batch stop for one reason and be described as stopping for another.
+func ControlOf(code string) string {
 	switch code {
 	case string(errs.CodePaused), string(errs.CodeHeld), string(errs.CodeScopeChanged),
 		string(errs.CodeProtectionAliasUnresolved):

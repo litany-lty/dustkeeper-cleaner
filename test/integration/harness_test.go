@@ -356,6 +356,11 @@ func (e *env) planForMayFail(sc store.Scope, r store.Rule, maxFiles int) (plan.R
 		MaxBytes: 1 << 30,
 		Config:   e.cfg,
 		NowNS:    e.clock.Wall().UnixNano(),
+		// The command line supplies this walk; without it here the harness would
+		// be testing a planner that decides differently from the one a user runs.
+		AncestorsOf: func(dir string) ([]domain.FileIdentity, error) {
+			return execute.AncestorIdentities(sctx, []byte(dir))
+		},
 	})
 }
 
