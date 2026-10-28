@@ -79,13 +79,17 @@ type Report struct {
 	Missing    int    `json:"manifest_without_object"`
 	Orphans    int    `json:"orphan_objects"`
 	Unverified int    `json:"unverified"`
-	// ObjectState is read, missing or unreadable. Only read supports any claim
-	// that a particular object is not there.
-	ObjectState string   `json:"object_state"`
-	Conflicts   int      `json:"conflicts"`
-	Unknown     int      `json:"unknown_payloads"`
-	Entries     []Entry  `json:"entries"`
-	Notes       []string `json:"notes,omitempty"`
+	// ObjectState is read, partial, missing or unreadable. Only read supports
+	// any claim that a particular object is not there.
+	ObjectState string `json:"object_state"`
+	// ManifestState says the same for the manifests directory. A partial listing
+	// there cannot support "this object has no manifest": the manifest may be in
+	// the part that was not listed.
+	ManifestState string   `json:"manifest_state"`
+	Conflicts     int      `json:"conflicts"`
+	Unknown       int      `json:"unknown_payloads"`
+	Entries       []Entry  `json:"entries"`
+	Notes         []string `json:"notes,omitempty"`
 }
 
 // Inspect inventories the private directory inside rootPath.
@@ -116,9 +120,10 @@ func Inspect(rootPath string) (Report, error) {
 		rep.InstanceID, rep.ScopeID = id, scopeID
 	}
 
-	manifests, notes := readManifests(root)
+	manifests, manifestState, notes := readManifests(root)
 	rep.Notes = append(rep.Notes, notes...)
 	rep.Manifests = len(manifests)
+	rep.ManifestState = manifestState
 
 	inv := readObjects(root)
 	rep.Notes = append(rep.Notes, inv.notes...)
@@ -176,11 +181,21 @@ func Inspect(rootPath string) (Report, error) {
 				}
 			}
 		} else if e.Status == "" {
-			// Reached only when the directory was read, or when it is known to be
-			// entirely absent. Both establish that this object is not there.
-			e.Status = StatusMissingObject
-			e.Notes = append(e.Notes, "the manifest is intact but the object is gone; this is not a recoverable payload")
-			rep.Missing++
+			if inv.state == objectStatePartial {
+				// The listing stopped early. This object is not in the part that was
+				// read, which is not evidence that it is absent.
+				e.Status = StatusUnverified
+				e.Notes = append(e.Notes,
+					"the objects directory could not be read to the end; this object may be in the part that was not listed")
+				rep.Unverified++
+			} else {
+				// Reached only when the directory was read in full, or when it is
+				// known to be entirely absent. Both establish that this object is
+				// not there.
+				e.Status = StatusMissingObject
+				e.Notes = append(e.Notes, "the manifest is intact but the object is gone; this is not a recoverable payload")
+				rep.Missing++
+			}
 		}
 		rep.Entries = append(rep.Entries, e)
 	}
@@ -196,6 +211,16 @@ func Inspect(rootPath string) (Report, error) {
 	for _, name := range orphanNames {
 		o := objects[name]
 		e := Entry{Object: name, Status: StatusOrphanObject, ObjectSize: o.size}
+		if rep.ManifestState == ManifestStatePartial {
+			// "No manifest" is a statement about the manifests directory, and that
+			// directory did not finish. The object is real; the conclusion is not.
+			e.Status = StatusUnverified
+			e.Notes = append(e.Notes,
+				"the manifests directory could not be read to the end; this object may have a manifest that was not listed")
+			rep.Unverified++
+			rep.Entries = append(rep.Entries, e)
+			continue
+		}
 		e.Notes = append(e.Notes,
 			"no manifest: the original path cannot be reconstructed from this directory alone")
 		if o.err != "" {
@@ -230,17 +255,41 @@ type manifestEntry struct {
 	problem  string
 }
 
+// States of a directory listing. "I saw these names" and "I saw all of them" are
+// different facts, and only the second one supports a negative conclusion.
+const (
+	listStateRead    = "read"
+	listStatePartial = "partial"
+	listStateMissing = "missing"
+)
+
+// Exported listing states for the report, so callers do not match on strings.
+const (
+	ManifestStateRead    = listStateRead
+	ManifestStatePartial = listStatePartial
+	ManifestStateMissing = listStateMissing
+)
+
+// dirListing is one directory read: what it gave, and whether it gave all of it.
+type dirListing struct {
+	names []string
+	state string
+	notes []string
+}
+
 // readManifests reads every manifest without opening anything for writing.
-func readManifests(root *fsops.Root) ([]manifestEntry, []string) {
+func readManifests(root *fsops.Root) ([]manifestEntry, string, []string) {
 	dir, err := root.OpenDir([]byte(domain.VaultManifests))
 	if err != nil {
-		return nil, []string{fmt.Sprintf("the manifests directory is missing: %v", err)}
+		return nil, listStateMissing, []string{fmt.Sprintf("the manifests directory is missing: %v", err)}
 	}
 	defer dir.Close()
 
-	names, notes := listDir(dir)
+	listing := listDir(dir)
+	state := listing.state
+	notes := listing.notes
 	var out []manifestEntry
-	for _, name := range names {
+	for _, name := range listing.names {
 		if !strings.HasSuffix(name, ".json") {
 			notes = append(notes, "ignored a non-manifest entry in the manifests directory: "+name)
 			continue
@@ -278,7 +327,7 @@ func readManifests(root *fsops.Root) ([]manifestEntry, []string) {
 		out = append(out, manifestEntry{name: name, manifest: m})
 	}
 	sortManifestEntries(out)
-	return out, notes
+	return out, state, notes
 }
 
 type objectEntry struct {
@@ -286,12 +335,14 @@ type objectEntry struct {
 	err  string
 }
 
-// The three states an objects directory can be in. Only objectStateRead supports
+// The four states an objects directory can be in. Only objectStateRead supports
 // a statement about a particular object being absent; objectStateMissing
 // establishes that the whole directory is gone, which also establishes that no
-// object is in it; objectStateUnreadable establishes nothing.
+// object is in it; objectStatePartial saw some names and no more; and
+// objectStateUnreadable establishes nothing at all.
 const (
 	objectStateRead       = "read"
+	objectStatePartial    = "partial"
 	objectStateMissing    = "missing"
 	objectStateUnreadable = "unreadable"
 )
@@ -300,6 +351,7 @@ const (
 // to match a string to know which fact it is holding.
 const (
 	ObjectStateRead       = objectStateRead
+	ObjectStatePartial    = objectStatePartial
 	ObjectStateMissing    = objectStateMissing
 	ObjectStateUnreadable = objectStateUnreadable
 )
@@ -331,13 +383,17 @@ func readObjects(root *fsops.Root) objectInventory {
 	}
 	defer dir.Close()
 
-	names, notes := listDir(dir)
-	inv.notes = append(inv.notes, notes...)
-	inv.state = objectStateRead
+	listing := listDir(dir)
+	inv.notes = append(inv.notes, listing.notes...)
+	// A listing that stopped halfway is neither "read" nor "unreadable": the
+	// names it gave are real, and the ones it never reached are unknown. Saying
+	// "read" here is what turns an unfinished inventory into "the object is
+	// gone" for every manifest after the point where reading stopped.
+	inv.state = listing.state
 
 	out := inv.entries
 	var unknown []string
-	for _, name := range names {
+	for _, name := range listing.names {
 		if name == domain.VaultNonceName {
 			// The vault's own creation evidence, not a payload.
 			continue
@@ -345,7 +401,7 @@ func readObjects(root *fsops.Root) objectInventory {
 		id, tok, err := dir.StatEntry(name)
 		if err != nil {
 			if errors.Is(err, unix.ENOENT) {
-				notes = append(notes, "an object disappeared while it was being listed: "+name)
+				inv.notes = append(inv.notes, "an object disappeared while it was being listed: "+name)
 				continue
 			}
 			out[name] = objectEntry{err: err.Error()}
@@ -370,35 +426,52 @@ func (inv objectInventory) conclusion() string {
 		return "a manifest_and_object entry means the two names exist; the inventory compares no hash and no identity"
 	case objectStateMissing:
 		return "the objects directory does not exist, so every manifest is reported as having no object"
+	case objectStatePartial:
+		return "the objects directory could not be read to the end: objects that were not listed are unknown, not absent"
 	default:
 		return "the objects directory could not be read: absence of an object is not established"
 	}
 }
 
-// listDir returns the entry names of a directory, sorted.
+// listDir returns the entry names of a directory, sorted, and says whether it
+// reached the end.
 //
-// A read error is returned rather than swallowed: an inventory that silently
+// A read error is reported rather than swallowed: an inventory that silently
 // stops halfway is worse than one that says it could not finish, because the
-// operator would conclude the rest of the vault is empty.
-func listDir(d *fsops.Dir) ([]string, []string) {
-	var names []string
+// operator would conclude the rest of the vault is empty. The caller decides what
+// an incomplete listing permits; this function only refuses to hide it.
+func listDir(d *fsops.Dir) dirListing {
+	var out dirListing
 	for {
+		if err := listFault(d.Rel(), len(out.names)); err != nil {
+			// The listing was interrupted before the directory confirmed it had
+			// given everything. What was collected is kept; what it permits is
+			// decided by the caller.
+			out.state = listStatePartial
+			out.notes = []string{"the directory could not be read to the end: " + err.Error()}
+			break
+		}
 		batch, err := d.Readdir(128)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
 				break
 			}
-			return names, []string{"the directory could not be read to the end: " + err.Error()}
+			out.state = listStatePartial
+			out.notes = []string{"the directory could not be read to the end: " + err.Error()}
+			break
 		}
 		if len(batch) == 0 {
 			break
 		}
 		for _, e := range batch {
-			names = append(names, e.Name())
+			out.names = append(out.names, e.Name())
 		}
 	}
-	sort.Strings(names)
-	return names, nil
+	if out.state == "" {
+		out.state = listStateRead
+	}
+	sort.Strings(out.names)
+	return out
 }
 
 // sortManifestEntries orders by object name so that two inventories of the same

@@ -84,6 +84,12 @@ func (s *Store) IterateObservations(ctx context.Context, scope domain.ScopeID, f
 		return err
 	}
 	defer rows.Close()
+	// From here until the last row, the pool's connection belongs to this
+	// iterator. Anything the callback asks the store would wait for it for ever,
+	// so the store refuses those calls instead (see refuseNested). A caller that
+	// needs more facts should read them before iterating.
+	leave := s.enterIteration()
+	defer leave()
 	for rows.Next() {
 		o, err := scanObs(rows)
 		if err != nil {
@@ -113,7 +119,7 @@ func (s *Store) GetObservation(ctx context.Context, scope domain.ScopeID, rel []
 // CountObservations returns the number of live indexed paths.
 func (s *Store) CountObservations(ctx context.Context, scope domain.ScopeID) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx,
+	err := s.queryRow(ctx,
 		"SELECT COUNT(*) FROM observations WHERE scope_id=? AND status!='stale'", string(scope)).Scan(&n)
 	if err != nil {
 		return 0, errs.Wrap(errs.CodeDBError, err)

@@ -56,6 +56,12 @@ type Logger struct {
 
 // Open prepares the log in dir, creating the directory if needed.
 //
+// The file is opened under the private-file contract rather than with a plain
+// O_CREATE|O_APPEND: the log names every scope and every decision, so a
+// pre-created symlink, a FIFO, a hard link or a group-readable file is refused
+// instead of written through (see openPrivateLog). Refusing is the only outcome
+// that keeps the target unchanged.
+//
 // A failure to open the log is returned rather than swallowed: a run that believes
 // it is recording and is not would be exactly the kind of silent gap this package is
 // meant to close.
@@ -154,9 +160,9 @@ func newRotating(path string, max int64, keep int) (*rotating, error) {
 }
 
 func (r *rotating) open() error {
-	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	f, err := openPrivateLog(r.path)
 	if err != nil {
-		return fmt.Errorf("diag: open %s: %w", r.path, err)
+		return err
 	}
 	info, err := f.Stat()
 	if err != nil {
@@ -205,7 +211,9 @@ func (r *rotating) rotate() error {
 	for i := r.keep - 1; i >= 1; i-- {
 		from := fmt.Sprintf("%s.%d", r.path, i)
 		to := fmt.Sprintf("%s.%d", r.path, i+1)
-		if _, err := os.Stat(from); err == nil {
+		// Lstat, not Stat: a rotated name that has become a link is moved as a
+		// link, never resolved to the file it points at.
+		if _, err := os.Lstat(from); err == nil {
 			if err := os.Rename(from, to); err != nil {
 				return fmt.Errorf("diag: rotate %s: %w", from, err)
 			}

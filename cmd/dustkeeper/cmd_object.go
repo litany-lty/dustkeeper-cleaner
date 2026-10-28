@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"dustkeeper/internal/clocktrust"
@@ -660,6 +661,7 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 				fmt.Sprintf("  %d object(s): %d complete, %d manifest without object, %d orphan, %d unverified, %d conflict, %d unknown",
 					rep.Objects, rep.Complete, rep.Missing, rep.Orphans, rep.Unverified, rep.Conflicts, rep.Unknown),
 				"  objects directory: " + rep.ObjectState,
+				"  manifests directory: " + rep.ManifestState,
 			}
 			if rep.InstanceID != "" {
 				out.Human = append(out.Human, "  owner instance: "+rep.InstanceID)
@@ -680,14 +682,15 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 				out.Status = string(errs.StatusOf(out.Code))
 				out.Message = "the directory holds objects this inventory cannot explain; nothing was changed"
 				if rep.Unverified > 0 {
-					out.Message += "; some entries were not verified because the objects directory could not be read"
+					out.Message += "; some entries are unverified: " + listingLimit(rep)
 				}
 			case rep.Unverified > 0:
 				// Nothing is known to be missing. Reporting "everything is fine"
 				// here would turn an unavailable check into a conclusion.
 				out.Code = errs.CodeRecoveryRequired
 				out.Status = string(errs.StatusOf(out.Code))
-				out.Message = "the objects directory could not be read, so this inventory does not establish which objects are present; nothing was changed"
+				out.Message = "this inventory does not establish which objects are present (" +
+					listingLimit(rep) + "); nothing was changed"
 			}
 			if rep.Unverified > 0 {
 				out.Next = append(out.Next, "dustkeeper recover inspect --root "+rep.Root)
@@ -784,3 +787,23 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 }
 
 func jsonUnmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
+
+// listingLimit names which of the two listing states made an inventory
+// inconclusive. "Could not be read" and "could not be read to the end" lead to
+// different next steps, so the message does not merge them.
+func listingLimit(rep rescue.Report) string {
+	var parts []string
+	switch rep.ObjectState {
+	case rescue.ObjectStateUnreadable:
+		parts = append(parts, "the objects directory could not be read")
+	case rescue.ObjectStatePartial:
+		parts = append(parts, "the objects directory could not be read to the end")
+	}
+	if rep.ManifestState == rescue.ManifestStatePartial {
+		parts = append(parts, "the manifests directory could not be read to the end")
+	}
+	if len(parts) == 0 {
+		return "some entries could not be examined"
+	}
+	return strings.Join(parts, "; ")
+}

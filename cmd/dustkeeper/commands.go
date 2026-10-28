@@ -728,8 +728,8 @@ func cmdScan(ctx context.Context, a *app, args []string) (output, error) {
 		res.Data = map[string]any{"scan": st, "scan_state": scanState}
 		res.Human = []string{
 			fmt.Sprintf("scanned %d directories, %d files (%d bytes)", st.Dirs, st.Files, st.Bytes),
-			fmt.Sprintf("  protected directories skipped: %d, entries skipped: %d, unreadable: %d",
-				st.ProtectedDirs, st.SkippedEntries, st.Unreadable),
+			fmt.Sprintf("  protected directories skipped: %d, entries skipped: %d, unreadable: %d, vanished: %d",
+				st.ProtectedDirs, st.SkippedEntries, st.Unreadable, st.Vanished),
 		}
 		switch {
 		case scanState.Complete:

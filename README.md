@@ -149,24 +149,23 @@ go test -race ./...
 ```sh
 DUSTKEEPER_BENCH=1 DUSTKEEPER_BENCH_FILES=100000 \
   DUSTKEEPER_BENCH_OUT=docs/evidence/performance-100k.md \
-  go test ./test/bench -run TestLargeTreeScanEvidence -count=1 -v
+  go test ./test/bench -run 'TestSmallTreeScan|TestLargeTreeScanEvidence' -count=1 -v
 ```
 
-实测（darwin/arm64，APFS，10 万文件／1 000 个叶子目录／30% 重复，见
+实测（darwin/arm64，APFS，10 万文件／1 000 个叶子目录，见
 [`docs/evidence/performance-100k.md`](docs/evidence/performance-100k.md)）：
 
 | 阶段 | 结果 |
 |---|---|
-| 扫描 | 100 000 文件 / 1 051 目录，wall 38.5 s，epoch 完整，队列 pending 0，observation 100 000 行 |
-| 峰值 RSS | 30.0 MiB（门槛 256 MiB；100 万文件时仍是 30.8 MiB） |
-| 数据库 | 59.0 MiB，约 619 B/文件（100 万文件时 588.5 MiB） |
+| 完整扫描 | 100 000 文件 / 1 051 目录，wall 44.8 s，epoch 完整，队列 pending 0，observation 100 000 行 |
+| 峰值 RSS | 30.0 MiB（门槛 256 MiB） |
+| 数据库 | 180 KiB → 59.0 MiB，约 619 B/文件 |
+| 默认预算下的一轮运行 | 100 000 文件，扫描完整、未被预算中断，control=continue |
 | 中断续跑 | 8 批，累计扫描 1.00× 树大小（没有重复读），最长单批 5.2 s |
-| `dedup` | 30 000 组可规划、52.3 MiB 逻辑字节，峰值 RSS **389 MiB** —— 随文件数线性增长，**未达 256 MiB**，见 §7.3 |
 
-1 000 000 文件的那一轮（0% 重复，用于单独观察索引本身）见
-[`docs/evidence/performance-1m.md`](docs/evidence/performance-1m.md)。不设 `DUSTKEEPER_BENCH_OUT`
-时只打印数字、不落盘；`DUSTKEEPER_BENCH_MAX_RSS_MB` 改扫描门槛，`DUSTKEEPER_BENCH_DEDUP_MAX_RSS_MB`
-给 `dedup` 单独设一个门槛（默认只报告）。
+不设 `DUSTKEEPER_BENCH_OUT` 时只打印数字、不落盘；`DUSTKEEPER_BENCH_MAX_RSS_MB` 改扫描门槛。
+证据里 `content_bytes_read` 是 null（扫描不打开文件内容，没有可测值）、WAL 字节不适用
+（存储固定 `journal_mode=DELETE`）、`Rusage inblock` 只作为块层提示而非精确物理读取。
 
 fuzz 目标：`FuzzMatchName`、`FuzzHasDirPrefix`、`FuzzSplitRelative`、`FuzzValidateName`、
 `FuzzParseDraft`、`FuzzParseRule`。种子每次 `go test` 都跑；深挖用 `-fuzz`。

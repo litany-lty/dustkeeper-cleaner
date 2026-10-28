@@ -8,6 +8,7 @@ package run
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"golang.org/x/sys/unix"
 
@@ -272,6 +273,21 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, runLedger *domain
 	// would be a new business action past the deadline.
 	if runLedger.TimeUp(r.Clock.Mono()) {
 		sr.QuarantineSkipped = "run time slice spent during the scan"
+		return sr, nil
+	}
+	// An unfinished scan is a partial picture of the scope, and a rule evaluated
+	// against a partial picture is a rule evaluated against the wrong tree: the
+	// files it has not reached are not "not matching", they are unknown. Due
+	// purges were already handled above and a restore never depends on a scan, so
+	// only new quarantine waits for the next round.
+	if !scanState.Complete {
+		if scanState.FailedDirs > 0 {
+			sr.QuarantineSkipped = fmt.Sprintf(
+				"the scan of this scope is not complete: %d directory(ies) could not be read", scanState.FailedDirs)
+		} else {
+			sr.QuarantineSkipped = "the scan of this scope is not complete yet"
+		}
+		sr.Message = sr.QuarantineSkipped
 		return sr, nil
 	}
 

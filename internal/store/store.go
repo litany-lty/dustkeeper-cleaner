@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -36,6 +37,54 @@ type Store struct {
 	path string
 	mu   sync.Mutex
 	now  func() int64
+	// iterating counts open streaming queries. See refuseNested.
+	iterating int32
+}
+
+// refuseNested turns the pool's one-connection design into an error instead of
+// a hang.
+//
+// The pool has exactly one connection. A streaming query holds it until the last
+// row is read, so any other query issued from inside the row callback waits for a
+// connection that cannot be released before that callback returns. Nothing would
+// time out and nothing would report: the process would simply stop, holding the
+// state lock, in the middle of a plan.
+//
+// Callers must therefore not reach back into the store from a row callback. This
+// makes that mistake diagnosable where it happens, with the operation named,
+// instead of turning it into a hang that needs a debugger to explain. Callbacks
+// that need the database should collect their input first.
+func (s *Store) refuseNested(op string) error {
+	if atomic.LoadInt32(&s.iterating) > 0 {
+		return errs.Newf(errs.CodeDBError,
+			"%s was requested from inside an open row iterator: the state database has one connection, "+
+				"so a nested call would wait for a connection the iterator cannot release", op)
+	}
+	return nil
+}
+
+// enterIteration marks a streaming query as open and returns the release.
+func (s *Store) enterIteration() func() {
+	atomic.AddInt32(&s.iterating, 1)
+	return func() { atomic.AddInt32(&s.iterating, -1) }
+}
+
+// rowScanner is what a single-row query returns. It exists so a refused nested
+// query can be reported through the same Scan call the caller already writes,
+// instead of needing a second error path at every site.
+type rowScanner interface{ Scan(dest ...any) error }
+
+// errRow is a row whose only outcome is an error.
+type errRow struct{ err error }
+
+func (e errRow) Scan(...any) error { return e.err }
+
+// queryRow reads one row, refusing the call when a streaming iterator is open.
+func (s *Store) queryRow(ctx context.Context, q string, args ...any) rowScanner {
+	if err := s.refuseNested("a single-row query"); err != nil {
+		return errRow{err: err}
+	}
+	return s.db.QueryRowContext(ctx, q, args...)
 }
 
 // Open opens or creates the database at path and applies the pragmas and
@@ -257,6 +306,9 @@ func (s *Store) NowNS() int64 { return s.now() }
 // write runs fn inside an immediate transaction, holding the process-wide write
 // mutex so two goroutines can never interleave a state change and its event.
 func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	if err := s.refuseNested("a write"); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -276,9 +328,15 @@ func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	return nil
 }
 
-// read runs a query and fully drains it before returning, because the pool has
-// exactly one connection: a nested query during iteration would deadlock.
+// read starts a streaming query.
+//
+// The rows keep the pool's single connection until they are closed, so the
+// caller must consume them before asking the store anything else; a nested call
+// is refused with an error rather than left to wait (see refuseNested).
 func (s *Store) read(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	if err := s.refuseNested("a query"); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, errs.Wrap(errs.CodeDBError, err)
@@ -289,7 +347,7 @@ func (s *Store) read(ctx context.Context, q string, args ...any) (*sql.Rows, err
 // MetaGet reads a meta value.
 func (s *Store) MetaGet(ctx context.Context, key string) (string, error) {
 	var v string
-	err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", key).Scan(&v)
+	err := s.queryRow(ctx, "SELECT value FROM meta WHERE key=?", key).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -339,7 +397,7 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 		{"protections", &st.Protections},
 	}
 	for _, p := range pairs {
-		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+p.table).Scan(p.dst); err != nil {
+		if err := s.queryRow(ctx, "SELECT COUNT(*) FROM "+p.table).Scan(p.dst); err != nil {
 			return st, errs.Wrap(errs.CodeDBError, err)
 		}
 	}

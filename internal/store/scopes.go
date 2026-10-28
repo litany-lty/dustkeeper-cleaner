@@ -179,7 +179,7 @@ func (s *Store) SetScanEpoch(ctx context.Context, id domain.ScopeID, epoch int64
 // ScopeExists reports whether a scope ID is taken.
 func (s *Store) ScopeExists(ctx context.Context, id domain.ScopeID) (bool, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM scopes WHERE scope_id=?", string(id)).Scan(&n)
+	err := s.queryRow(ctx, "SELECT COUNT(*) FROM scopes WHERE scope_id=?", string(id)).Scan(&n)
 	if err != nil {
 		return false, errs.Wrap(errs.CodeDBError, err)
 	}

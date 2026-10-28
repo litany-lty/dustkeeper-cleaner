@@ -269,7 +269,7 @@ func (s *Store) PurgeQueuePage(ctx context.Context, scope domain.ScopeID, nowNS 
 // CountItemsByState reports how many items of a scope are in a state.
 func (s *Store) CountItemsByState(ctx context.Context, scope domain.ScopeID, state string) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx,
+	err := s.queryRow(ctx,
 		"SELECT COUNT(*) FROM items WHERE scope_id=? AND state=?", string(scope), state).Scan(&n)
 	if err != nil {
 		return 0, errs.Wrap(errs.CodeDBError, err)
@@ -281,7 +281,7 @@ func (s *Store) CountItemsByState(ctx context.Context, scope domain.ScopeID, sta
 // path. A keeper with an active dependency must not be quarantined.
 func (s *Store) KeeperInUse(ctx context.Context, scope domain.ScopeID, rel []byte) (bool, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, `
+	err := s.queryRow(ctx, `
 SELECT COUNT(*) FROM items
 WHERE keeper_scope_id=? AND keeper_raw_relative=? AND keeper_pin_active=1
   AND state IN ('q_intent','quarantined','r_intent','p_intent')`,
@@ -319,7 +319,7 @@ WHERE keeper_scope_id=? AND keeper_raw_relative=? AND keeper_pin_active=1`,
 // needed would be a way to lose data.
 func (s *Store) ScopeHasUnresolved(ctx context.Context, scope domain.ScopeID) (bool, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, `
+	err := s.queryRow(ctx, `
 SELECT COUNT(*) FROM items
 WHERE scope_id=?
   AND (pending_op_id IS NOT NULL

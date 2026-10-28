@@ -100,6 +100,12 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 	// The ancestry of a candidate depends only on the directory that holds it, so
 	// one walk serves every file in that directory. Without the cache a large
 	// tree would be walked once per file.
+	//
+	// The walk is the only thing this callback does outside the row it was given,
+	// and it deliberately does not touch the store: the iterator below holds the
+	// database's single connection, so a query from here would wait for ever. The
+	// store refuses such a call rather than hanging, but the rule is that the
+	// callback stays a decision about one observation.
 	type ancestry struct {
 		ids []domain.FileIdentity
 		err error

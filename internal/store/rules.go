@@ -113,7 +113,7 @@ func (s *Store) ListActiveRules(ctx context.Context) ([]Rule, error) {
 // NextRuleRevision returns the next revision number for a rule ID.
 func (s *Store) NextRuleRevision(ctx context.Context, id domain.RuleID) (int64, error) {
 	var rev sql.NullInt64
-	if err := s.db.QueryRowContext(ctx,
+	if err := s.queryRow(ctx,
 		"SELECT MAX(revision) FROM rules WHERE rule_id=?", string(id)).Scan(&rev); err != nil {
 		return 0, errs.Wrap(errs.CodeDBError, err)
 	}

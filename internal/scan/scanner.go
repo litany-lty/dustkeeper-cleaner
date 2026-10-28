@@ -10,6 +10,7 @@ package scan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"unicode/utf8"
@@ -57,8 +58,14 @@ type Stats struct {
 	SkippedEntries int   `json:"skipped_entries"`
 	Unreadable     int   `json:"unreadable"`
 	FailedDirs     int   `json:"failed_dirs"`
-	Interrupted    bool  `json:"interrupted"`
-	Incomplete     bool  `json:"incomplete"`
+	// Vanished counts entries that were listed and then could not be stat'ed
+	// because they were gone. It is the one entry-level error that means "this
+	// path really is not there any more", so it is counted apart from Unreadable:
+	// "the file ended" and "the filesystem would not answer" lead to opposite
+	// conclusions.
+	Vanished    int  `json:"vanished_entries"`
+	Interrupted bool `json:"interrupted"`
+	Incomplete  bool `json:"incomplete"`
 }
 
 // New returns a scanner with conservative defaults.
@@ -263,6 +270,11 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 		obsBatch []store.Observation
 		dirBatch [][]byte
 		nowNS    = s.Clock.Wall().UnixNano()
+		// Entries this directory listed but could not describe. They are not
+		// reported one by one: the queue row carries one reason, and the queue is
+		// what survives this process.
+		unverifiedCount int
+		unverifiedFirst string
 	)
 
 	flush := func() error {
@@ -312,15 +324,43 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 				continue
 			}
 
-			id, token, err := dir.StatEntry(name)
-			if err != nil {
-				stats.Unreadable++
-				continue
-			}
-
 			childRel := name
 			if len(rel) > 0 {
 				childRel = string(rel) + "/" + name
+			}
+
+			// One entry the filesystem would not describe. "I could not look" is
+			// not "it is not there": the directory is unfinished, the epoch stays
+			// open, and the old observation of this path survives. Only ENOENT is
+			// an answer about the file itself.
+			if herr := entryStatError(childRel); herr != nil {
+				if errors.Is(herr, unix.ENOENT) {
+					stats.Vanished++
+					continue
+				}
+				stats.Unreadable++
+				unverifiedCount++
+				if unverifiedFirst == "" {
+					unverifiedFirst = fmt.Sprintf("%q: %v", name, herr)
+				}
+				continue
+			}
+
+			id, token, err := dir.StatEntry(name)
+			if err != nil {
+				if errors.Is(err, unix.ENOENT) {
+					// It was in the listing and is gone by the time we asked. The
+					// epoch's retirement sweep is what withdraws its observation,
+					// and it may only run if the epoch completes.
+					stats.Vanished++
+					continue
+				}
+				stats.Unreadable++
+				unverifiedCount++
+				if unverifiedFirst == "" {
+					unverifiedFirst = fmt.Sprintf("%q: %v", name, err)
+				}
+				continue
 			}
 
 			switch id.Kind {
@@ -368,6 +408,17 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 				return dirFailedWith("flush failed"), err
 			}
 		}
+		if unverifiedCount > 0 {
+			// The entries that could be read are written first: a directory that
+			// is only partly describable still has facts worth updating. What it
+			// does not have is an ending - the epoch stays open, so the
+			// observations this pass could not confirm are not retired as stale.
+			if err := flush(); err != nil {
+				return dirFailedWith("flush failed"), err
+			}
+			return dirFailedWith(fmt.Sprintf("%d entries could not be inspected (first: %s)",
+				unverifiedCount, unverifiedFirst)), nil
+		}
 		if run.TimeUp(s.Clock.Mono()) {
 			// Flush what we have, then report the directory as unfinished. Its
 			// already-recorded observations stay; the rest is picked up by the
@@ -387,6 +438,15 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 
 // InsertFailures counts unreadable entries per run; kept for reporting only.
 func (s Stats) InsertFailures() int { return s.Unreadable }
+
+// entryStatError consults the test seam. It is nil in production, so the whole
+// cost is one branch per entry.
+func entryStatError(rel string) error {
+	if f := TestHookEntryStat; f != nil {
+		return f(rel)
+	}
+	return nil
+}
 
 // SanitizeDisplay is used by reports; kept here so the scanner owns the rule
 // that display strings never round-trip into syscalls.
