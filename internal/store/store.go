@@ -26,6 +26,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/sys/unix"
 
 	"dustkeeper/internal/errs"
 	"dustkeeper/migrations"
@@ -95,19 +96,45 @@ func (s *Store) queryRow(ctx context.Context, q string, args ...any) rowScanner 
 // first write (CheckSupportedState), and the operator keeps the old binary and the
 // old state until they have a verified copy to move forward from. Migration code
 // still runs, but only for a database this call is creating.
+//
+// A database this call creates is published as one step. The baseline is built at
+// a staging path and only linked into place once every migration has committed,
+// because the refusal above is otherwise self-defeating: the migrations commit one
+// at a time, so a first installation interrupted after 001 leaves a file that the
+// next run reads as "an old schema, keep the previous binary" - and there is no
+// previous binary, because this was the first one. See createStateFile.
 func Open(path string) (*Store, error) {
 	existing, err := databaseExists(path)
 	if err != nil {
 		return nil, err
 	}
+	// A zero-length file is not a database: no header, no schema, no rows. It is
+	// what an attempt that stopped inside SQLite's own initialisation leaves
+	// behind, and it cannot be distinguished from an empty state directory by the
+	// version check - version 0 reads as "older than this build". It is removed
+	// rather than migrated: there is nothing in it to keep.
 	if existing {
-		// The pre-flight reads the header directly, so a file that is not ours is
-		// refused without SQLite touching it.
-		if err := CheckSupportedState(path); err != nil {
+		empty, eerr := isEmptyFile(path)
+		if eerr != nil {
+			return nil, eerr
+		}
+		if empty {
+			if rerr := os.Remove(path); rerr != nil {
+				return nil, errs.Wrap(errs.CodeAccessDenied, rerr)
+			}
+			existing = false
+		}
+	}
+	if !existing {
+		if err := createStateFile(path); err != nil {
 			return nil, err
 		}
-	} else if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	// Past this point the file exists and has to be the schema this build writes.
+	// The pre-flight reads the header directly, so a file that is not ours is
+	// refused without SQLite touching it.
+	if err := CheckSupportedState(path); err != nil {
+		return nil, err
 	}
 
 	// Only connection-level options live in the DSN. Durability pragmas are set
@@ -123,14 +150,12 @@ func Open(path string) (*Store, error) {
 
 	s := &Store{db: db, path: path, now: func() int64 { return time.Now().UnixNano() }}
 
-	if existing {
-		// Opening an existing file is where SQLite rolls back a hot journal, so
-		// the version is re-read after that recovery and before the pragmas. The
-		// header check ran on the bytes that were on disk before it.
-		if err := s.requireCurrentSchema(); err != nil {
-			db.Close()
-			return nil, err
-		}
+	// Opening the file is where SQLite rolls back a hot journal, so the version is
+	// re-read after that recovery and before the pragmas. The header check ran on
+	// the bytes that were on disk before it.
+	if err := s.requireCurrentSchema(); err != nil {
+		db.Close()
+		return nil, err
 	}
 	if err := s.applyPragmas(); err != nil {
 		db.Close()
@@ -140,18 +165,109 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if !existing {
-		if err := s.migrate(); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		// A permission fix-up failure is worth reporting but not fatal: the
 		// database was created by the current user inside a 0700 directory.
 		_ = err
 	}
 	return s, nil
+}
+
+// stagingSuffix names the half-built database of an interrupted first
+// installation. Nothing else in the product creates this name.
+const stagingSuffix = ".init"
+
+// createStateFile builds a new state database and publishes it in one step.
+//
+// The order is the point:
+//
+//	build and migrate at state.db.init  ->  link it to state.db  ->  remove the
+//	staging name  ->  flush the directory
+//
+// link(2) does not replace an existing file, so a database that appeared in the
+// meantime is an error rather than a casualty; and a process that dies before the
+// link leaves no state.db at all, only a staging file that the next run resumes
+// from. Resuming is safe because every migration commits on its own and
+// migrations.For picks up at whatever version the file reached - unlike the
+// published name, which is held to the "no in-place migration" rule.
+func createStateFile(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	staging := path + stagingSuffix
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=1000&_txlock=immediate", staging)
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return errs.Wrap(errs.CodeDBError, err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
+	tmp := &Store{db: db, path: staging, now: func() int64 { return time.Now().UnixNano() }}
+	if err := tmp.applyPragmas(); err != nil {
+		db.Close()
+		return err
+	}
+	if err := tmp.verifyPragmas(); err != nil {
+		db.Close()
+		return err
+	}
+	if err := tmp.migrate(); err != nil {
+		// The staging file is left where it is on purpose: the next attempt
+		// resumes from the last committed step.
+		db.Close()
+		return err
+	}
+	if err := db.Close(); err != nil {
+		return errs.Wrap(errs.CodeDBError, err)
+	}
+	if err := os.Link(staging, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return errs.Newf(errs.CodeDBError,
+				"%s appeared while this installation was being created; refusing to replace it", path)
+		}
+		return errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	if err := os.Remove(staging); err != nil {
+		// The published name is the same inode, so this is untidiness rather
+		// than a state problem.
+		_ = err
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// isEmptyFile reports whether path is a regular file of zero length.
+func isEmptyFile(path string) (bool, error) {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, nil
+		}
+		return false, errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		// Not a regular file: CheckSupportedState is what refuses it, with the
+		// right message.
+		return false, nil
+	}
+	return st.Size == 0, nil
+}
+
+// syncDir flushes a directory so a link created in it survives a crash.
+func syncDir(dir string) error {
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	defer unix.Close(fd)
+	if err := unix.Fsync(fd); err != nil {
+		return errs.Wrap(errs.CodeDurabilityFailed, err)
+	}
+	return nil
 }
 
 // requireCurrentSchema re-reads the schema version of a database that already

@@ -94,8 +94,16 @@ func CheckSupportedState(path string) error {
 // The state directory is private to the user; a database that is reachable
 // through a link is not the file the operator registered, and a FIFO would block
 // the process that opens it. Both are refused here, before any read.
+//
+// O_NONBLOCK is what makes the second refusal true rather than aspirational.
+// Opening a FIFO for reading without it waits for a writer, and that wait happens
+// in open(2) - before the fstat that would have rejected the file. status,
+// doctor, run and init would all hang on a FIFO they were about to refuse. With
+// O_NONBLOCK the open returns immediately and the regular-file check below is the
+// first thing that looks at the file. The flag changes nothing for a regular
+// file, which is the only kind this function is willing to return.
 func openStateFile(path string) (*os.File, int64, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, 0, err
 	}
