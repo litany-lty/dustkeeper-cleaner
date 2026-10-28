@@ -129,7 +129,12 @@ func inspectELF(path, want string) (artifactFacts, error) {
 			}
 		}
 	}
-	if libs, err := f.ImportedLibraries(); err == nil {
+	if libs, err := neededLibraries(f); err != nil {
+		// A dynamic section that cannot be parsed is not "no dependencies". Treating
+		// a parse failure as an empty list is how a binary with a loader would be
+		// reported as static.
+		return artifactFacts{}, fmt.Errorf("%s has a dynamic section that could not be read: %w", path, err)
+	} else {
 		facts.needed = libs
 	}
 	if facts.interp == "" && len(facts.needed) == 0 {
@@ -138,6 +143,15 @@ func inspectELF(path, want string) (artifactFacts, error) {
 		facts.linkage = "dynamic"
 	}
 	return facts, nil
+}
+
+// neededLibraries lists the shared libraries an ELF file requires.
+//
+// It distinguishes the two outcomes that used to be merged: a file with no dynamic
+// section has no dependencies (nil, nil), while a dynamic section that cannot be
+// read is an error the caller must fail on.
+func neededLibraries(f *elf.File) ([]string, error) {
+	return f.ImportedLibraries()
 }
 
 // machoMachines maps the arch names onto Mach-O cpu types. A darwin binary is never
@@ -163,7 +177,9 @@ func inspectMachO(path, want string) (artifactFacts, error) {
 		return artifactFacts{}, fmt.Errorf("%s is %s, expected %s", path, f.Cpu, wantCPU)
 	}
 	facts := artifactFacts{format: "macho", machine: want, linkage: "linked"}
-	if libs, err := f.ImportedLibraries(); err == nil {
+	if libs, lerr := f.ImportedLibraries(); lerr != nil {
+		return artifactFacts{}, fmt.Errorf("%s has load commands that could not be read: %w", path, lerr)
+	} else {
 		facts.needed = libs
 	}
 	return facts, nil

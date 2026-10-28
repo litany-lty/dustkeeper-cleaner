@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-28T05:25:11Z",
+  "generated_at": "2026-10-28T05:59:53Z",
   "host": "darwin/arm64",
   "go_version": "go1.26.1",
   "requested_files": 100000,
@@ -13,10 +13,10 @@
     "mean_file_bytes": 1829.26752
   },
   "full_scan": {
-    "wall_ms": 44830,
-    "cpu_user_ms": 1446,
-    "cpu_sys_ms": 2943,
-    "peak_rss_bytes": 31506432,
+    "wall_ms": 39637,
+    "cpu_user_ms": 1506,
+    "cpu_sys_ms": 3044,
+    "peak_rss_bytes": 32243712,
     "os_disk_read_hint_bytes": 0,
     "content_bytes_read": null,
     "epoch": 2,
@@ -42,9 +42,9 @@
   },
   "default_budget_run": {
     "run_soft_seconds": 60,
-    "wall_ms": 39825,
-    "cpu_user_ms": 1410,
-    "cpu_sys_ms": 3152,
+    "wall_ms": 40646,
+    "cpu_user_ms": 1472,
+    "cpu_sys_ms": 2928,
     "peak_rss_bytes": 32047104,
     "scanned_files": 100000,
     "scan_epoch_complete": true,
@@ -53,11 +53,11 @@
     "control": "continue"
   },
   "resume": {
-    "batches": 8,
+    "batches": 10,
     "files_scanned_total": 100000,
     "files_scanned_over_files": 1,
-    "peak_rss_bytes": 32227328,
-    "longest_batch_ms": 5189,
+    "peak_rss_bytes": 31719424,
+    "longest_batch_ms": 5131,
     "final_epoch_complete": true
   },
   "limits": {

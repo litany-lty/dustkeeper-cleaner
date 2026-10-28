@@ -1,8 +1,14 @@
 name: ci
 
-# The release gate is a script, so it is tested like one: the same command runs
-# on every platform, and the cgo/SQLite build is compiled on both operating
-# systems this project claims to support.
+# Two jobs, one per release target, and each one starts by asserting that the
+# runner really is the target the job claims. A runner image that changes
+# architecture must break this workflow: a release with no artifact for the
+# declared target is the failure this gate exists for, and "ubuntu-latest" or
+# "macos-latest" is a label, not an architecture.
+#
+# The release itself is produced the way build/build.sh documents: natively on
+# macOS, and on Linux only through the pinned container entry point, so the
+# artifact that CI verifies is the same kind of artifact a release publishes.
 on:
   push:
     branches: [main]
@@ -16,7 +22,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: linux-amd64
+          - os: macos-latest
+            target: darwin-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +35,19 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # The assertion, not an inference: go env is what the compiler will target,
+      # and it is compared with the target this job says it is producing.
+      - name: assert the runner is the target this job claims
+        run: |
+          set -eu
+          got="$(go env GOOS)-$(go env GOARCH)"
+          if [ "$got" != "${{ matrix.target }}" ]; then
+            echo "::error::runner is $got but this job claims ${{ matrix.target }}"
+            echo "move the job to a ${{ matrix.target }} runner, or change the claim"
+            exit 1
+          fi
+          echo "runner ${{ matrix.os }} is $got, as claimed"
 
       - name: build
         run: go build ./...
@@ -40,17 +63,45 @@ jobs:
       - name: race
         run: go test -race ./... -count=1
 
-      # A release must fail when a declared target is missing. On a runner with no
-      # cross C compiler that is exactly the situation, so the expected exit code
-      # is 1 — asserting it here keeps the gate itself under test.
-      - name: release gate refuses an incomplete release
+      # Linux: the only sanctioned entry point, pinned by digest, building on
+      # linux/amd64 inside the image. It re-checks the artifact's headers itself.
+      - name: release (pinned container)
+        if: matrix.target == 'linux-amd64'
+        run: ./build/build-linux-release.sh
+
+      # macOS: native compile, signature, artifact facts, `version` and the
+      # quarantine/restore smoke.
+      - name: release (native)
+        if: matrix.target == 'darwin-arm64'
+        run: ./build/build.sh --release
+
+      # This target's artifact, or a failure. The manifest is written from facts
+      # read during this build, so a missing or stale artifact cannot pass.
+      - name: assert this target's artifact exists, matches its checksum, and runs
         run: |
-          set +e
-          ./build/build.sh --release
-          code=$?
-          set -e
-          if [ "$code" -eq 0 ]; then
-            echo "a release without every declared target exited 0"
+          set -eu
+          target="${{ matrix.target }}"
+          manifest=dist/release-manifest.txt
+          if [ ! -f "$manifest" ]; then
+            echo "::error::the build wrote no release manifest"
             exit 1
           fi
-          echo "release gate exited $code as expected"
+          if ! grep -q "^target=$target " "$manifest"; then
+            echo "::error::the manifest does not record target=$target"
+            cat "$manifest"
+            exit 1
+          fi
+          artifact="$(sed -n 's/^artifact=//p' "$manifest")"
+          want="$(sed -n 's/^sha256=//p' "$manifest")"
+          if [ -z "$artifact" ] || [ ! -s "dist/$artifact" ]; then
+            echo "::error::the manifest names no artifact, or it is not in dist"
+            cat "$manifest"
+            exit 1
+          fi
+          got="$( (shasum -a 256 "dist/$artifact" 2>/dev/null || sha256sum "dist/$artifact") | cut -d' ' -f1)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::$artifact hashes to $got, the manifest says $want"
+            exit 1
+          fi
+          echo "$artifact sha256=$got (matches the manifest)"
+          "./dist/$artifact" version

@@ -12,3 +12,6 @@ coverage.*
 
 # macOS metadata.
 .DS_Store
+
+# Stray binary from `go build ./build/verify-artifact` run at the repo root.
+/verify-artifact

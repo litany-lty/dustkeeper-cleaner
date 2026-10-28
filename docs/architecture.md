@@ -40,7 +40,7 @@
        │            │           │  └──────► scope                  config
        │            │           │              │                     │
        ▼            ▼           ▼              ▼                     ▼
-      scan ──────► fsops ◄──── dedup         store ──► migrations   strictjson
+      scan ──────► fsops                   store ──► migrations   strictjson
         │           │                          │
         └───────────┴──────────► domain ◄──────┘
                                      ▲
@@ -65,7 +65,6 @@
 | `clocktrust` | 时钟可信基线、确认动作与受影响对象的新到期时间 | `domain`、`store` |
 | `recovery` | 对账矩阵 | `execute`、`fsops`、`scope`、`store` |
 | `rescue` | 不打开数据库的只读清单（`recover inspect --root`） | `fsops`、`domain` |
-| `dedup` | 精确重复检测（实现 `execute.KeeperVerifier`） | 以上全部 |
 | `run` | 编排一次运行 | 以上全部 |
 | `schedule` | systemd / launchd 模板渲染 | `errs` |
 
@@ -324,7 +323,7 @@ plan_digest      = sha256(purpose + "\n" + canonicalJSON{plan 字段 + 每个 it
   并要求 `doctor --acknowledge-clock` 显式确认。确认动作只写 `clock_ack_ns`，**不修改任何已记录的
   `quarantined_at_ns` / `purge_not_before_ns`**——不确定的时间不能被一次确认抹平。
 - `purge_not_before = quarantined_at + retention`，两端都用整数纳秒，`domain.AddSecondsNS` 溢出即失败。
-- 保留期只能来自被批准的 DSL（生命周期对象）或宿主的固定 30 天（精确重复对象，显示在计划里并计入摘要）。
+- 保留期只能来自被批准的 DSL。规则里没有一处能表达"授权"：`retention_seconds` 是最短保留期，不是删除许可。
 
 ---
 
@@ -365,25 +364,21 @@ SQLite 本身用单写连接（`SetMaxOpenConns(1)`）、`journal_mode=DELETE`�
 ## 11. 已知限制（一期）
 
 - 只支持 Linux 与 macOS；其他平台 `init` 之后第一个 `doctor` 就会返回 `UNSUPPORTED_FS`。
-- 四个发布目标（darwin-arm64/amd64、linux-amd64/arm64）都能交叉编译，但只有 darwin/arm64 跑过完整闭环。
-  其余三个在 README 的平台表里标为**实验性**，不声称已验收。
-- `build/build.sh --release` 要求四个目标、签名与 `SHA256SUMS` 全部齐备，缺一个就退出 1；Linux 固定
-  musl 静态链接，不产出 glibc 版本。
+- 两个发布目标：`darwin-arm64` 与 `linux-amd64`，各自在**自己的机器上原生构建**（`build/build.sh` 是单目标，
+  不接受 GOOS/GOARCH 覆盖）。Linux 只通过固定 digest 镜像的 `build/build-linux-release.sh` 产出，
+  静态链接 musl。不是这两个目标的机器仍能做开发构建，但产物不带"受支持"的说法、也不写发布清单。
+- 发布清单由构建期读出的事实生成（目标、Go 与 musl 版本、编译器 triple、musl 证据、产物头信息、
+  checksum、这份制品实际跑过哪些动作）。缺一项证据就没有清单，因为那一轮已经失败。
 - 隔离区在被清理的目录内部（`<scope>/.dustkeeper/objects`），因此 `scan` 显式跳过 `.dustkeeper`
   （`scan.vaultName`）；这在一期是可接受的取舍（同卷保证排他 rename 可用），代价是清理整棵目录时会连同
   隔离区一起被带走。
-- `dedup` 的 keeper 选择是保守的：元数据不一致就报告"保留"，不做近似判定；跨 scope 提升 keeper 只在
-  提供 `--keeper-scope` 时发生。分组已改为**按大小分组流式处理**（一个 size 组哈希完就比对并释放），
-  因此工作集不再同时持有 bySize + byHash + 结果三份索引；但结果集本身仍是"每个重复组两个候选"，
-  峰值随文件数线性增长（10 万文件实测 442 MiB），**未达到 256 MiB 的扫描门槛**，见
-  [`docs/compliance.md`](compliance.md) §7.3 与 `docs/evidence/performance-100k.md`。
 - 运行日志在 `internal/diag`（`log/slog` + 自实现轮转）：`<state>/logs/dustkeeper.jsonl`，2 MiB × 3，
   单字段 4 KiB 截断，文件 0600；记录 `phase=begin|result|run|scope|op`，字段含 run_id / scope_id /
   plan_id / object_id / op_id / item_id / code / status / exit / retryable / control / next_steps，
   以及本轮读取字节、动作数与待处理计数。文件内容、模型密钥不进入日志（`TestTheLogNeverCarriesTheModelKeyOrFileContents`
   在真实命令上断言）。
-- `internal/scan`、`execute`、`recovery`、`dedup`、`run` 仍没有包内单测，主路径由 `test/integration`
-  覆盖；`test/bench` 已能产出完整的工作量与资源证据（`docs/evidence/performance-*.md`），但 `dedup`
-  的内存上限仍未解决（见上）。
+- `internal/scan`、`execute`、`recovery`、`run` 仍没有包内单测，主路径由 `test/integration` 覆盖；
+  `test/bench` 能产出完整的工作量与资源证据（`docs/evidence/performance-100k.md`），10 万文件扫描
+  峰值 RSS 30.8 MiB，远低于 256 MiB 的门槛。
 
 逐条的文档对照、仍缺的验收用例与"实现待补测"清单见 [`docs/compliance.md`](compliance.md)。
