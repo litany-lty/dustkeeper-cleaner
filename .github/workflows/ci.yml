@@ -36,18 +36,27 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # The assertion, not an inference: go env is what the compiler will target,
-      # and it is compared with the target this job says it is producing.
+      # The assertion, not an inference. GOHOSTOS/GOHOSTARCH are the system and
+      # architecture of the Go toolchain binary itself; GOOS/GOARCH are target
+      # settings, which an image or an exported variable can set to something else.
+      # Both are checked: the host has to match the claim, and the toolchain must not
+      # have been pointed at a different target than the host it is running on.
       - name: assert the runner is the target this job claims
         run: |
           set -eu
-          got="$(go env GOOS)-$(go env GOARCH)"
-          if [ "$got" != "${{ matrix.target }}" ]; then
-            echo "::error::runner is $got but this job claims ${{ matrix.target }}"
+          host="$(go env GOHOSTOS)-$(go env GOHOSTARCH)"
+          target="$(go env GOOS)-$(go env GOARCH)"
+          if [ "$host" != "$target" ]; then
+            echo "::error::the toolchain targets $target but runs on $host"
+            echo "unset GOOS/GOARCH: this job builds the host's artifact"
+            exit 1
+          fi
+          if [ "$host" != "${{ matrix.target }}" ]; then
+            echo "::error::runner is $host but this job claims ${{ matrix.target }}"
             echo "move the job to a ${{ matrix.target }} runner, or change the claim"
             exit 1
           fi
-          echo "runner ${{ matrix.os }} is $got, as claimed"
+          echo "runner ${{ matrix.os }} is $host (GOHOSTOS/GOHOSTARCH), as claimed"
 
       - name: build
         run: go build ./...
@@ -105,3 +114,21 @@ jobs:
           fi
           echo "$artifact sha256=$got (matches the manifest)"
           "./dist/$artifact" version
+
+      # The four files the manifest cites, this target's, as one archive. They are
+      # uploaded after the checks above, so what is downloadable is what was
+      # verified here: rebuilding for a later download would produce a different
+      # binary (timestamp, commit stamp) and could not stand in for this one.
+      # if-no-files-found=error is the gate: an empty archive must not pass as an
+      # archive.
+      - name: archive this target's verified artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dustkeeper-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            dist/dustkeeper-*-${{ matrix.target }}
+            dist/SHA256SUMS
+            dist/release-manifest.txt
+            dist/build-facts.txt

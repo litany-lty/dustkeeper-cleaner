@@ -27,8 +27,15 @@
 # a Linux artifact must be statically linked against musl, and the claim is proved
 # twice, because "-static" alone only asks the linker for a static link:
 #
-#   1. the compiler says which libc it links (<cc> -dumpmachine names musl, or its
-#      own spec/include paths do), and its version is recorded next to the facts;
+#   1. the link inputs the compiler really passes to the linker name musl -- the
+#      startfile (crt1.o/Scrt1.o) and the -L it hands to collect2, read back from a
+#      static link of a probe. Not a directory that happens to appear in the
+#      include search list: CPATH can add any directory there, so an empty one
+#      called *musl* would otherwise prove a glibc compiler. Not
+#      -print-file-name=libc.a either: Debian's musl-gcc answers that with glibc's
+#      path while linking musl's archive. Not the banner or -print-sysroot: they
+#      can say anything. A compiler that targets musl outright (triple names musl)
+#      is its own evidence, because that is the driver's answer about itself;
 #   2. the artifact is opened and its headers read (build/verify-artifact): no
 #      PT_INTERP, no DT_NEEDED. A binary that cannot be checked fails the release
 #      instead of being labelled.
@@ -61,6 +68,9 @@ environment:
   DUSTKEEPER_BUILD_ENV=...  how to describe the build environment in the release
                        manifest, e.g. "docker:golang@sha256:..." for a pinned
                        builder image. Recorded, not interpreted.
+  DUSTKEEPER_MUSL_PACKAGES=...  the musl packages the Linux builder installed, e.g.
+                       "musl=1.2.3-1,musl-dev=1.2.3-1". Recorded next to the libc
+                       proof; not interpreted.
   ALLOW_UNPROVED_LIBC=1  development only: keep a Linux artifact whose libc could
                        not be proved. Recorded as linkage=unproved and never
                        labelled musl. A release ignores this variable.
@@ -99,8 +109,21 @@ OUT="$ROOT/dist"
 # the artifact name and in the facts file rather than left to the reader.
 RELEASE_TARGETS="darwin-arm64 linux-amd64"
 
-HOST_OS=$(go env GOOS)
-HOST_ARCH=$(go env GOARCH)
+# The host is the machine the toolchain runs on, which GOHOSTOS/GOHOSTARCH
+# report. GOOS/GOARCH are target settings: an exported GOOS or a CI image default
+# can point the build at another system, and then "darwin-arm64" in the artifact
+# name would be a claim about the host that the build never made. The two must
+# agree or this script refuses to name anything.
+HOST_OS=$(go env GOHOSTOS)
+HOST_ARCH=$(go env GOHOSTARCH)
+BUILD_OS=$(go env GOOS)
+BUILD_ARCH=$(go env GOARCH)
+if [ "$BUILD_OS-$BUILD_ARCH" != "$HOST_OS-$HOST_ARCH" ]; then
+	echo "error: the toolchain targets $BUILD_OS-$BUILD_ARCH but runs on $HOST_OS-$HOST_ARCH" >&2
+	echo "       unset GOOS/GOARCH: this script builds the host's artifact, and naming a" >&2
+	echo "       cross-compiled binary after the host is what the release gate forbids" >&2
+	exit 1
+fi
 TARGET="$HOST_OS-$HOST_ARCH"
 
 mkdir -p "$OUT"
@@ -119,12 +142,34 @@ fi
 # assembled from constants at the end of the script is a wish, not a record.
 FACTS_FILE="$OUT/build-facts.txt"
 : >"$FACTS_FILE"
+
+# Same reason for the manifest: dist holds one release claim at a time, and the
+# manifest names the artifact this run verified. Last run's manifest left sitting
+# there while a new build is in progress is exactly how a build that failed halfway
+# turns into something a person reads as a release. Only this file and this run's
+# artifact are touched: other versions' binaries in dist are not this script's.
+rm -f "$OUT/release-manifest.txt"
 record_fact() {
 	printf '%s\n' "$1" >>"$FACTS_FILE"
 }
 
 TMPD=$(mktemp -d "${TMPDIR:-/tmp}/dustkeeper-build.XXXXXX")
 trap 'rm -rf "$TMPD"' EXIT
+
+# fail_release is the single way out of the stages after the build. Every one of
+# them exists to prove something about the artifact in dist, so a failure there
+# means this run proved nothing: the binary it would have published, this run's
+# checksum file and the manifest that would have cited them are all removed.
+# Leaving them behind produces a dist directory that looks like a release and
+# verifies as one, which is the confusion the checksum step exists to rule out.
+fail_release() {
+	echo "error: $1" >&2
+	if [ -n "${BUILT:-}" ]; then
+		rm -f "$BUILT"
+	fi
+	rm -f "$OUT/SHA256SUMS" "$OUT/release-manifest.txt"
+	exit 1
+}
 
 # complain reports a problem. A release treats it as fatal, a development build as
 # advisory; neither one swallows it.
@@ -199,6 +244,11 @@ smoke_qr() {
 	work=$2
 	mkdir -p "$work/tree" "$work/state" "$work/config"
 	printf 'smoke payload\n' >"$work/tree/old.zip"
+	# The bytes that have to come back. Asking "is there a file at the original
+	# path" after a restore is satisfied by a file that was never moved, or by an
+	# empty one, so the content is kept and compared instead.
+	mkdir -p "$work/keep"
+	cp "$work/tree/old.zip" "$work/keep/old.zip"
 	# The rule's minimum age is a day (the schema refuses anything shorter), so the
 	# file has to look older than that. touch -t is POSIX on both targets.
 	touch -t 202001010000 "$work/tree/old.zip"
@@ -254,6 +304,14 @@ JSON
 	fi
 	step 17 "$work/apply.json" plan apply --id "$plan_id" --digest "$plan_digest" --json || return $?
 
+	# A quarantine that reported success and left the source where it was is not a
+	# quarantine. The list below would still look right, which is why this is
+	# checked against the filesystem and not against the tool's own report.
+	if [ -e "$work/tree/old.zip" ]; then
+		echo "smoke: the source is still at its original path after a quarantine was applied" >&2
+		return 17
+	fi
+
 	step 18 "$work/list.json" quarantine list --json || return $?
 	item=$(json_str item_id <"$work/list.json")
 	if [ -z "$item" ]; then
@@ -268,6 +326,19 @@ JSON
 	if [ ! -f "$work/tree/old.zip" ]; then
 		echo "smoke: the restore did not put the file back" >&2
 		return 19
+	fi
+	# Same bytes, not merely "a file is there": a restore that writes the wrong
+	# content is worse than one that fails, because the listing looked fine.
+	if ! cmp -s "$work/keep/old.zip" "$work/tree/old.zip"; then
+		echo "smoke: the restored file's content differs from the file that was quarantined" >&2
+		return 19
+	fi
+	# And the object's own record has to agree: nothing may stay listed as
+	# restorable once it is back.
+	step 20 "$work/list2.json" quarantine list --json || return $?
+	if grep -q "\"$item\"" "$work/list2.json"; then
+		echo "smoke: $item is still listed as a quarantined object after its restore" >&2
+		return 20
 	fi
 	return 0
 }
@@ -299,61 +370,83 @@ build_target() {
 		triple=$("$probe_cc" -dumpmachine 2>/dev/null || echo unknown)
 		ccver=$("$probe_cc" --version 2>/dev/null | head -1 || echo unknown)
 		sysroot=$("$probe_cc" -print-sysroot 2>/dev/null || echo "")
-		# Which libc will this compiler actually link? A compiler's real target is
-		# what it says about its own spec and include search path, not what its
-		# filename is: Debian's musl-gcc reports "x86_64-linux-gnu" from
-		# -dumpmachine and is still musl, because it injects musl's specs, headers
-		# and libc.a. So the evidence is taken from the two places the compiler
-		# answers about itself:
+		# Which libc will this artifact link? The answer has to come from the link
+		# itself, because every cheaper answer can be made to say "musl" while the
+		# linker reads glibc:
 		#
-		#   * the include search list it prints for -v, read only from the block
-		#     between "#include <...> search starts here:" and "End of search
-		#     list." -- that block is where headers are really looked up;
-		#   * the libc.a it would link (-print-file-name=libc.a).
+		#   * anything CPATH names is prepended to the include search list printed by
+		#     -v, so an empty directory called musl-headers-placeholder shows up in
+		#     front of glibc's headers;
+		#   * -print-file-name=libc.a answers with glibc's archive even for Debian's
+		#     musl-gcc, whose specs send the real -lc somewhere else;
+		#   * the banner and -print-sysroot are free text.
 		#
-		# A path that merely mentions musl somewhere in the transcript is not
-		# evidence: a banner line, or a -print-sysroot answer, can say anything
-		# while the compiler links glibc. Only a musl path in the search list the
-		# compiler really uses, or a musl libc.a, counts.
+		# So the probe is a real static link, and the command the driver then runs is
+		# read back from its own transcript: the startfile it passes and the -L it
+		# hands to collect2 are the inputs ld will open. musl-gcc puts both in musl's
+		# directory; a glibc compiler puts both in glibc's, whatever CPATH says. A
+		# driver that targets musl outright (its triple names musl) is its own
+		# evidence, because that is its answer about itself.
 		probe_src="$TMPD/libc-probe.c"
 		printf 'int main(void){return 0;}\n' >"$probe_src"
 		probe_log="$TMPD/libc-probe.log"
-		"$probe_cc" -v -c "$probe_src" -o "$TMPD/libc-probe.o" >"$probe_log" 2>&1 || true
+		# A probe that cannot compile or link is a failure, not a missing proof: it
+		# says this compiler cannot produce the artifact at all.
+		if ! "$probe_cc" -static -v -o "$TMPD/libc-probe" "$probe_src" >"$probe_log" 2>&1; then
+			fail_target "$TARGET cannot be linked: the static libc probe failed with $probe_cc ($(tail -1 "$probe_log" 2>/dev/null))"
+			return 0
+		fi
 		include_list=$(awk '/#include <\.\.\.> search starts here:/{f=1;next} /End of search list\./{f=0} f' \
 			"$probe_log" 2>/dev/null || true)
-		musl_include=$(printf '%s\n' "$include_list" | tr -s ' \t' '\n' | grep 'musl' | head -1 || true)
 		libc_a=$("$probe_cc" -print-file-name=libc.a 2>/dev/null || echo libc.a)
-		musl_libc=""
-		case "$libc_a" in
-		/*musl*) musl_libc=$libc_a ;;
-		esac
-		musl_evidence=${musl_include:-$musl_libc}
+		link_line=$(grep -m1 -e 'collect2' -e ' -lc' "$probe_log" 2>/dev/null || true)
+		startfile=""
+		musl_libdir=""
+		for tok in $link_line; do
+			case "$tok" in
+			*crt1.o) startfile=$tok ;;
+			esac
+			case "$tok" in
+			-L*musl*) musl_libdir=$tok ;;
+			esac
+		done
+		# Both have to come from musl: a startfile alone can be passed by hand, and a
+		# -L alone does not say what the linker finds in that directory.
+		musl_evidence=""
 		proved=0
 		case "$triple" in
-		*musl*) proved=1 ;;
-		esac
-		if [ -n "$musl_evidence" ]; then
+		*musl*)
 			proved=1
+			musl_evidence="triple:$triple"
+			;;
+		esac
+		if [ "$proved" = 0 ] && [ -n "$musl_libdir" ]; then
+			case "$startfile" in
+			*musl*)
+				proved=1
+				musl_evidence=$startfile
+				;;
+			esac
 		fi
 		if [ "$proved" = 0 ]; then
 			# A glibc static binary is still a glibc binary: it must never be
 			# labelled musl-static, and a release refuses it outright.
 			if [ "$MODE" = release ] || [ "${ALLOW_UNPROVED_LIBC:-0}" != "1" ]; then
-				fail_target "$TARGET was built with $probe_cc, which targets '$triple' and links $libc_a, not musl"
+				fail_target "$TARGET was linked by $probe_cc with startfile '${startfile:-none}' and lib search '${musl_libdir:-no musl -L}', not musl"
 				return 0
 			fi
 			if ! facts=$("$VERIFY" -file "$out" -format elf -machine "$HOST_ARCH" 2>&1); then
 				fail_target "$TARGET is not a readable $HOST_ARCH ELF: $facts"
 				return 0
 			fi
-			echo "dev: $TARGET linkage is unproved (compiler targets '$triple' and links $libc_a); this artifact is not a musl static build" >&2
-			record_fact "target=$TARGET format=elf arch=$HOST_ARCH linkage=unproved toolchain=$triple compiler=$probe_cc compiler_version=\"$ccver\" libc_a=$libc_a include_search=\"$(printf '%s' "$include_list" | tr '\n' ' ' | sed 's/  */ /g')\" build_env=${DUSTKEEPER_BUILD_ENV:-host} artifact=[$facts]"
+			echo "dev: $TARGET linkage is unproved (compiler targets '$triple', startfile '${startfile:-none}'); this artifact is not a musl static build" >&2
+			record_fact "target=$TARGET format=elf arch=$HOST_ARCH linkage=unproved toolchain=$triple compiler=$probe_cc compiler_version=\"$ccver\" startfile=${startfile:-none} libc_a=$libc_a musl_pkgs=${DUSTKEEPER_MUSL_PACKAGES:-unknown} include_search=\"$(printf '%s' "$include_list" | tr '\n' ' ' | sed 's/  */ /g')\" build_env=${DUSTKEEPER_BUILD_ENV:-host} artifact=[$facts]"
 		else
 			if ! facts=$("$VERIFY" -file "$out" -format elf -machine "$HOST_ARCH" -require static 2>&1); then
 				fail_target "$TARGET is not a static $HOST_ARCH ELF: $facts"
 				return 0
 			fi
-			record_fact "target=$TARGET format=elf arch=$HOST_ARCH linkage=static toolchain=$triple compiler=$probe_cc compiler_version=\"$ccver\" sysroot=${sysroot:-none} musl_evidence=$musl_evidence build_env=${DUSTKEEPER_BUILD_ENV:-host} artifact=[$facts]"
+			record_fact "target=$TARGET format=elf arch=$HOST_ARCH linkage=static toolchain=$triple compiler=$probe_cc compiler_version=\"$ccver\" sysroot=${sysroot:-none} startfile=${startfile:-none} musl_libdir=${musl_libdir:-none} libc_a=$libc_a musl_evidence=$musl_evidence musl_pkgs=${DUSTKEEPER_MUSL_PACKAGES:-unknown} build_env=${DUSTKEEPER_BUILD_ENV:-host} artifact=[$facts]"
 		fi
 	else
 		if ! facts=$("$VERIFY" -file "$out" -format macho -machine "$HOST_ARCH" 2>&1); then
@@ -388,7 +481,7 @@ build_target() {
 		smoke_work="$TMPD/smoke"
 		mkdir -p "$smoke_work"
 		if smoke_qr "$out" "$smoke_work" >"$smoke_work/log" 2>&1; then
-			record_fact "target=$TARGET smoke_qr=ok flow=\"init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore\""
+			record_fact "target=$TARGET smoke_qr=ok flow=\"init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore,quarantine list\" source_gone_after_apply=yes restored_bytes_match=yes"
 		else
 			step=$?
 			fail_target "$TARGET failed the quarantine/restore smoke (step $step); see the log"
@@ -413,14 +506,12 @@ build_target
 echo "version=$VERSION commit=$COMMIT target=$TARGET built=$STAMP mode=$MODE"
 
 if [ "$FAILED" -eq 1 ]; then
-	echo "release is incomplete: $TARGET produced no acceptable artifact" >&2
-	exit 1
+	fail_release "release is incomplete: $TARGET produced no acceptable artifact"
 fi
 if [ -z "$BUILT" ] || [ ! -s "$BUILT" ]; then
 	# "Attempted" is not "produced": a step that returns 0 without leaving an
 	# artifact is still a missing target.
-	echo "error: no artifact for $TARGET" >&2
-	exit 1
+	fail_release "no artifact for $TARGET"
 fi
 
 # A checksum file is worthless if it can be empty, partial or stale, so it is
@@ -432,8 +523,7 @@ elif command -v sha256sum >/dev/null 2>&1; then
 	SHA="sha256sum"
 fi
 if [ -z "$SHA" ]; then
-	echo "error: no SHA-256 tool found; refusing to produce unverified artifacts" >&2
-	exit 1
+	fail_release "no SHA-256 tool found; refusing to produce unverified artifacts"
 fi
 
 name=$(basename "$BUILT")
@@ -442,16 +532,13 @@ name=$(basename "$BUILT")
 # this build.
 rm -f "$OUT/SHA256SUMS"
 if ! (cd "$OUT" && $SHA "$name" >SHA256SUMS); then
-	echo "error: could not write $OUT/SHA256SUMS" >&2
-	exit 1
+	fail_release "could not write $OUT/SHA256SUMS"
 fi
 if ! (cd "$OUT" && $SHA -c SHA256SUMS >/dev/null); then
-	echo "error: $OUT/SHA256SUMS does not verify" >&2
-	exit 1
+	fail_release "$OUT/SHA256SUMS does not verify"
 fi
 if [ "$(wc -l <"$OUT/SHA256SUMS" | tr -d ' ')" != "1" ]; then
-	echo "error: SHA256SUMS does not cover exactly one artifact" >&2
-	exit 1
+	fail_release "SHA256SUMS does not cover exactly one artifact"
 fi
 checksum=$(cut -d' ' -f1 "$OUT/SHA256SUMS")
 
@@ -462,16 +549,19 @@ if [ "$MODE" = release ]; then
 	# artifact in this build, it is not a constant.
 	if [ "$HOST_OS" = "linux" ]; then
 		if ! grep -q "^target=$TARGET .*linkage=static" "$FACTS_FILE"; then
-			echo "release is incomplete, libc policy unproved: $TARGET" >&2
-			exit 1
+			fail_release "release is incomplete, libc policy unproved: $TARGET"
 		fi
+		# The proof line names the inputs it was read from, so a reader can go and
+		# look at them; it is not a sentence about the policy in general.
 		libc_line="linux_libc=musl-static"
-		libc_proof="linux_libc_proof=compiler names musl; artifact has no PT_INTERP and no DT_NEEDED"
+		libc_proof="linux_libc_proof=link inputs name musl (see startfile and musl_libdir above); artifact has no PT_INTERP and no DT_NEEDED"
 	else
 		libc_line="linux_libc=not-applicable"
 		libc_proof="linux_libc_proof=not-applicable (this artifact is Mach-O)"
 	fi
-	{
+	# The manifest is written to a temporary name and moved into place only once it
+	# is complete: a reader must never find a half-written manifest in dist.
+	if ! {
 		echo "# release manifest: one key=value per record"
 		echo "# artifact and toolchain facts below were read during this build"
 		echo "version=$VERSION"
@@ -487,7 +577,11 @@ if [ "$MODE" = release ]; then
 		echo "artifact=$name"
 		echo "sha256=$checksum"
 		cat "$FACTS_FILE"
-	} >"$OUT/release-manifest.txt"
+	} >"$OUT/release-manifest.txt.tmp"; then
+		rm -f "$OUT/release-manifest.txt.tmp"
+		fail_release "could not write the release manifest"
+	fi
+	mv "$OUT/release-manifest.txt.tmp" "$OUT/release-manifest.txt"
 fi
 
 echo "artifacts in $OUT"

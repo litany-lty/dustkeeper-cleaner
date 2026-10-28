@@ -97,10 +97,22 @@ export CC=musl-gcc
 # from the image name.
 go_version=$(go version)
 musl_version=$(musl-gcc --version | head -1)
+# Which musl this is, asked of the package manager rather than assumed: the version
+# string printed by musl-gcc belongs to the compiler, and says nothing about where
+# the archive the linker reads came from. On an image without dpkg this stays empty
+# and the manifest records "unknown" instead of a guess.
+musl_pkgs=""
+for pkg in musl musl-dev musl-tools; do
+	pkgver=$(dpkg-query -W -f=\$\{Version\} "$pkg" 2>/dev/null || true)
+	if [ -n "$pkgver" ]; then musl_pkgs="$musl_pkgs$pkg=$pkgver,"; fi
+done
+musl_pkgs=${musl_pkgs%,}
+export DUSTKEEPER_MUSL_PACKAGES=$musl_pkgs
 export DUSTKEEPER_BUILD_ENV="docker:$DK_IMAGE platform=linux/amd64 $go_version / $musl_version"
 
 echo "go:   $go_version"
 echo "musl: $musl_version"
+echo "musl packages: ${musl_pkgs:-unknown}"
 echo
 
 ./build/build.sh --release

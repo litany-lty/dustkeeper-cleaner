@@ -111,7 +111,7 @@ type measured struct {
 	User    time.Duration
 	Sys     time.Duration
 	MaxRSS  int64
-	DiskIn  int64 // Rusage inblock * 512: a block-layer hint, not exact bytes
+	DiskIn  int64 // Rusage inblock: filesystem input operations, not bytes
 	ExitOK  bool
 	JSONEnv map[string]any
 }
@@ -128,7 +128,7 @@ func (b *benchEnv) run(args ...string) measured {
 		if ru, ok := ps.SysUsage().(*syscall.Rusage); ok {
 			m.User = timeval(ru.Utime)
 			m.Sys = timeval(ru.Stime)
-			m.DiskIn = int64(ru.Inblock) * 512
+			m.DiskIn = int64(ru.Inblock)
 		}
 	}
 	if strings.HasPrefix(strings.TrimSpace(m.Output), "{") {
@@ -340,7 +340,12 @@ func content(seed int, size int64) []byte {
 // evidence is one report row. Every field is produced by a run; none is typed by
 // hand, which is the difference between this and a claim.
 type evidence struct {
-	GeneratedAt  string           `json:"generated_at"`
+	GeneratedAt string `json:"generated_at"`
+	// Commit is recorded with the numbers, because a performance figure without
+	// the tree it was measured on is a figure about nothing in particular. It is
+	// read from git and reported as "unknown" when that fails: a written-in
+	// constant would be worse than an honest gap.
+	Commit       string           `json:"commit"`
 	Host         string           `json:"host"`
 	GoVersion    string           `json:"go_version"`
 	FilesFromEnv int              `json:"requested_files"`
@@ -356,10 +361,12 @@ type scanFacts struct {
 	UserMS      int64 `json:"cpu_user_ms"`
 	SysMS       int64 `json:"cpu_sys_ms"`
 	MaxRSSBytes int64 `json:"peak_rss_bytes"`
-	// DiskReadHintBytes is Rusage inblock * 512. It is a block-layer counter: on
-	// a machine with a warm page cache it is near zero even though the scan read
-	// every directory, so it is reported as a hint and never as "bytes read".
-	DiskReadHintBytes int64 `json:"os_disk_read_hint_bytes"`
+	// DiskInOps is Rusage inblock as the kernel reports it: a count of filesystem
+	// input operations. The manual says operations, so multiplying it by 512 would
+	// manufacture bytes out of a number that is not measured in them; the unit is
+	// kept and named instead. It is a block-layer counter either way: with a warm
+	// page cache it stays near zero even though the scan read every directory.
+	DiskInOps int64 `json:"inblock_ops"`
 	// ContentBytesRead is null, not zero: the scan opens no file content, so
 	// there is no measurement to report. Zero would read like one.
 	ContentBytesRead *int64 `json:"content_bytes_read"`
@@ -400,6 +407,10 @@ type defaultRunFacts struct {
 	Interrupted   bool   `json:"scan_interrupted"`
 	DeepScan      bool   `json:"deep_scan_required"`
 	Control       string `json:"control"`
+	// Code is the envelope code this run ended with. It is recorded so that the
+	// row cannot be read as a measurement when the run actually failed: only OK
+	// and PARTIAL describe work the budget stopped.
+	Code          string `json:"code"`
 	QuarantineMsg string `json:"quarantine_skipped,omitempty"`
 }
 
@@ -533,6 +544,7 @@ func TestLargeTreeScanEvidence(t *testing.T) {
 
 	ev := evidence{
 		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+		Commit:       repoCommit(),
 		Host:         runtime.GOOS + "/" + runtime.GOARCH,
 		GoVersion:    runtime.Version(),
 		FilesFromEnv: b.files,
@@ -590,6 +602,11 @@ func (b *benchEnv) defaultBudgetRun(t *testing.T) defaultRunFacts {
 	if m.Err != nil && m.JSONEnv == nil {
 		t.Fatalf("default-budget run: %v\n%s", m.Err, m.Output)
 	}
+	// A run that ended on a real failure can still print a partial result, and a
+	// partial result still has a scanned count. Timing it would then record a
+	// failure as performance evidence, so the same allowed codes as the resume
+	// batches apply.
+	facts.Code = acceptableRunCode(t, "default-budget run", m)
 	data := dataOf(t, m)
 	scopes, ok := data["scopes"].([]any)
 	if !ok || len(scopes) != 1 {
@@ -620,6 +637,18 @@ func (b *benchEnv) defaultBudgetRun(t *testing.T) defaultRunFacts {
 		t.Fatal("the default-budget run scanned nothing at all")
 	}
 	return facts
+}
+
+// acceptableRunCode fails unless the run ended on a code that still describes
+// measured work. OK is a complete run and PARTIAL is a run the budget or the scan
+// state cut short; anything else is a failure that happened to print numbers.
+func acceptableRunCode(t *testing.T, what string, m measured) string {
+	t.Helper()
+	code, _ := m.JSONEnv["code"].(string)
+	if code != "OK" && code != "PARTIAL" {
+		t.Fatalf("%s ended with %q (%v):\n%s", what, code, m.Err, m.Output)
+	}
+	return code
 }
 
 // strOr reads an optional string. It is used only for fields the envelope
@@ -657,9 +686,7 @@ func (b *benchEnv) resumeFacts(t *testing.T, shape treeShape) resumeFacts {
 		if m.Err != nil && m.JSONEnv == nil {
 			t.Fatalf("batch %d: %v\n%s", batch, m.Err, m.Output)
 		}
-		if code, _ := m.JSONEnv["code"].(string); code != "OK" && code != "PARTIAL" {
-			t.Fatalf("batch %d ended with %s: %v\n%s", batch, code, m.Err, m.Output)
-		}
+		acceptableRunCode(t, fmt.Sprintf("batch %d", batch), m)
 		data := dataOf(t, m)
 		scan := mustObj(t, data, "scan")
 		state := mustObj(t, data, "scan_state")
@@ -721,7 +748,7 @@ func (b *benchEnv) fullScanFacts(t *testing.T, shape treeShape, initialDB int64)
 	facts.UserMS = m.User.Milliseconds()
 	facts.SysMS = m.Sys.Milliseconds()
 	facts.MaxRSSBytes = m.MaxRSS
-	facts.DiskReadHintBytes = m.DiskIn
+	facts.DiskInOps = m.DiskIn
 	facts.DirsScanned = int(mustNum(t, scan, "dirs"))
 	facts.FilesScanned = int(mustNum(t, scan, "files"))
 	facts.MetadataBytes = mustNum(t, scan, "bytes")
@@ -767,6 +794,21 @@ func (b *benchEnv) fullScanFacts(t *testing.T, shape treeShape, initialDB int64)
 		t.Fatalf("observation rows %d for %d files", facts.Observations, shape.Files)
 	}
 	return facts
+}
+
+// repoCommit reports the commit the numbers were measured on. Short, and
+// "unknown" rather than a guess: an evidence file that cannot be traced back to a
+// tree is not evidence of anything.
+func repoCommit() string {
+	root, err := repoRoot()
+	if err != nil {
+		return "unknown"
+	}
+	out, err := exec.Command("git", "-C", root, "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // repoRoot walks up from the working directory to the directory holding go.mod.
@@ -826,7 +868,8 @@ func markdown(ev evidence) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<!-- generated by test/bench; do not edit by hand -->\n")
 	fmt.Fprintf(&b, "# 性能证据：%s 文件的扫描与续扫（%s）\n\n", humanInt(ev.Shape.Files), ev.Host)
-	fmt.Fprintf(&b, "生成于 %s，Go %s，单进程 bench（真实二进制，非 mock）。\n\n", ev.GeneratedAt, ev.GoVersion)
+	fmt.Fprintf(&b, "生成于 %s，commit %s，Go %s，单进程 bench（真实二进制，非 mock）。\n\n",
+		ev.GeneratedAt, ev.Commit, ev.GoVersion)
 
 	b.WriteString("## 1. 工作量（先证明扫完了）\n\n")
 	b.WriteString("| 项目 | 数值 |\n|---|---|\n")
@@ -854,10 +897,10 @@ func markdown(ev evidence) string {
 	row("完整扫描前 / 后的库大小", fmt.Sprintf("%s / %s", humanBytes(ev.Scan.DBBytesBefore), humanBytes(ev.Scan.DBBytesAfter)))
 	row("数据库增长（相对初始）", humanBytes(ev.Scan.DBGrowthBytes))
 	row("每文件数据库占用", fmt.Sprintf("%.0f B", ev.Scan.BytesPerFile))
-	row("内核块层读取（Rusage inblock×512，仅提示）", humanBytes(ev.Scan.DiskReadHintBytes))
+	row("内核块层输入操作（Rusage inblock，单位：次）", humanCount(ev.Scan.DiskInOps))
 	row("WAL 字节", nullOrInt(ev.Scan.WALBytes))
 	b.WriteString("\n")
-	b.WriteString("口径说明：`内核块层读取` 是进程级的块层计数，不是精确物理读取字节，扫描只读元数据时它可能接近 0；")
+	b.WriteString("口径说明：`inblock_ops` 是 getrusage 的 `ru_inblock` 原值，手册把它定义为文件系统输入**操作次数**，不是字节数，所以只记次数、不乘 512 冒充字节；扫描只读元数据时它可能接近 0；")
 	b.WriteString("`content_bytes_read` 为 null——扫描不打开文件内容，因此没有可测值，0 会被误读成测量结果；")
 	fmt.Fprintf(&b, "%s。\n", ev.Scan.WALApplicability)
 
@@ -915,6 +958,12 @@ func humanInt(n int) string {
 	}
 	out = append([]string{s}, out...)
 	return strings.Join(out, ",")
+}
+
+// humanCount formats an operation count. Not humanBytes: inblock counts
+// operations, and dressing a count up as a size is the mistake this replaced.
+func humanCount(n int64) string {
+	return fmt.Sprintf("%d ops", n)
 }
 
 func humanBytes(n int64) string {

@@ -34,8 +34,10 @@ type scriptDir struct {
 const stubGo = `#!/bin/sh
 if [ "${1:-}" = "env" ]; then
 	case "${2:-}" in
-	GOOS) echo "$STUB_HOST_OS" ;;
-	GOARCH) echo "$STUB_HOST_ARCH" ;;
+	GOOS) echo "${STUB_GOOS:-$STUB_HOST_OS}" ;;
+	GOARCH) echo "${STUB_GOARCH:-$STUB_HOST_ARCH}" ;;
+	GOHOSTOS) echo "$STUB_HOST_OS" ;;
+	GOHOSTARCH) echo "$STUB_HOST_ARCH" ;;
 	*) echo "" ;;
 	esac
 	exit 0
@@ -62,10 +64,31 @@ if [ "${1:-}" = "build" ]; then
 	cat >"$out" <<'ARTIFACT'
 #!/bin/sh
 # A stand-in for dustkeeper: version plus the quarantine/restore flow.
+#
+# The quarantine is modelled as the product behaves in the two places the smoke
+# now checks independently: "plan apply" takes the source out of the tree, and
+# "quarantine restore" puts those bytes back. STUB_QR_NOOP and STUB_QR_BAD_BYTES
+# break exactly one of those while every command still exits 0 -- the two shapes
+# of failure a smoke that only reads JSON would call a success.
+vault="${DUSTKEEPER_STATE_DIR%/}/stub-vault"
+tree=$(cat "${DUSTKEEPER_STATE_DIR%/}/stub-tree" 2>/dev/null)
 case "${1:-}" in
 version) echo "dustkeeper stub (stub/os)" ;;
 init) echo '{"status":"ok","data":{}}' ;;
-scope) echo '{"status":"ok","data":{"scope_id":"scp_stub"}}' ;;
+scope)
+	case "${2:-}" in
+	add)
+		shift 2
+		while [ $# -gt 0 ]; do
+			case "$1" in
+			--path) printf '%s' "$2" >"${DUSTKEEPER_STATE_DIR%/}/stub-tree"; tree=$2; shift 2 ;;
+			*) shift ;;
+			esac
+		done
+		echo '{"status":"ok","data":{"scope_id":"scp_stub"}}' ;;
+	*) exit 2 ;;
+	esac
+	;;
 scan) echo '{"status":"ok","data":{"scan":{},"scan_state":{}}}' ;;
 rule)
 	case "${2:-}" in
@@ -77,20 +100,38 @@ rule)
 plan)
 	case "${2:-}" in
 	create) echo '{"status":"ok","data":{"plan_id":"pln_stub","digest":"sha256:stub"}}' ;;
-	apply) echo '{"status":"ok","data":{}}' ;;
+	apply)
+		mkdir -p "$vault"
+		: >"$vault/obj_stub"
+		if [ "${STUB_QR_NOOP:-0}" != "1" ] && [ -n "$tree" ] && [ -f "$tree/old.zip" ]; then
+			mv "$tree/old.zip" "$vault/old.zip"
+		fi
+		echo '{"status":"ok","data":{}}'
+		;;
 	*) exit 2 ;;
 	esac
 	;;
 quarantine)
 	case "${2:-}" in
 	list)
-		if [ "${STUB_BROKEN_QR:-0}" = "1" ]; then
+		if [ "${STUB_BROKEN_QR:-0}" = "1" ] || [ ! -f "$vault/obj_stub" ]; then
 			echo '{"status":"ok","data":{"objects":[]}}'
 		else
 			echo '{"status":"ok","data":{"objects":[{"item_id":"obj_stub","state":"quarantined","restorable":true}]}}'
 		fi
 		;;
-	restore) echo '{"status":"ok","data":{}}' ;;
+	restore)
+		if [ -n "$tree" ] && [ -f "$vault/old.zip" ]; then
+			if [ "${STUB_QR_BAD_BYTES:-0}" = "1" ]; then
+				printf 'something else entirely\n' >"$tree/old.zip"
+				rm -f "$vault/old.zip"
+			else
+				mv "$vault/old.zip" "$tree/old.zip"
+			fi
+		fi
+		rm -f "$vault/obj_stub"
+		echo '{"status":"ok","data":{}}'
+		;;
 	*) exit 2 ;;
 	esac
 	;;
@@ -105,11 +146,14 @@ exit 2
 `
 
 // stubCC answers the questions the libc policy asks a compiler: which triple it
-// targets, which version it is, and -- the part the policy actually reads -- which
-// include search list and libc.a it would use. Both are derived from the triple, so
-// a stub that claims glibc triple really answers like glibc, and a test that wants
-// to see how the policy treats a noisy transcript can override the banner and
-// sysroot without changing the libc it links.
+// targets, which version it is, and -- the part the policy actually reads -- what
+// the link would be made of. The policy reads the startfile and the -L that the
+// driver passes to collect2 during a static link, because that is the only answer
+// the compiler cannot be talked into by CPATH, a banner or -print-file-name. All of
+// it is derived from the triple, so a stub that claims a glibc triple really answers
+// like glibc and one that claims musl answers like musl; a test that wants to see
+// how the policy treats a noisy transcript can override the banner, the sysroot and
+// the include list without changing the link.
 const stubCC = `#!/bin/sh
 t=${STUB_CC_TRIPLE:-x86_64-linux-musl}
 case "${1:-}" in
@@ -126,8 +170,28 @@ case "${1:-}" in
 		echo "${STUB_CC_VERSION:-stub cc 1.0 for tests}"
 		echo "${STUB_CC_BANNER:-}"
 		echo "#include <...> search starts here:"
-		echo " ${STUB_CC_INCLUDE:-/usr/include/$t}"
+		for d in ${STUB_CC_INCLUDE:-/usr/include/$t}; do echo " $d"; done
 		echo "End of search list."
+	} >&2
+	exit 0 ;;
+-static)
+	if [ "${STUB_CC_LINK_FAIL:-0}" = "1" ]; then
+		echo "stub cc: collect2: cannot find -lc" >&2
+		exit 1
+	fi
+	out=""
+	prev=""
+	for a in "$@"; do
+		if [ "$prev" = "-o" ]; then out="$a"; fi
+		prev="$a"
+	done
+	if [ -n "$out" ]; then : >"$out"; fi
+	{
+		echo "${STUB_CC_VERSION:-stub cc 1.0 for tests}"
+		echo "#include <...> search starts here:"
+		for d in ${STUB_CC_INCLUDE:-/usr/include/$t}; do echo " $d"; done
+		echo "End of search list."
+		echo " /usr/lib/gcc/$t/collect2 -static -o ${out:-a.out} ${STUB_CC_STARTFILE:-/usr/lib/$t/Scrt1.o} ${STUB_CC_LIBDIR_ARG:--L/usr/lib/$t} -lc"
 	} >&2
 	exit 0 ;;
 *) exit 0 ;;
@@ -158,6 +222,12 @@ if [ "${STUB_SHASUM_FAIL:-0}" = "1" ]; then
 	echo "stub shasum: refusing to hash" >&2
 	exit 1
 fi
+for a in "$@"; do
+	if [ "$a" = "-c" ] && [ "${STUB_SHASUM_FAILCHECK:-0}" = "1" ]; then
+		echo "stub shasum: WARNING: 1 computed checksum did NOT match" >&2
+		exit 1
+	fi
+done
 for c in /usr/bin/shasum /usr/bin/sha256sum /bin/sha256sum; do
 	if [ -x "$c" ]; then exec "$c" "$@"; fi
 done
@@ -433,16 +503,23 @@ func TestAMuslMentionIsNotAMuslProof(t *testing.T) {
 	}
 }
 
-// The other direction: Debian's musl-gcc reports a gnu triple and is still musl,
-// because its include search list and libc.a are musl's. That compiler must be
-// provable, or the fixed builder image could never pass its own gate.
-func TestANonMuslTripleIsProvedByItsSearchListAndLibc(t *testing.T) {
+// The other direction: Debian's musl-gcc reports a gnu triple and is still musl.
+// The values here are the ones that compiler really gives (measured in the pinned
+// builder image): a gnu triple, musl's include directory, and -- the part that
+// makes libc.a useless as evidence -- glibc's archive path from
+// -print-file-name=libc.a, because musl's specs move the real -lc elsewhere. What
+// does name musl is the link: Scrt1.o from musl's directory and the -L that goes
+// with it. That compiler must be provable, or the fixed builder image could never
+// pass its own gate.
+func TestDebianMuslGccIsProvedByItsLinkInputs(t *testing.T) {
 	s := newScriptDir(t)
 
 	env := linuxHost()
 	env["STUB_CC_TRIPLE"] = "x86_64-linux-gnu"
-	env["STUB_CC_INCLUDE"] = "/usr/include/x86_64-linux-musl"
-	env["STUB_CC_LIBC_A"] = "/usr/lib/x86_64-linux-musl/libc.a"
+	env["STUB_CC_INCLUDE"] = "/usr/include/x86_64-linux-musl /usr/lib/gcc/x86_64-linux-gnu/12/include"
+	env["STUB_CC_LIBC_A"] = "/usr/lib/gcc/x86_64-linux-gnu/12/../../../x86_64-linux-gnu/libc.a"
+	env["STUB_CC_STARTFILE"] = "/usr/lib/x86_64-linux-musl/Scrt1.o"
+	env["STUB_CC_LIBDIR_ARG"] = "-L/usr/lib/x86_64-linux-musl"
 	out, code := s.run(t, env, "--release")
 	if code != 0 {
 		t.Fatalf("a musl-gcc-style compiler was refused a release:\n%s", out)
@@ -451,8 +528,80 @@ func TestANonMuslTripleIsProvedByItsSearchListAndLibc(t *testing.T) {
 	if !strings.Contains(m, "linkage=static") {
 		t.Errorf("the manifest does not record a static artifact:\n%s", m)
 	}
-	if !strings.Contains(m, "musl_evidence=/usr/include/x86_64-linux-musl") {
+	if !strings.Contains(m, "musl_evidence=/usr/lib/x86_64-linux-musl/Scrt1.o") {
 		t.Errorf("the manifest does not record the evidence it accepted:\n%s", m)
+	}
+	if !strings.Contains(m, "musl_libdir=-L/usr/lib/x86_64-linux-musl") {
+		t.Errorf("the manifest does not record the library search path:\n%s", m)
+	}
+}
+
+// A startfile alone is not the proof either: the -lc that goes with it has to come
+// from musl too, or the binary is glibc's with a borrowed crt1.o.
+func TestAMuslStartfileWithoutAMuslLibraryPathIsRefused(t *testing.T) {
+	s := newScriptDir(t)
+
+	env := linuxHost()
+	env["STUB_CC_TRIPLE"] = "x86_64-linux-gnu"
+	env["STUB_CC_STARTFILE"] = "/usr/lib/x86_64-linux-musl/Scrt1.o"
+	env["STUB_CC_LIBDIR_ARG"] = "-L/usr/lib/x86_64-linux-gnu"
+	out, code := s.run(t, env, "--release")
+	if code == 0 {
+		t.Fatalf("a compiler with a musl startfile and glibc's -L produced a release:\n%s", out)
+	}
+	if !strings.Contains(out, "not musl") {
+		t.Errorf("the failure does not state the libc policy:\n%s", out)
+	}
+}
+
+// D14.1: the counterexample the review used. A real glibc compiler, plus one empty
+// directory named after musl, added to the include search list (CPATH is how it gets
+// there). features.h is glibc's and libc.a is glibc's; only the link says glibc, and
+// that is what the policy reads.
+func TestAnEmptyMuslNamedIncludeDirectoryIsNotAProof(t *testing.T) {
+	s := newScriptDir(t)
+
+	placeholder := filepath.Join(s.root, "musl-headers-placeholder")
+	if err := os.MkdirAll(placeholder, 0o755); err != nil {
+		t.Fatalf("mkdir placeholder: %v", err)
+	}
+	if entries, err := os.ReadDir(placeholder); err != nil || len(entries) != 0 {
+		t.Fatalf("the placeholder is not empty: %v %v", entries, err)
+	}
+
+	env := linuxHost()
+	env["STUB_CC_TRIPLE"] = "x86_64-linux-gnu"
+	env["STUB_CC_INCLUDE"] = placeholder + " /usr/include/x86_64-linux-gnu /usr/include"
+	out, code := s.run(t, env, "--release")
+	if code == 0 {
+		t.Fatalf("an empty musl-named include directory proved a glibc compiler:\n%s", out)
+	}
+	for _, want := range []string{"not musl", "linux-amd64"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the failure does not name %q:\n%s", want, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "release-manifest.txt")); err == nil {
+		t.Error("a release without a libc proof still wrote a manifest")
+	}
+}
+
+// A compiler that cannot link the probe cannot produce the artifact, and that is a
+// failure with its own message -- not a missing proof that a later step discovers.
+func TestAFailedProbeLinkIsReportedAsALinkFailure(t *testing.T) {
+	s := newScriptDir(t)
+
+	env := linuxHost()
+	env["STUB_CC_LINK_FAIL"] = "1"
+	out, code := s.run(t, env)
+	if code == 0 {
+		t.Fatalf("a compiler that cannot link exited 0:\n%s", out)
+	}
+	if !strings.Contains(out, "static libc probe failed") {
+		t.Errorf("the failure does not say the probe link failed:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "SHA256SUMS")); err == nil {
+		t.Error("an unlinkable toolchain still produced a checksum")
 	}
 }
 
@@ -681,5 +830,124 @@ func TestTheContainerBodyIsOneShellWord(t *testing.T) {
 	}
 	if !strings.Contains(container, "TMPDIR=") {
 		t.Errorf("the container body does not point TMPDIR at the smoke volume:\n%s", container)
+	}
+}
+
+// D14.2: a smoke that only reads the tool's own JSON accepts a quarantine that
+// moved nothing. The step that reported success is the step being checked, so the
+// tree itself has to be looked at.
+func TestTheSmokeFailsWhenNothingIsMoved(t *testing.T) {
+	s := newScriptDir(t)
+
+	out, code := s.run(t, map[string]string{"STUB_QR_NOOP": "1"}, "--release")
+	if code == 0 {
+		t.Fatalf("a quarantine that left the source in place produced a release:\n%s", out)
+	}
+	if !strings.Contains(out, "still at its original path") {
+		t.Errorf("the failure does not say the source was never moved:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "release-manifest.txt")); err == nil {
+		t.Error("a failed smoke still wrote a release manifest")
+	}
+}
+
+// And the other half: a restore that writes some other file's bytes satisfies "the
+// path exists again". The bytes that come back have to be the bytes that went in.
+func TestTheSmokeFailsWhenTheRestoreWritesOtherBytes(t *testing.T) {
+	s := newScriptDir(t)
+
+	out, code := s.run(t, map[string]string{"STUB_QR_BAD_BYTES": "1"}, "--release")
+	if code == 0 {
+		t.Fatalf("a restore that wrote the wrong content produced a release:\n%s", out)
+	}
+	if !strings.Contains(out, "differs from the file that was quarantined") {
+		t.Errorf("the failure does not say the content differs:\n%s", out)
+	}
+}
+
+// A restore also has to retire the object's record: an item that is back on disk
+// but still listed as restorable is a state nobody can act on.
+func TestTheSmokeChecksTheObjectRecordAfterARestore(t *testing.T) {
+	s := newScriptDir(t)
+
+	if out, code := s.run(t, nil, "--release"); code != 0 {
+		t.Fatalf("the release failed:\n%s", out)
+	}
+	facts := s.facts(t)
+	for _, want := range []string{
+		"source_gone_after_apply=yes",
+		"restored_bytes_match=yes",
+		"quarantine restore,quarantine list",
+	} {
+		if !strings.Contains(facts, want) {
+			t.Errorf("the facts do not record %q:\n%s", want, facts)
+		}
+	}
+}
+
+// D14.3: a run that could not write its checksum file used to leave its binary in
+// dist, and the previous run's manifest next to it. What is left is a directory that
+// looks like a release, so the failure has to take its own outputs with it.
+func TestAFailedChecksumLeavesNoArtifactAndNoManifest(t *testing.T) {
+	s := newScriptDir(t)
+
+	// The previous run's claim, and its binary, are in place before this one starts.
+	oldManifest := filepath.Join(s.out, "release-manifest.txt")
+	oldArtifact := filepath.Join(s.out, "dustkeeper-0.9.0-darwin-arm64")
+	mustWrite(t, oldManifest, "version=0.9.0\nartifact=dustkeeper-0.9.0-darwin-arm64\n", 0o644)
+	mustWrite(t, oldArtifact, "an earlier release\n", 0o755)
+
+	out, code := s.run(t, map[string]string{"STUB_SHASUM_FAIL": "1"}, "--release")
+	if code == 0 {
+		t.Fatalf("a release whose checksum tool failed exited 0:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "dustkeeper-1.0.0-phase1-darwin-arm64")); err == nil {
+		t.Error("this run's binary survived a failure that verified nothing")
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "SHA256SUMS")); err == nil {
+		t.Error("a checksum file this run could not fill was left in dist")
+	}
+	if _, err := os.Stat(oldManifest); err == nil {
+		t.Error("an earlier run's manifest was left describing a release this run did not produce")
+	}
+	// The other version's binary is not this run's output and is not its to delete.
+	if _, err := os.Stat(oldArtifact); err != nil {
+		t.Errorf("an unrelated earlier artifact was deleted: %v", err)
+	}
+}
+
+// A checksum file that exists but does not verify is worse than none: it is an
+// artifact plus a claim that the artifact is good.
+func TestAChecksumFileThatDoesNotVerifyIsRemoved(t *testing.T) {
+	s := newScriptDir(t)
+
+	out, code := s.run(t, map[string]string{"STUB_SHASUM_FAILCHECK": "1"}, "--release")
+	if code == 0 {
+		t.Fatalf("a release whose checksum file did not verify exited 0:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "SHA256SUMS")); err == nil {
+		t.Error("an unverified checksum file was left in dist")
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "release-manifest.txt")); err == nil {
+		t.Error("a manifest was written from an unverified checksum")
+	}
+}
+
+// D14.5: GOOS/GOARCH are target settings. A build that targets another system must
+// not be named after the machine it happens to run on.
+func TestACrossCompiledSettingIsRefused(t *testing.T) {
+	s := newScriptDir(t)
+
+	out, code := s.run(t, map[string]string{"STUB_GOOS": "linux", "STUB_GOARCH": "amd64"}, "--release")
+	if code == 0 {
+		t.Fatalf("a toolchain targeting linux-amd64 on a darwin-arm64 host exited 0:\n%s", out)
+	}
+	for _, want := range []string{"targets linux-amd64", "runs on darwin-arm64", "unset GOOS/GOARCH"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the failure does not mention %q:\n%s", want, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(s.out, "release-manifest.txt")); err == nil {
+		t.Error("a cross-compiled setting produced a manifest")
 	}
 }
