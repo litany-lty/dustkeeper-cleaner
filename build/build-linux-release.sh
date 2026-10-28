@@ -79,6 +79,11 @@ apt-get update -qq
 apt-get install -y -qq musl-tools binutils >/dev/null
 
 export GOCACHE=/gocache
+# The checkout is mounted from the host, so it belongs to another uid and git
+# refuses it as "dubious ownership" -- which would silently stamp the artifact with
+# commit=unknown. Trusting this one mount point is what keeps the commit in the
+# manifest a fact instead of a blank.
+git config --global --add safe.directory /src
 # The smoke tree and the state directory it uses must be on ext4/xfs/apfs: scope
 # registration refuses anything else, and the /tmp of the container is overlayfs.
 export TMPDIR=/smoke/tmp
