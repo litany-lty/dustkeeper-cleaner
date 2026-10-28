@@ -168,7 +168,11 @@ fi
 VERIFY=${VERIFY_ARTIFACT:-}
 if [ -z "$VERIFY" ]; then
 	VERIFY="$TMPD/verify-artifact"
-	if ! go build -trimpath -o "$VERIFY" ./build/verify-artifact; then
+	# -buildvcs=false for the same reason the artifact build uses it: inside the
+	# builder container the mounted checkout belongs to another uid, git refuses it
+	# as "dubious ownership", and VCS stamping would turn that into a build failure
+	# that has nothing to do with the verifier.
+	if ! go build -trimpath -buildvcs=false -o "$VERIFY" ./build/verify-artifact; then
 		echo "error: could not build the artifact verifier; refusing to produce unchecked artifacts" >&2
 		exit 1
 	fi
