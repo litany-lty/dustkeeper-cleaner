@@ -364,11 +364,16 @@ SQLite 本身用单写连接（`SetMaxOpenConns(1)`）、`journal_mode=DELETE`�
 ## 11. 已知限制（一期）
 
 - 只支持 Linux 与 macOS；其他平台 `init` 之后第一个 `doctor` 就会返回 `UNSUPPORTED_FS`。
-- 两个发布目标：`darwin-arm64` 与 `linux-amd64`，各自在**自己的机器上原生构建**（`build/build.sh` 是单目标，
-  不接受 GOOS/GOARCH 覆盖）。Linux 只通过固定 digest 镜像的 `build/build-linux-release.sh` 产出，
-  静态链接 musl。不是这两个目标的机器仍能做开发构建，但产物不带"受支持"的说法、也不写发布清单。
-- 发布清单由构建期读出的事实生成（目标、Go 与 musl 版本、编译器 triple、musl 证据、产物头信息、
-  checksum、这份制品实际跑过哪些动作）。缺一项证据就没有清单，因为那一轮已经失败。
+- 两个发布目标：`darwin-arm64` 与 `linux-amd64`，各自在**自己的机器上原生构建**。`build/build.sh` 是单目标：
+  宿主取自 `GOHOSTOS/GOHOSTARCH`，并与 `GOOS/GOARCH` 比对，两者不一致直接拒绝（跨编译产物不能被按宿主命名）。
+  Linux 只通过固定 digest 镜像的 `build/build-linux-release.sh` 产出，静态链接 musl。不是这两个目标的机器
+  仍能做开发构建，但产物不带"受支持"的说法、也不写发布清单。
+- musl 的证据取自链接输入，不取自名字：探针做一次真实静态链接，从 driver 打印的 collect2 命令行里读
+  startfile 与 `-L`，两者必须都指向 musl；CPATH 能往 include 搜索列表里塞任何目录，`-print-file-name=libc.a`
+  在 Debian musl-gcc 上还会答 glibc 的路径，所以这两样都不作证据。
+- 发布清单由构建期读出的事实生成（目标、Go 与 musl 版本与包版本、编译器 triple、startfile 与 `-L`、
+  产物头信息、checksum、这份制品实际跑过哪些动作；Q/R 冒烟独立断言 apply 后源不存在、restore 后字节一致）。
+  缺一项证据就没有清单，因为那一轮已经失败；失败也不留本轮产物与清单。
 - 隔离区在被清理的目录内部（`<scope>/.dustkeeper/objects`），因此 `scan` 显式跳过 `.dustkeeper`
   （`scan.vaultName`）；这在一期是可接受的取舍（同卷保证排他 rename 可用），代价是清理整棵目录时会连同
   隔离区一起被带走。

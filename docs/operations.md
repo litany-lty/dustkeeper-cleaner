@@ -164,6 +164,11 @@ dustkeeper rule authorize --id rule-001 --revision 1 --auto-quarantine --digest 
 `retroactive: false` 与 "objects already isolated: NOT covered"。把提案里的 `approval_digest` 原样传回去
 才真正写库。这个"两步"是为了让"批准了什么"有据可查，而不是一条命令改掉权限。
 
+日常用 `rule enable` 代替 2–4 步：`rule enable --id rule-001 --revision 1` 只打印会批准什么与
+`enable digest`，`--digest` 那次把"激活 + review 绑定 + 选定能力"放进一个事务，要么全成要么全不成，
+不会留下半激活的规则。上面 2–4 是它的底层入口，分开做时两次确认之间任何变化都要重新确认；
+`--mode cleanup` 才是"隔离后到期清空"，`--mode quarantine`（默认）只隔离。
+
 额度语义：`--max-files` / `--max-bytes` 取 `min(配置默认, grant 批准值)`。**`0` 表示禁止**，不是无限。
 
 撤销与停用：

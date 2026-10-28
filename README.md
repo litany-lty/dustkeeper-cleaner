@@ -8,7 +8,8 @@
 
 一期是一个 Go + 原生 SQLite 的可执行文件：无常驻进程、无后台模型、不依赖 Python/Java。
 
-> **状态：FINAL-1.0 收口完成。`darwin-arm64` 在开发机上产出并冒烟验收；`linux-amd64` 在 CI 的原生
+> **状态：FINAL-1.0 收口完成，独立复核的 D01–D14 已按最小修补处理（逐条修改、反例与未关闭项见
+> `docs/compliance.md` §1.1）。`darwin-arm64` 在开发机上产出并冒烟验收；`linux-amd64` 在 CI 的原生
 > x86_64 runner 上产出并冒烟（这台 arm64 机器不能执行它，见「支持平台」）。模型能力仍未验收。**
 > 逐条结论见 [`docs/compliance.md`](docs/compliance.md) 的 FINAL 状态表（A01–A12）。
 > 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
@@ -18,11 +19,14 @@ dustkeeper init
 dustkeeper scope add --path /srv/app/disposable-exports --kind managed_disposable --name exports
 dustkeeper scan --scope exports
 dustkeeper rule import --file rule.json --id rule-001
-dustkeeper rule preview --id rule-001 --revision 1
-dustkeeper rule activate --id rule-001 --revision 1 --digest <review_digest>
-dustkeeper rule authorize --id rule-001 --revision 1 --auto-quarantine --digest <approval_digest>
+dustkeeper rule enable --id rule-001 --revision 1                 # 只显示会批准什么 + enable digest
+dustkeeper rule enable --id rule-001 --revision 1 --digest <enable_digest>
 dustkeeper run
 ```
+
+主流程用 `rule enable`：它把「预览」「确认」「授权」合成两次调用。不带 `--digest` 的那次不改任何东西，
+只把将要批准的规则、额度、候选文件和建议命令打印出来；带上它打印的 digest 再跑一次，规则激活、review
+绑定和所选能力在同一个事务里落库，要么全成要么全不成。
 
 ## 快速开始
 
@@ -38,10 +42,10 @@ dustkeeper scope add --path /srv/app/disposable-exports --kind managed_disposabl
 dustkeeper doctor --scope exports         # 权限、数据库、文件系统能力、时钟、待对账
 dustkeeper scan --scope exports           # 只读元数据扫描，建立候选索引
 dustkeeper rule import --file rule.json --id rule-001
-dustkeeper rule preview --id rule-001 --revision 1
-dustkeeper rule activate --id rule-001 --revision 1 --digest <review_digest>
-dustkeeper rule authorize --id rule-001 --revision 1 --auto-quarantine --digest <approval_digest>
+dustkeeper rule enable --id rule-001 --revision 1        # 打印会批准什么 + enable digest，不改状态
+dustkeeper rule enable --id rule-001 --revision 1 --digest <enable_digest>
 dustkeeper run                            # 对账 → 到期清空 → 扫描 → 已授权隔离
+dustkeeper quarantine list                # 看隔离了什么，以及恢复命令
 ```
 
 规则文件长这样（一条规则只对应一个 scope）：
@@ -88,12 +92,19 @@ scope / plan / object ID。退出码：`0` 成功（含「无候选」）、`2` 
 | `schedule render` | 生成 systemd / launchd 模板 | 否 |
 | `protect add/list/remove` | 路径保护（不自动过期） | 否 |
 | `plan create/show/apply` | 冻结并执行隔离计划 | apply 会隔离 |
-| `rule draft/import/show/validate/preview/activate/authorize/revoke/disable` | 规则全生命周期，激活与授权分开 | 否 |
+| `rule draft/import/show/validate/enable/preview/activate/authorize/revoke/disable` | 规则全生命周期；主流程用 `enable` | 否 |
 | `scope add/list/show/pause/resume` | 登记与管理范围 | 仅 `managed_disposable` 建私有隔离区 |
 | `doctor` | 权限、数据库、文件系统能力、时钟、待对账 | 仅自有探针 |
 
 日常节奏是「定时 `run` + 定期看 `status`/`events` + 有事才 `restore`/`recover`」。`run` 不做没被授权的动作：
 隔离要 `auto_quarantine`，永久删除要再单独授予 `auto_purge`。
+
+**高级：`enable` 底下的两步。** `rule enable` 做的事，也可以自己按顺序做——
+`rule preview --id --revision`（打印 review digest 与候选）→ `rule activate --id --revision --digest <review_digest>`
+（激活这一版规则）→ `rule authorize --id --revision --auto-quarantine --digest <approval_digest>`
+（授予 `auto_quarantine`，要单独给额度）。分开做时，两次确认之间的任何状态变化都要重新确认；
+`enable` 把这两步放进一个事务，正是为了避免半激活。清空授权同理，用 `--auto-purge` 并在 `enable --mode cleanup`
+下一次说清。
 
 ## 范围限制
 
@@ -113,9 +124,9 @@ scope / plan / object ID。退出码：`0` 成功（含「无候选」）、`2` 
    没有常驻进程和后台模型。扫描不读取文件内容（证据里 `content_bytes_read` 为 null）。
 7. **Windows 不是目标**：本实现依赖 `flock`、`renameatx_np`/`renameat2`、`F_FULLFSYNC` 这些 unix 原语。
 
-规模上限有实测：10 万普通文件、1 051 个目录，完整扫描 wall 39.6 s、峰值 RSS 30.8 MiB（既定上限 256 MiB），
-数据库 180 KiB → 59.0 MiB（约 619 B/文件）；默认预算下的一轮运行扫描完整、未被预算中断（control=continue）；
-中断续跑 10 批、累计只扫 1.00× 树大小。数字与测量口径见
+规模上限有实测：10 万普通文件、1 051 个目录，完整扫描 wall 54.5 s、峰值 RSS 29.5 MiB（既定上限 256 MiB），
+数据库 180 KiB → 59.0 MiB（约 619 B/文件）；默认预算下的一轮运行扫描完整、未被预算中断（`control=continue`，
+envelope `code=OK`）；中断续跑 10 批、累计只扫 1.00× 树大小。数字、commit 与测量口径见
 [`docs/evidence/performance-100k.md`](docs/evidence/performance-100k.md)。
 
 **模型能力未验收。** 自然语言 → 规则草稿这一层需要在已获准的模型配置下跑固定语料才有结论；
