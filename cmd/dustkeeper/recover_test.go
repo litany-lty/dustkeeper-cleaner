@@ -139,3 +139,97 @@ func TestRecoverInspectOnAReadableDirectorySucceeds(t *testing.T) {
 		t.Fatalf("complete = %v, want 1", got)
 	}
 }
+
+// D13, first half: the manifests directory has its own state. Reporting "no
+// manifest" for an object when that directory could not be opened calls the
+// object an orphan - the one status that tells an operator the record of the file
+// is lost - on the strength of a check that never ran.
+func TestRecoverInspectDoesNotCallObjectsOrphansWhenManifestsAreUnreadable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode bits do not deny access")
+	}
+	base := newHome(t)
+	root := filepath.Join(base, "scope")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("mkdir scope: %v", err)
+	}
+	buildVault(t, root)
+	manifests := filepath.Join(root, ".dustkeeper", "manifests")
+	if err := os.Chmod(manifests, 0o000); err != nil {
+		t.Fatalf("chmod manifests: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(manifests, 0o700) })
+
+	r := cli(t, "recover", "inspect", "--root", root, "--json")
+	if r.code != 6 {
+		t.Fatalf("exit = %d, want 6 (RECOVERY_REQUIRED); stdout:\n%s", r.code, r.stdout)
+	}
+	data, ok := r.env["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("no data object: %v", r.env["data"])
+	}
+	if got := data["manifest_state"]; got != rescue.ManifestStateUnreadable {
+		t.Fatalf("manifest_state = %v, want %q", got, rescue.ManifestStateUnreadable)
+	}
+	if got := data["orphan_objects"]; got != float64(0) {
+		t.Fatalf("orphan_objects = %v; an unreadable manifests directory proves no orphan", got)
+	}
+	if got := data["unverified"]; got != float64(1) {
+		t.Fatalf("unverified = %v, want 1", got)
+	}
+	entries, _ := data["entries"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	entry, _ := entries[0].(map[string]any)
+	if got := entry["status"]; got != rescue.StatusUnverified {
+		t.Fatalf("entry status = %v, want %q", got, rescue.StatusUnverified)
+	}
+}
+
+// D13, second half: "zero unverified entries" cannot be read as "the directory
+// was read". With an empty manifests directory and an objects directory that
+// cannot be opened, every count is zero - and the old CLI called that a success.
+func TestRecoverInspectWithNoEntriesAndAnUnreadableDirectoryStillFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode bits do not deny access")
+	}
+	base := newHome(t)
+	root := filepath.Join(base, "scope")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("mkdir scope: %v", err)
+	}
+	objectID, objectsDir := buildVault(t, root)
+	// No manifests at all, so no entry can be produced from them.
+	if err := os.Remove(filepath.Join(root, ".dustkeeper", "manifests", objectID+".json")); err != nil {
+		t.Fatalf("remove the manifest: %v", err)
+	}
+	if err := os.Chmod(objectsDir, 0o000); err != nil {
+		t.Fatalf("chmod objects: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(objectsDir, 0o700) })
+
+	r := cli(t, "recover", "inspect", "--root", root, "--json")
+	if r.code == 0 {
+		t.Fatalf("a vault that could not be read was reported as healthy; stdout:\n%s", r.stdout)
+	}
+	if r.code != 6 {
+		t.Fatalf("exit = %d, want 6 (RECOVERY_REQUIRED); stdout:\n%s", r.code, r.stdout)
+	}
+	data, ok := r.env["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("no data object: %v", r.env["data"])
+	}
+	if got := data["object_state"]; got != rescue.ObjectStateUnreadable {
+		t.Fatalf("object_state = %v, want %q", got, rescue.ObjectStateUnreadable)
+	}
+	// The counts really are zero: the failure has to come from the state.
+	for _, key := range []string{"unverified", "orphan_objects", "manifest_without_object", "conflicts"} {
+		if got := data[key]; got != float64(0) {
+			t.Fatalf("%s = %v, want 0 so the state is what carries the failure", key, got)
+		}
+	}
+	if len(r.env["next_steps"].([]any)) == 0 {
+		t.Fatal("the envelope offers no next step for an inventory it could not complete")
+	}
+}

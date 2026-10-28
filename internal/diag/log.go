@@ -19,12 +19,15 @@
 package diag
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Bounds. They are constants rather than configuration on purpose: a bound that an
@@ -69,8 +72,13 @@ func Open(dir string) (*Logger, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("diag: create log directory %s: %w", dir, err)
 	}
-	rot, err := newRotating(filepath.Join(dir, FileName), MaxFileBytes, KeepFiles)
+	dirFD, err := openLogDir(dir)
 	if err != nil {
+		return nil, err
+	}
+	rot, err := newRotating(dirFD, dir, FileName, MaxFileBytes, KeepFiles)
+	if err != nil {
+		unix.Close(dirFD)
 		return nil, err
 	}
 	h := slog.NewJSONHandler(rot, &slog.HandlerOptions{
@@ -141,9 +149,17 @@ func (l *Logger) Path() string {
 
 // rotating is an io.Writer that keeps the file under max bytes by shifting
 // name -> name.1 -> name.2 ... and dropping the oldest beyond keep.
+//
+// Every operation is relative to dir, the descriptor of the directory that was
+// verified when the log was opened. That is the whole point of holding it: a path
+// that was replaced after the check (logs renamed away, a new directory created
+// under the same name) must not become the place the next record or the next
+// rotation goes.
 type rotating struct {
 	mu   sync.Mutex
+	dir  int
 	path string
+	name string
 	max  int64
 	keep int
 
@@ -151,8 +167,8 @@ type rotating struct {
 	size int64
 }
 
-func newRotating(path string, max int64, keep int) (*rotating, error) {
-	r := &rotating{path: path, max: max, keep: keep}
+func newRotating(dir int, displayDir, name string, max int64, keep int) (*rotating, error) {
+	r := &rotating{dir: dir, path: filepath.Join(displayDir, name), name: name, max: max, keep: keep}
 	if err := r.open(); err != nil {
 		return nil, err
 	}
@@ -160,7 +176,7 @@ func newRotating(path string, max int64, keep int) (*rotating, error) {
 }
 
 func (r *rotating) open() error {
-	f, err := openPrivateLog(r.path)
+	f, err := openPrivateLog(r.dir, r.name, r.path)
 	if err != nil {
 		return err
 	}
@@ -205,34 +221,48 @@ func (r *rotating) rotate() error {
 	}
 	r.file = nil
 
-	// Oldest first: name.(keep-1) is dropped, then each file moves one step.
-	oldest := fmt.Sprintf("%s.%d", r.path, r.keep)
-	_ = os.Remove(oldest)
+	// Oldest first: name.(keep) is dropped, then each file moves one step. The
+	// names are relative to the verified directory, and the unlink/rename calls
+	// take that descriptor rather than a path assembled from a string.
+	oldest := fmt.Sprintf("%s.%d", r.name, r.keep)
+	if err := unix.Unlinkat(r.dir, oldest, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		// A name that is not there is nothing to drop. Anything else is reported:
+		// a rotation that silently stops dropping files grows without bound.
+		return fmt.Errorf("diag: drop %s: %w", filepath.Join(filepath.Dir(r.path), oldest), err)
+	}
 	for i := r.keep - 1; i >= 1; i-- {
-		from := fmt.Sprintf("%s.%d", r.path, i)
-		to := fmt.Sprintf("%s.%d", r.path, i+1)
-		// Lstat, not Stat: a rotated name that has become a link is moved as a
-		// link, never resolved to the file it points at.
-		if _, err := os.Lstat(from); err == nil {
-			if err := os.Rename(from, to); err != nil {
-				return fmt.Errorf("diag: rotate %s: %w", from, err)
+		from := fmt.Sprintf("%s.%d", r.name, i)
+		to := fmt.Sprintf("%s.%d", r.name, i+1)
+		// Renaming is by name and never follows a link: a rotated name that has
+		// become a link is moved as a link, never resolved to the file it points
+		// at. A missing source is skipped, which is what the first rotations do.
+		if err := unix.Renameat(r.dir, from, r.dir, to); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
 			}
+			return fmt.Errorf("diag: rotate %s: %w", filepath.Join(filepath.Dir(r.path), from), err)
 		}
 	}
-	if err := os.Rename(r.path, r.path+".1"); err != nil {
+	if err := unix.Renameat(r.dir, r.name, r.dir, r.name+".1"); err != nil {
 		return fmt.Errorf("diag: rotate %s: %w", r.path, err)
 	}
 	return r.open()
 }
 
-// Close releases the file.
+// Close releases the file and the directory descriptor.
 func (r *rotating) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.file == nil {
-		return nil
+	var err error
+	if r.file != nil {
+		err = r.file.Close()
+		r.file = nil
 	}
-	err := r.file.Close()
-	r.file = nil
+	if r.dir >= 0 {
+		if cerr := unix.Close(r.dir); cerr != nil && err == nil {
+			err = cerr
+		}
+		r.dir = -1
+	}
 	return err
 }

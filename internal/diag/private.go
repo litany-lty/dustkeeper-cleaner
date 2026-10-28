@@ -14,8 +14,58 @@ import (
 // only, no setuid or setgid bit.
 var ErrNotPrivate = errors.New("diag: log file is not private")
 
-// openPrivateLog opens the live log file and refuses anything that is not the
-// file this program created.
+// openLogDir opens the directory the log lives in and returns a descriptor that
+// the rest of this package works through.
+//
+// Two things are being refused here, and neither could be refused by checking the
+// leaf name:
+//
+//   - a "logs" that is a symlink. O_NOFOLLOW only protects the last component of
+//     the path it opens, so `logs -> /somewhere/else` passed the leaf check
+//     whenever that directory held a suitable dustkeeper.jsonl. The log then
+//     appended scope paths and error codes into a directory nobody registered.
+//   - a directory somebody else can create entries in. Group- or world-writable
+//     means another user can replace the log file between two writes; the leaf
+//     contract cannot see that either.
+//
+// The permission rule is deliberately narrower than the 0600 of the leaf: a
+// directory that is merely readable to others (0755, which older installations
+// have) cannot be used to replace anything, and refusing it would stop the log on
+// upgrade for no gain.
+func openLogDir(dir string) (int, error) {
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		switch {
+		case errors.Is(err, unix.ELOOP):
+			return -1, fmt.Errorf("%w: %s is a symlink, so the log directory is not the one that was registered", ErrNotPrivate, dir)
+		case errors.Is(err, unix.ENOTDIR):
+			return -1, fmt.Errorf("%w: %s is not a directory", ErrNotPrivate, dir)
+		}
+		return -1, fmt.Errorf("diag: open the log directory %s: %w", dir, err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("diag: stat the log directory %s: %w", dir, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		unix.Close(fd)
+		return -1, fmt.Errorf("%w: %s is not a directory (mode %#o)", ErrNotPrivate, dir, st.Mode)
+	}
+	if wide := st.Mode & 0o022; wide != 0 {
+		unix.Close(fd)
+		return -1, fmt.Errorf("%w: %s is writable by group or others (mode %04o), so its entries can be replaced",
+			ErrNotPrivate, dir, st.Mode&0o7777)
+	}
+	if uid := uint32(os.Geteuid()); st.Uid != uid {
+		unix.Close(fd)
+		return -1, fmt.Errorf("%w: %s is owned by uid %d, want %d", ErrNotPrivate, dir, st.Uid, uid)
+	}
+	return fd, nil
+}
+
+// openPrivateLog opens the live log file inside an already-verified directory and
+// refuses anything that is not the file this program created.
 //
 // The flags are the contract, not decoration:
 //
@@ -29,8 +79,11 @@ var ErrNotPrivate = errors.New("diag: log file is not private")
 //     permissions is therefore refused rather than quietly fixed: repairing it
 //     would mean the program writes its log into a file it has just decided was
 //     not trustworthy, and the operator never learns the log was exposed.
-func openPrivateLog(path string) (*os.File, error) {
-	fd, err := unix.Open(path,
+//
+// The open is relative to dirFD, which is what keeps the leaf inside the
+// directory that was verified rather than one that replaced it by name.
+func openPrivateLog(dirFD int, name, path string) (*os.File, error) {
+	fd, err := unix.Openat(dirFD, name,
 		unix.O_WRONLY|unix.O_CREAT|unix.O_APPEND|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		// Three shapes are refused by the kernel before any stat could describe

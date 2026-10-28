@@ -676,15 +676,24 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			for _, n := range rep.Notes {
 				out.Human = append(out.Human, "  note: "+n)
 			}
+			// "Zero unverified entries" is not the same fact as "the directory was
+			// read". The counts are derived from the listings, so a pass over an
+			// objects directory that could not be opened produces no entries at
+			// all - and a CLI that only counts entries would then report success
+			// over a vault it never looked at.
+			incomplete := rep.ObjectState == rescue.ObjectStateUnreadable ||
+				rep.ObjectState == rescue.ObjectStatePartial ||
+				rep.ManifestState == rescue.ManifestStateUnreadable ||
+				rep.ManifestState == rescue.ManifestStatePartial
 			switch {
 			case rep.Orphans > 0 || rep.Conflicts > 0 || rep.Missing > 0:
 				out.Code = errs.CodeRecoveryRequired
 				out.Status = string(errs.StatusOf(out.Code))
 				out.Message = "the directory holds objects this inventory cannot explain; nothing was changed"
-				if rep.Unverified > 0 {
+				if rep.Unverified > 0 || incomplete {
 					out.Message += "; some entries are unverified: " + listingLimit(rep)
 				}
-			case rep.Unverified > 0:
+			case rep.Unverified > 0 || incomplete:
 				// Nothing is known to be missing. Reporting "everything is fine"
 				// here would turn an unavailable check into a conclusion.
 				out.Code = errs.CodeRecoveryRequired
@@ -692,7 +701,7 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 				out.Message = "this inventory does not establish which objects are present (" +
 					listingLimit(rep) + "); nothing was changed"
 			}
-			if rep.Unverified > 0 {
+			if rep.Unverified > 0 || incomplete {
 				out.Next = append(out.Next, "dustkeeper recover inspect --root "+rep.Root)
 			}
 			return out, nil
@@ -801,6 +810,9 @@ func listingLimit(rep rescue.Report) string {
 	}
 	if rep.ManifestState == rescue.ManifestStatePartial {
 		parts = append(parts, "the manifests directory could not be read to the end")
+	}
+	if rep.ManifestState == rescue.ManifestStateUnreadable {
+		parts = append(parts, "the manifests directory could not be read")
 	}
 	if len(parts) == 0 {
 		return "some entries could not be examined"

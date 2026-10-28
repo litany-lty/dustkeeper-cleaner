@@ -211,12 +211,13 @@ func Inspect(rootPath string) (Report, error) {
 	for _, name := range orphanNames {
 		o := objects[name]
 		e := Entry{Object: name, Status: StatusOrphanObject, ObjectSize: o.size}
-		if rep.ManifestState == ManifestStatePartial {
+		if rep.ManifestState == ManifestStatePartial || rep.ManifestState == ManifestStateUnreadable {
 			// "No manifest" is a statement about the manifests directory, and that
-			// directory did not finish. The object is real; the conclusion is not.
+			// directory either did not finish or could not be opened at all. The
+			// object is real; the conclusion is not.
 			e.Status = StatusUnverified
 			e.Notes = append(e.Notes,
-				"the manifests directory could not be read to the end; this object may have a manifest that was not listed")
+				"the manifests directory could not be read, so this object may have a manifest that was not listed")
 			rep.Unverified++
 			rep.Entries = append(rep.Entries, e)
 			continue
@@ -258,16 +259,18 @@ type manifestEntry struct {
 // States of a directory listing. "I saw these names" and "I saw all of them" are
 // different facts, and only the second one supports a negative conclusion.
 const (
-	listStateRead    = "read"
-	listStatePartial = "partial"
-	listStateMissing = "missing"
+	listStateRead       = "read"
+	listStatePartial    = "partial"
+	listStateMissing    = "missing"
+	listStateUnreadable = "unreadable"
 )
 
 // Exported listing states for the report, so callers do not match on strings.
 const (
-	ManifestStateRead    = listStateRead
-	ManifestStatePartial = listStatePartial
-	ManifestStateMissing = listStateMissing
+	ManifestStateRead       = listStateRead
+	ManifestStatePartial    = listStatePartial
+	ManifestStateMissing    = listStateMissing
+	ManifestStateUnreadable = listStateUnreadable
 )
 
 // dirListing is one directory read: what it gave, and whether it gave all of it.
@@ -281,7 +284,15 @@ type dirListing struct {
 func readManifests(root *fsops.Root) ([]manifestEntry, string, []string) {
 	dir, err := root.OpenDir([]byte(domain.VaultManifests))
 	if err != nil {
-		return nil, listStateMissing, []string{fmt.Sprintf("the manifests directory is missing: %v", err)}
+		// Only ENOENT establishes that the directory is not there. An access or
+		// I/O error establishes nothing - and the caller uses "no manifest" to
+		// call an object an orphan, which is the one status that tells an operator
+		// the record of that file is lost. Reporting that from a check that never
+		// happened would invent the loss.
+		if errors.Is(err, unix.ENOENT) {
+			return nil, listStateMissing, []string{"the manifests directory does not exist: " + err.Error()}
+		}
+		return nil, listStateUnreadable, []string{"the manifests directory cannot be opened: " + err.Error()}
 	}
 	defer dir.Close()
 
