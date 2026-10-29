@@ -525,8 +525,27 @@ func (e *Executor) miscapture(ctx context.Context, sc *ScopeCtx, it store.Item,
 			it.ID, err)
 	}
 
-	compensated, detail := e.tryCompensate(ctx, sc, it, obj)
-	if compensated {
+	compensated, detail, cerr := e.tryCompensate(ctx, sc, it, obj)
+	switch {
+	case cerr != nil:
+		// The filesystem work happened; the record of it did not. That is a storage
+		// failure and it stops the run, not the scope: HELD means "this object needs
+		// a decision", and there is no decision here - a pass that could not write
+		// must not go on to the next scope and then be described as a hold.
+		//
+		// The state reported is the one the record holds, read back rather than
+		// assumed: the failure may have left the item held (no intent was written)
+		// or between states (the intent was written, its closing was not). Saying
+		// "held" for the second case is the same kind of inaccuracy this branch
+		// exists to remove.
+		if got, ierr := e.Store.GetItem(ctx, it.ID); ierr == nil {
+			res.State = got.State
+		}
+		res.Code = string(errs.CodeOf(cerr))
+		res.Control = domain.ControlStopRun
+		res.Message = detail
+		return res, cerr
+	case compensated:
 		// The object is back in its slot and the slot is protected, so the item
 		// is no longer an open question: it is restored. Leaving it `held` with
 		// no pending marker made it permanent - reconciliation only looks at
@@ -535,7 +554,7 @@ func (e *Executor) miscapture(ctx context.Context, sc *ScopeCtx, it store.Item,
 		res.State = domain.StateRestored
 		res.Code = string(errs.CodeHeld)
 		res.Message = "the wrong object was captured and has been put back; the scope needs re-approval before new work"
-	} else {
+	default:
 		res.Code = string(errs.CodeHeld)
 		res.Message = "the wrong object was captured; nothing was overwritten and the captured object can be restored explicitly"
 	}
@@ -552,34 +571,40 @@ func (e *Executor) miscapture(ctx context.Context, sc *ScopeCtx, it store.Item,
 // syncs and the abort error, and hardcoded "quarantined" as the state to return
 // to. A compensation that fails halfway must return the item to held, not to a
 // state that implies the original was still there.
-func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Item, obj *fsops.File) (bool, string) {
+//
+// The third result carries the errors that are not verdicts. "The original path
+// is occupied" is a decision about this object and belongs in detail; a database
+// that refused a write is a failure of the run and has to keep its own code, or
+// the caller cannot tell "nothing happened here" from "the record of what happened
+// is missing".
+func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Item, obj *fsops.File) (bool, string, error) {
 	parent, err := sc.Root.OpenParent(it.RawRelative)
 	if err != nil {
-		return false, "the original directory cannot be resolved; the captured object stays in the vault"
+		return false, "the original directory cannot be resolved; the captured object stays in the vault", nil
 	}
 	defer parent.Close()
 
 	parentID, _, err := parent.Stat()
 	if err != nil {
-		return false, "the original directory cannot be inspected; the captured object stays in the vault"
+		return false, "the original directory cannot be inspected; the captured object stays in the vault", nil
 	}
 	storedParent, err := decodeID(it.SourceParentIdentityJSON)
 	if err != nil || !parentID.Equal(storedParent) {
-		return false, "the original directory was replaced; the captured object stays in the vault"
+		return false, "the original directory was replaced; the captured object stays in the vault", nil
 	}
 	exists, err := parent.Exists()
 	if err != nil {
-		return false, "the original path cannot be inspected; the captured object stays in the vault"
+		return false, "the original path cannot be inspected; the captured object stays in the vault", nil
 	}
 	if exists {
-		return false, "the original path now holds another file; that file was left untouched"
+		return false, "the original path now holds another file; that file was left untouched", nil
 	}
 
 	opID := domain.OperationID(domain.NewID("op"))
 	nowNS := e.Clock.Wall().UnixNano()
 	destParentID, _, perr := parent.Stat()
 	if perr != nil {
-		return false, "the original directory cannot be inspected; the captured object stays in the vault"
+		return false, "the original directory cannot be inspected; the captured object stays in the vault", nil
 	}
 	// The destination directory is written into the contract for the same reason
 	// the normal restore writes it: after a crash the question "did the object
@@ -603,7 +628,7 @@ func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Ite
 	}
 	contractJSON, err := json.Marshal(contract)
 	if err != nil {
-		return false, "the compensation contract could not be written"
+		return false, "the compensation contract could not be written", nil
 	}
 	comp := store.Intent{
 		OpID:         opID,
@@ -628,42 +653,42 @@ func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Ite
 		CreatedAtNS:  nowNS,
 	}}
 	if err := e.Store.RestoreIntent(ctx, comp, protections); err != nil {
-		return false, "a compensation intent could not be recorded"
+		return false, "a compensation intent could not be recorded; the captured object stays in the vault", err
 	}
 	runCompensateHook()
 	if err := fsops.RenameNoReplace(sc.Objects, it.ObjectName, parent, parent.Name()); err != nil {
 		if aerr := e.Store.AbortIntent(ctx, comp, domain.StateHeld,
 			`{"source":"observed","reason":"compensation rename failed"}`); aerr != nil {
-			return false, "the compensation move failed and the attempt could not be closed (" +
-				aerr.Error() + "); reconcile will finish it"
+			return false, "the compensation move failed and the attempt could not be closed; " +
+				"the operation stays pending for `recover reconcile`", aerr
 		}
-		return false, "the compensation move failed; the captured object stays in the vault"
+		return false, "the compensation move failed; the captured object stays in the vault", nil
 	}
 
 	back, err := fsops.OpenRegularAt(parent, sc.RootDev)
 	if err != nil {
 		// The object moved back but cannot be re-opened: the compensation intent
 		// stays open so reconciliation can finish it from the observed state.
-		return false, "the object was moved back but could not be re-verified; reconcile will finish it"
+		return false, "the object was moved back but could not be re-verified; reconcile will finish it", nil
 	}
 	if !back.Identity.Equal(obj.Identity) {
 		back.Close()
-		return false, "the object that moved back is not the captured object; reconcile will explain it"
+		return false, "the object that moved back is not the captured object; reconcile will explain it", nil
 	}
 	if err := back.Sync(); err != nil {
 		back.Close()
-		return false, "the object was moved back but its data could not be flushed; reconcile will finish it"
+		return false, "the object was moved back but its data could not be flushed; reconcile will finish it", nil
 	}
 	back.Close()
 	if err := fsops.DurableDir(parent); err != nil {
-		return false, "the destination directory could not be flushed; reconcile will finish it"
+		return false, "the destination directory could not be flushed; reconcile will finish it", nil
 	}
 	if err := fsops.DurableDir(sc.Objects); err != nil {
-		return false, "the vault directory could not be flushed; reconcile will finish it"
+		return false, "the vault directory could not be flushed; reconcile will finish it", nil
 	}
 	if sc.AnchorFD() >= 0 {
 		if err := fsops.Barrier(sc.AnchorFD(), []byte("compensate")); err != nil {
-			return false, "the durability barrier failed; reconcile will finish it"
+			return false, "the durability barrier failed; reconcile will finish it", nil
 		}
 	}
 
@@ -683,13 +708,19 @@ func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Ite
 	if err := e.Store.AbortIntentReleasingHold(ctx, comp, domain.StateRestored,
 		`{"source":"compensated","result":"original slot restored; item settled as restored"}`,
 		sc.Scope.ID); err != nil {
-		return false, "the object was put back but the record could not be closed (" + err.Error() +
-			"); the pending marker is still there, so reconcile will finish it"
+		// The file is back and its slot is protected, but the record that says so
+		// did not commit: the item is still r_intent with its pending marker, and
+		// reconciliation is what finishes it. Returning this as "held" would hide a
+		// storage failure behind a verdict and let the run move on to the next
+		// scope, so the error keeps its own code and its own stop range.
+		return false, "the object is back in its original place but the record could not be closed; " +
+			"the operation stays pending for `recover reconcile`", err
 	}
 	if err := e.Store.ReleaseItemKeeperPin(ctx, it.ID); err != nil {
-		return true, "put back, but the keeper pin could not be released: " + err.Error()
+		return true, "the object was put back and its record was closed, but the keeper dependency " +
+			"could not be released; no tree change is waiting on it", err
 	}
-	return true, "put back"
+	return true, "put back", nil
 }
 
 func strPtr(s string) *string { return &s }
