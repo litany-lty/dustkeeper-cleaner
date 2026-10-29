@@ -6,6 +6,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -189,4 +190,229 @@ func schemaVersion(t *testing.T, s *Store) int {
 		t.Fatalf("user_version: %v", err)
 	}
 	return v
+}
+
+// C04: OpenExisting is what every read-only command uses. A state file that was
+// truncated to zero bytes is damage to an instance that still has a vault and a
+// tree; rebuilding it here would answer "no scopes, no objects" for files that are
+// sitting on disk.
+func TestOpenExistingRefusesATruncatedStateFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("init the state file: %v", err)
+	}
+	if err := s.MetaSet(context.Background(), "instance_id", "inst_truncated"); err != nil {
+		t.Fatalf("set instance id: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	var before unix.Stat_t
+	if err := unix.Lstat(path, &before); err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	got, err := OpenExisting(path)
+	if err == nil {
+		got.Close()
+		t.Fatal("a zero-byte state file was opened as an instance")
+	}
+	if code := errs.CodeOf(err); code != errs.CodeRecoveryRequired {
+		t.Fatalf("code = %s, want %s (%v)", code, errs.CodeRecoveryRequired, err)
+	}
+
+	var after unix.Stat_t
+	if err := unix.Lstat(path, &after); err != nil {
+		// A refusal that deletes the file is the failure this test exists for.
+		t.Fatalf("the state file was removed by a refusal: %v", err)
+	}
+	if after.Size != 0 {
+		t.Fatalf("the refused file was replaced by %d bytes", after.Size)
+	}
+	if after.Ino != before.Ino {
+		t.Fatal("the refused file was replaced: the inode changed")
+	}
+	// And the staging name was not used to build a new one either.
+	if _, err := os.Stat(path + stagingSuffix); !os.IsNotExist(err) {
+		t.Fatal("a refusal built a staging database")
+	}
+}
+
+// The positive half: a complete instance opens normally through OpenExisting.
+func TestOpenExistingOpensAnExistingInstance(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := s.MetaSet(context.Background(), "instance_id", "inst_open"); err != nil {
+		t.Fatalf("set instance id: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	got, err := OpenExisting(path)
+	if err != nil {
+		t.Fatalf("an existing instance was refused: %v", err)
+	}
+	defer got.Close()
+	if v := schemaVersion(t, got); v != migrations.CurrentVersion {
+		t.Fatalf("schema version = %d, want %d", v, migrations.CurrentVersion)
+	}
+	id, err := got.MetaGet(context.Background(), "instance_id")
+	if err != nil || id != "inst_open" {
+		t.Fatalf("instance id = %q (%v), want the stored one", id, err)
+	}
+}
+
+// And OpenExisting does not create anything when there is nothing to open.
+func TestOpenExistingRefusesAMissingStateFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	if _, err := OpenExisting(path); err == nil {
+		t.Fatal("a missing state file was opened as an instance")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("a read-only open created a database: %v", err)
+	}
+	if _, err := os.Stat(path + stagingSuffix); !os.IsNotExist(err) {
+		t.Fatal("a read-only open left a staging database behind")
+	}
+}
+
+// C03: the staging name is fixed, so it can be occupied by something this build
+// never created. SQLite is opened on it - and the first thing the driver is asked
+// to do is set the pragmas, journal_mode included. That is a write, and it used to
+// happen before anybody checked what the file was.
+//
+// The target here is a WAL database from another build. Its journal mode byte is
+// the evidence: 2 means WAL, 1 means rollback journal, and rewriting it is the
+// first thing the old order did.
+func TestAStagedSymlinkIsRefusedBeforeAnythingIsWritten(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	staging := path + stagingSuffix
+
+	target := filepath.Join(dir, "somebody-elses.db")
+	buildStaging(t, target, 0)
+	if err := setUserVersionAndWAL(t, target, 99); err != nil {
+		t.Fatalf("prepare the foreign database: %v", err)
+	}
+	before, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+	if before[18] != 2 {
+		t.Fatalf("the fixture is not a WAL database (write version byte %d)", before[18])
+	}
+	if err := os.Symlink(target, staging); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	got, oerr := Open(path)
+	if oerr == nil {
+		got.Close()
+		t.Fatal("a staged symlink was accepted as a first installation")
+	}
+
+	after, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("the symlink target was modified: its journal mode byte went from %d to %d",
+			before[18], after[18])
+	}
+	if after[18] != 2 {
+		t.Fatal("the foreign database is no longer a WAL database")
+	}
+	// Still a symlink, still pointing at the same file.
+	var st unix.Stat_t
+	if err := unix.Lstat(staging, &st); err != nil {
+		t.Fatalf("lstat staging: %v", err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFLNK {
+		t.Fatal("the refusal replaced the staging symlink")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("a refused installation published a state database")
+	}
+}
+
+// A hard link into the same file is the same write through another name.
+func TestAStagedHardLinkIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	staging := path + stagingSuffix
+
+	target := filepath.Join(dir, "shared.db")
+	buildStaging(t, target, migrations.CurrentVersion)
+	before, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+	if err := os.Link(target, staging); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+
+	if got, oerr := Open(path); oerr == nil {
+		got.Close()
+		t.Fatal("a staged hard link was accepted as a first installation")
+	}
+	after, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("the hard-link target was modified")
+	}
+}
+
+// A file that is not a database at all is not an interrupted installation.
+func TestAStagedFileThatIsNotADatabaseIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	staging := path + stagingSuffix
+	payload := bytes.Repeat([]byte("not a database "), 16)
+	if err := os.WriteFile(staging, payload, 0o600); err != nil {
+		t.Fatalf("write staging: %v", err)
+	}
+
+	if got, err := Open(path); err == nil {
+		got.Close()
+		t.Fatal("a non-database staging file was accepted as a first installation")
+	}
+	after, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if !bytes.Equal(after, payload) {
+		t.Fatal("the refusal rewrote the file it refused")
+	}
+}
+
+// setUserVersionAndWAL turns a database into one from another build: a version
+// this build does not implement, and a journal mode of its own.
+func setUserVersionAndWAL(t *testing.T, path string, version int) error {
+	t.Helper()
+	db, err := sql.Open("sqlite3", "file:"+path+"?_busy_timeout=1000")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return err
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", version)); err != nil {
+		return err
+	}
+	return db.Close()
 }

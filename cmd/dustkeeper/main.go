@@ -408,9 +408,15 @@ func lookup(name string, args []string) (func(context.Context, *app, []string) (
 
 // ---- shared helpers -------------------------------------------------------
 
-// openStore opens the state database, creating nothing. Commands that must
-// create it call init first, so a typo in the state directory never produces a
-// fresh, empty database that looks like "no scopes".
+// openStore opens the state database of an existing instance, creating nothing.
+// Commands that must create it call init first, so a typo in the state directory
+// never produces a fresh, empty database that looks like "no scopes".
+//
+// "Creating nothing" is the whole contract, and store.Open does not honour it: a
+// zero-byte state file is deleted and rebuilt there. A truncated database is
+// damage - the vault and the tree can still hold every object it used to name -
+// and a read-only command such as status must report that damage instead of
+// replacing it with an empty instance that answers "no scopes, no objects".
 func (a *app) openStore() error {
 	if a.store != nil {
 		return nil
@@ -422,14 +428,27 @@ func (a *app) openStore() error {
 		}
 		return errs.Wrap(errs.CodeAccessDenied, err)
 	}
-	st, err := store.Open(a.paths.DBFile)
+	st, err := store.OpenExisting(a.paths.DBFile)
 	if err != nil {
 		return err
 	}
-	a.store = st
-	if id, err := st.MetaGet(context.Background(), "instance_id"); err == nil {
-		a.instance = id
+	id, err := st.MetaGet(context.Background(), "instance_id")
+	if err != nil {
+		st.Close()
+		return errs.Wrap(errs.CodeRecoveryRequired, err)
 	}
+	if id == "" {
+		// Every database this product writes carries an instance identity, and
+		// every vault object is bound to it. A database without one is not an
+		// instance a command can act on, and guessing one would attach this
+		// process to a vault it cannot prove it owns.
+		st.Close()
+		return errs.Newf(errs.CodeRecoveryRequired,
+			"%s has no instance identity; it is not a state database this build can act on. Nothing was created or changed - restore it from a copy, or start a new state directory",
+			a.paths.DBFile)
+	}
+	a.store = st
+	a.instance = id
 	return nil
 }
 

@@ -16,8 +16,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -113,6 +115,9 @@ func Open(path string) (*Store, error) {
 	// behind, and it cannot be distinguished from an empty state directory by the
 	// version check - version 0 reads as "older than this build". It is removed
 	// rather than migrated: there is nothing in it to keep.
+	//
+	// This is the explicit-initialisation entry point only. A command that merely
+	// reads the state must not take this path: see OpenExisting.
 	if existing {
 		empty, eerr := isEmptyFile(path)
 		if eerr != nil {
@@ -130,9 +135,49 @@ func Open(path string) (*Store, error) {
 			return nil, err
 		}
 	}
-	// Past this point the file exists and has to be the schema this build writes.
-	// The pre-flight reads the header directly, so a file that is not ours is
-	// refused without SQLite touching it.
+	return openPublished(path)
+}
+
+// OpenExisting opens the state database of an instance that is already there and
+// creates nothing, removes nothing and rebuilds nothing.
+//
+// It is the entry point for every command that reads or acts on an existing
+// installation. Open is not, because Open answers "there is no database here" by
+// installing one - which is right for `init` and wrong for `status`: a state file
+// that was truncated to zero bytes used to be deleted and replaced by an empty
+// baseline, and the command then reported zero scopes, zero objects and zero
+// pending operations for an instance whose vault still held the files. A read-only
+// diagnostic must report damage, never repair it into an empty installation.
+//
+// Missing, empty and unreadable are therefore three refusals with three messages,
+// and in all of them the bytes on disk are left exactly as they were.
+func OpenExisting(path string) (*Store, error) {
+	existing, err := databaseExists(path)
+	if err != nil {
+		return nil, err
+	}
+	if !existing {
+		return nil, errs.Newf(errs.CodeInvalidArgument,
+			"no state database at %s; run `dustkeeper init` first", path)
+	}
+	empty, err := isEmptyFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if empty {
+		return nil, errs.Newf(errs.CodeRecoveryRequired,
+			"%s is zero bytes, so it is not a database: nothing was created, removed or rebuilt. "+
+				"An empty database would report no scopes and no quarantined objects while the vault and the tree still hold them. "+
+				"Restore this file from a copy; if the previous state is gone, start a new state directory and leave the vault as it is", path)
+	}
+	return openPublished(path)
+}
+
+// openPublished opens a database that exists at its published name.
+func openPublished(path string) (*Store, error) {
+	// The file exists and has to be the schema this build writes. The pre-flight
+	// reads the header directly, so a file that is not ours is refused without
+	// SQLite touching it.
 	if err := CheckSupportedState(path); err != nil {
 		return nil, err
 	}
@@ -195,6 +240,18 @@ func createStateFile(path string) error {
 		return errs.Wrap(errs.CodeAccessDenied, err)
 	}
 	staging := path + stagingSuffix
+	// Before SQLite sees the staging name, the name has to be ours.
+	//
+	// The name is fixed, so whatever is sitting there gets opened by the driver -
+	// and the first thing this function does to an open database is set the
+	// pragmas, which includes journal_mode. That is a write. A staging path that
+	// is a symlink, a hard link, somebody else's file, or a database from another
+	// build would therefore be modified and only afterwards refused for its
+	// schema. The checks below happen on the directory entry and on the file's own
+	// bytes, with SQLite nowhere in the picture.
+	if err := prepareStaging(staging); err != nil {
+		return err
+	}
 	dsn := fmt.Sprintf("file:%s?_busy_timeout=1000&_txlock=immediate", staging)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
@@ -236,6 +293,105 @@ func createStateFile(path string) error {
 	}
 	if err := syncDir(filepath.Dir(path)); err != nil {
 		return err
+	}
+	return nil
+}
+
+// prepareStaging makes the staging name safe to hand to SQLite, or refuses.
+//
+// Four things can be at that path, and only two of them may be opened:
+//
+//   - nothing: this is the first attempt. The name is created here with O_EXCL,
+//     so it is this process's file and not whatever a concurrent writer places
+//     between the check and the driver's open;
+//   - an empty regular file: an attempt that stopped before SQLite wrote its
+//     first page. SQLite initialises it normally;
+//   - a SQLite database whose header says a schema this build can finish
+//     migrating (user_version <= CurrentVersion): the residue of an interrupted
+//     first installation, which is exactly what resuming is for;
+//   - anything else - a symlink, a hard link, a FIFO, a file owned by somebody
+//     else, a truncated database, a file that is not SQLite, a database from a
+//     newer build - is refused with the bytes untouched.
+//
+// The header is read here rather than through SQLite on purpose: "which schema is
+// this" has to be answered before the driver gets a chance to rewrite the journal
+// mode. CheckSupportedState makes the same argument for the published name.
+func prepareStaging(staging string) error {
+	for {
+		var st unix.Stat_t
+		err := unix.Lstat(staging, &st)
+		if errors.Is(err, unix.ENOENT) {
+			fd, cerr := unix.Open(staging,
+				unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+			if errors.Is(cerr, unix.EEXIST) {
+				// Something appeared between the check and the create. Look at it
+				// instead of deciding for it.
+				continue
+			}
+			if cerr != nil {
+				return errs.Wrap(errs.CodeAccessDenied, cerr)
+			}
+			if cerr := unix.Close(fd); cerr != nil {
+				return errs.Wrap(errs.CodeAccessDenied, cerr)
+			}
+			return nil
+		}
+		if err != nil {
+			return errs.Wrap(errs.CodeAccessDenied, err)
+		}
+		if st.Mode&unix.S_IFMT != unix.S_IFREG {
+			return errs.Newf(errs.CodeDurabilityFailed,
+				"%s is not a regular file; an interrupted installation is resumed only through a file this build created, and nothing here was opened or written",
+				staging)
+		}
+		if st.Nlink != 1 {
+			return errs.Newf(errs.CodeDurabilityFailed,
+				"%s has %d links; an interrupted installation is resumed only through a file nothing else can reach, and nothing here was opened or written",
+				staging, st.Nlink)
+		}
+		if int(st.Uid) != os.Geteuid() {
+			return errs.Newf(errs.CodeDurabilityFailed,
+				"%s belongs to uid %d, not to the user running this command (uid %d); nothing here was opened or written",
+				staging, st.Uid, os.Geteuid())
+		}
+		if st.Mode&0o022 != 0 {
+			return errs.Newf(errs.CodeDurabilityFailed,
+				"%s is writable by group or other (%#o); nothing here was opened or written", staging, st.Mode&0o777)
+		}
+		if st.Size == 0 {
+			// An attempt that stopped before the first page was written.
+			return nil
+		}
+		return checkResumableStaging(staging, st.Size)
+	}
+}
+
+// checkResumableStaging answers "is this file a first installation this build may
+// finish" from the file itself.
+func checkResumableStaging(staging string, size int64) error {
+	if size < sqliteHeaderSize {
+		return errs.Newf(errs.CodeDurabilityFailed,
+			"%s is %d bytes, shorter than a SQLite header; it is not an interrupted installation this build can resume, and it was left as it is",
+			staging, size)
+	}
+	f, err := os.Open(staging)
+	if err != nil {
+		return errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	defer f.Close()
+	header := make([]byte, sqliteHeaderSize)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return errs.Wrap(errs.CodeDurabilityFailed, err)
+	}
+	if string(header[:len(sqliteMagic)]) != string(sqliteMagic) {
+		return errs.Newf(errs.CodeDurabilityFailed,
+			"%s is not a SQLite database; it is not an interrupted installation this build can resume, and it was left as it is", staging)
+	}
+	version := int(binary.BigEndian.Uint32(header[sqliteUserOffset : sqliteUserOffset+4]))
+	if version > migrations.CurrentVersion {
+		return errs.Newf(errs.CodeMigrationTooNew,
+			"%s is at schema version %d and this build writes %d; a newer installation cannot be finished by an older binary, and the file was left as it is",
+			staging, version, migrations.CurrentVersion)
 	}
 	return nil
 }
