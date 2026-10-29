@@ -206,13 +206,23 @@ func TestACustomDestinationRestoreRejectsAReplacedDirectory(t *testing.T) {
 	e.openRestore(t, f, "restore", c)
 
 	// The directory the operator approved is replaced by another one with the
-	// same name before the record is finished.
+	// same name before the record is finished. It is renamed aside rather than
+	// removed and recreated: removing it frees the inode, and on a filesystem
+	// that hands the same number back the replacement would be indistinguishable
+	// from the original, which is the one thing this case must not depend on.
 	dir := filepath.Join(e.base, "trees", "exports", "recovered")
-	if err := os.Remove(dir); err != nil {
-		t.Fatalf("remove the destination directory: %v", err)
+	if err := os.Rename(dir, dir+".replaced"); err != nil {
+		t.Fatalf("move the destination directory aside: %v", err)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("recreate it: %v", err)
+	}
+	// The case only exists if the replacement is a different directory. Saying so
+	// here keeps a filesystem that reuses inodes from turning into a mysterious
+	// "accepted" result further down.
+	if now := e.parentIdentityOf(t, f.scope.ID, []byte("recovered/placeholder")); now.Equal(parentID) {
+		t.Fatalf("the replacement directory has the identity of the one it replaced (%+v); "+
+			"this filesystem cannot express the case", now)
 	}
 	if err := os.Rename(f.vaultRaw, filepath.Join(dir, "a.zip")); err != nil {
 		t.Fatalf("move the object: %v", err)
