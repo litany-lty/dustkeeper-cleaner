@@ -523,7 +523,9 @@ ContractJSON: `{"purpose":"miscapture_compensation"}`,
 
 **R12 最低验收里还没做到的一条**：「两个年龄阈值」「不是所有」这类语义误解不得直接形成已激活规则。宿主能保证的是"缺字段即拒绝"，不能保证模型没有把双阈值悄悄写成单阈值。为此 `test/eval` 的判定从"kind 相同"改成逐项语义比较（`test/eval/semantic.go`：scope、年龄阈值、大小上下界、match、except、保留期，外加"该澄清时是否澄清、该拒绝时是否拒绝"），并且报告路径 `DUSTKEEPER_EVAL_OUT` 现在是必填——写进 `t.TempDir()` 的报告随进程消失，等于没有证据。`TestTheSemanticGateCatchesWhatTheReviewNames` 用"90 天写成 30 天""丢掉 except""换一个仍合法的 scope""改保留期""凭空加上界""收窄模式"六种偏差证明这个门禁会失败。**但仍然没有真实模型跑过的报告**：这一条只能靠真实 provider 的输出，本轮环境没有可用的端点，因此 A22 记为未交付，不能算关闭。
 
-### 7.3 仍未关闭
+### 7.3 当时仍未关闭的条目（2026-10-27）
+
+<small>这是当时的记录。其中多数已经补齐或随功能退出而不适用，逐条现状见 §7.3.1；不要直接把这一节当成今天的门槛。</small>
 
 - **R14 去重内存**：按大小分组流式处理后仍是"每重复组两个候选"常驻内存，10 万文件／30% 重复实测峰值
   442 MiB（4.4 KB/文件），未达 256 MiB。要达标必须把分组结果分页落盘（SQLite 索引或逐组写计划），
@@ -545,6 +547,51 @@ ContractJSON: `{"purpose":"miscapture_compensation"}`,
 - **`internal/rescue`、`scan`、`execute`、`recovery`、`run` 仍无包内单测**：`internal/diag` 与
   `internal/rescue` 的行为证据都在 `test/integration` 与 `cmd/dustkeeper`，这是刻意的（测真实入口），
   但 §7.1 的 T04/T06/T07 要求仍然没有逐一满足。
+
+#### 7.3.1 这些条目的现状（2026-10-29 逐条核过）
+
+上面那一节是 2026-10-27 的记录，不是今天的结论。逐条对现在的树核一遍：有的已经补齐，
+有的随功能退出而不适用，剩下三条仍然成立。写在这里，是因为把"当时没做"读成"现在也没做"
+会让复审重做一遍已经做完的工作，也会掩盖真正还缺的那几条。
+
+| 当时记的 | 今天 |
+|---|---|
+| R14 去重内存 | **不适用**：精确去重已随 FINAL F1 退出生产路径，`internal/dedup` 不在树里，442 MiB 是历史测量值。R14 的这一半是随功能一起消失的，不是"修好了"。R09 那行引用的 `dedup/dedup.go` 与它的用例同样只作为历史存在。 |
+| R14 扫描吞吐 | **仍成立，本轮未动**。每个目录 claim 与 done 各一次提交的事实没变，§2 的 10 万文件 wall 54.5 s 仍主要由它决定。批量化提交要重新论证崩溃边界，不在这一轮的范围内。 |
+| A22 真实模型评测报告 | **仍缺，且本机关不掉**：`DUSTKEEPER_EVAL_BASE_URL` 未设置；本机能找到的模型凭证都不接受这一类请求（千帆的 OpenAI 兼容端点回 `token_plan_person_api_key_not_allowed`，Gemini 的兼容端点回 `ACCESS_TOKEN_TYPE_UNSUPPORTED`），本地也没有可用的兼容服务。`test/eval` 继续 skip。 |
+| R04 残余：「同一 purge 计划从两条 CLI apply 结果一致」 | **已覆盖**：`TestSlimTwoPurgeRoutesAgree` 用同一串步骤各建一份 fixture，分别走 `purge apply` 与 `plan apply`，逐字段比对两次结果，并要求两次的答案都是对的（完成 1、vault 空、队列空）——不是"两边都成功"就算一致。 |
+| R04 残余：「plan 后 pause」「第一规则失败后第二规则无 intent」 | **已覆盖**：plan 后 pause 是 `TestPauseStopsNewIntents`；规则之间是 `TestARuleThatStopsTheScopeLeavesTheNextRuleAlone`（第一条规则授权自相矛盾 → 停 scope）与 `TestARunLevelFailureLeavesTheNextRuleAlone`（第一条规则的终态写入失败 → 停 run，对象停在 `q_intent`）。两条都反证过：把对应的 `return` 换成 `continue`，用例立刻报 `the run ended with ""`。 |
+| R04 残余：「扫描状态写失败后其他 scope 无新 intent」 | **仍缺**：`scan` 只有一个具名钩子（`TestHookDirRead`，目录读取失败），没有"写结论失败"的注入点。这条要证的行为（`STATE_WRITE_FAILED` → `ControlStopRun` → 后续 scope 不启动）已经由 `TestARunLevelFailureLeavesTheNextRuleAlone` 在"同一 scope 的下一条规则"上覆盖，缺的是跨 scope 的那一次直接观察。本可以再加一个钩子，但那是为一条已经有间接证据的断言新增生产代码里的接缝，不值得。 |
+| R03/R05/R07/R10「缺能在旧版复现问题的独立用例」 | **全部已有可执行断言**，逐条列在下面。它们不是"旧版会错"的反例，因为这几项在旧版里就不存在对应的错误实现——缺的一直是证据，不是缺陷。文档把它们记成"实现待补测"是当时的准确描述，今天不再准确。 |
+
+R03（保护在所有入口一致执行）：
+
+- scan 之后新增 subtree：`TestAProtectionAddedAfterTheScanIsHonouredByANewPlan`；
+- 计划之后、执行之前新增 subtree：`TestAProtectionAddedAfterThePlanIsHonouredByTheExecutor`；
+- scope 根是 Git 仓库：`TestAGitRepositoryAtTheScopeRootIsNotScanned`（零观察、无候选、后台 run 拿不走）；
+- `.git` 是 worktree 指针文件：`TestAGitWorktreePointerFileProtectsTheTreeToo`（同样保护，且指针文件字节未变）；
+- 计划批准之后才 `git init`：`TestAProjectMarkerThatAppearsAfterThePlanStopsTheMove`（`SKIPPED_PROTECTED`，item 仍是 `planned`）；
+- 反方向，保护不外溢：`TestAProtectedRepositoryDoesNotFreezeItsSiblings`。
+
+R05（清空时钟边界）：
+
+- 跳钟之后连续两轮仍不可信：`TestAnUntrustedRunLeavesTheTrustedBaselineWhereItWas` 的第三段——把壁钟调回正常值再跑一轮，`ClockTrusted` 仍为假，因为 latch 只由人清；
+- 确认之后必须保留完整新窗口：`TestAcknowledgingTheClockRestartsUnprovableWindows`（截止时间不早于确认时刻 + 整个保留期）。
+
+R07（错误捕获对象的可恢复性）：
+
+- 原路径被新文件占用：`TestRestoreRefusesToOverwrite`（`RESTORE_CONFLICT`，占用者字节未变，对象留在隔离区）；
+- 补偿 intent 之后崩溃：`TestCompensationCrashReturnsToTheHold`（pending 仍在，对账回到 hold 而不是猜一个结果）。
+
+R10（后台自动清空不被零额度与上限拦住）：
+
+- 双授权 → 到期 → 后台确实清空：`TestAutomaticPurgeHonoursTheGrantCeiling`（Q 与 P 各一份授权，两轮 `step` 跨过保留期，按授权上限逐个清掉，队列最终为空）；
+- 零额度不动手：`TestZeroBudgetForbidsTheAction`；额度耗尽不扩散：`TestBudgetExhaustionLeavesTheRestAlone`。
+
+仍然成立的只剩三条：**R14 扫描吞吐**（性能，未动）、**A22 真实模型评测报告**（本机无端点）、
+**R04 的"扫描写失败后跨 scope"**（缺注入点，已有同 scope 的间接证据）；
+另有两条属于"结构上不打算补"的：`internal/{scan,execute,recovery,run,rescue}` 没有包内单测
+（证据在真实入口上），linux-arm64 与 darwin-amd64 没有在目标机器执行过。
 
 ### 7.4 B5 批次（R13/R14/R15）的可复核入口
 
