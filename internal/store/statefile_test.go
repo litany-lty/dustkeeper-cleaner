@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -174,6 +175,16 @@ func buildStaging(t *testing.T, path string, reached int) {
 		}
 		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", step.Version)); err != nil {
 			t.Fatalf("set user_version %d: %v", step.Version, err)
+		}
+		// migrate writes this row in the same transaction as the version bump, so
+		// a real residue carries it. A fixture that skipped it would describe a
+		// state the product never produces - and the ownership check would then
+		// pass a file it should have refused, which is worse than the reverse.
+		if _, err := db.Exec(
+			"INSERT INTO meta(key,value) VALUES('schema_version',?) "+
+				"ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+			fmt.Sprintf("%d", step.Version)); err != nil {
+			t.Fatalf("record schema_version %d: %v", step.Version, err)
 		}
 	}
 	if err := db.Close(); err != nil {
@@ -396,6 +407,136 @@ func TestAStagedFileThatIsNotADatabaseIsRefused(t *testing.T) {
 	}
 	if !bytes.Equal(after, payload) {
 		t.Fatal("the refusal rewrote the file it refused")
+	}
+}
+
+// C03, the half that was still open: the file type, the owner, the mode, the link
+// count and a SQLite header are all true of somebody else's database. A backup or
+// an export parked at the fixed staging name used to be migrated and published as
+// this installation - its own rows intact, this build's schema added, `init`
+// reporting a fresh start.
+//
+// The fixture is exactly that case: user_version 0, one table that has nothing to
+// do with this product, and a row in it.
+func TestAForeignDatabaseAtTheStagingNameIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	staging := path + stagingSuffix
+
+	db, err := sql.Open("sqlite3", "file:"+staging+"?_busy_timeout=1000")
+	if err != nil {
+		t.Fatalf("create the foreign database: %v", err)
+	}
+	for _, statement := range []string{
+		"CREATE TABLE customer_records (id INTEGER PRIMARY KEY, name TEXT)",
+		"INSERT INTO customer_records(name) VALUES('a row that is not ours')",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	var before unix.Stat_t
+	if err := unix.Lstat(staging, &before); err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	bytesBefore, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+
+	got, oerr := Open(path)
+	if oerr == nil {
+		got.Close()
+		t.Fatal("a foreign database at the staging name was adopted as this installation")
+	}
+	if code := errs.CodeOf(oerr); code != errs.CodeRecoveryRequired {
+		t.Fatalf("code = %s, want %s (%v)", code, errs.CodeRecoveryRequired, oerr)
+	}
+	if !strings.Contains(oerr.Error(), "customer_records") {
+		t.Fatalf("the refusal does not say what the file actually is: %v", oerr)
+	}
+	// The bytes are the point: an unknown database is not ours to migrate, and a
+	// refusal that rewrote it while explaining that it would not would be worse
+	// than no check at all.
+	bytesAfter, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("the refused file is gone: %v", err)
+	}
+	if !bytes.Equal(bytesBefore, bytesAfter) {
+		t.Fatal("the refusal modified the file it refused")
+	}
+	var after unix.Stat_t
+	if err := unix.Lstat(staging, &after); err != nil {
+		t.Fatalf("lstat after: %v", err)
+	}
+	if after.Ino != before.Ino {
+		t.Fatal("the refused file was replaced: the inode changed")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("a refused installation published a state database")
+	}
+}
+
+// The positive half of the same boundary: an installation this build finished but
+// never published is resumed, not refused. This is the state a process leaves
+// behind when it dies between the last migration and the link.
+func TestAFinishedButUnpublishedStagingIsResumed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	staging := path + stagingSuffix
+	buildStaging(t, staging, migrations.CurrentVersion)
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a finished but unpublished installation was refused: %v", err)
+	}
+	defer s.Close()
+	if got := schemaVersion(t, s); got != migrations.CurrentVersion {
+		t.Fatalf("schema version = %d, want %d", got, migrations.CurrentVersion)
+	}
+	if _, err := os.Stat(staging); !os.IsNotExist(err) {
+		t.Fatalf("the staging name survived publication: %v", err)
+	}
+}
+
+// And the reverse of the same coin: a database with this build's schema that has
+// already taken data is not an installation that was never published. That is a
+// state database somebody put under the wrong name, and publishing it would be a
+// migration nobody asked for.
+func TestAUsedDatabaseAtTheStagingNameIsNotAdopted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	staging := path + stagingSuffix
+	buildStaging(t, staging, migrations.CurrentVersion)
+
+	db, err := sql.Open("sqlite3", "file:"+staging+"?_busy_timeout=1000")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO events(event_id, action, phase, occurred_at_ns, contract_json)
+VALUES('ev_somebody_elses', 'quarantine', 'info', 1, '{}')`); err != nil {
+		t.Fatalf("insert a historical event: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	got, oerr := Open(path)
+	if oerr == nil {
+		got.Close()
+		t.Fatal("a used database at the staging name was published as a new installation")
+	}
+	if code := errs.CodeOf(oerr); code != errs.CodeRecoveryRequired {
+		t.Fatalf("code = %s, want %s (%v)", code, errs.CodeRecoveryRequired, oerr)
+	}
+	if !strings.Contains(oerr.Error(), "belongs at the published name") {
+		t.Fatalf("the refusal does not say where the file belongs: %v", oerr)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("a refused installation published a state database")
 	}
 }
 

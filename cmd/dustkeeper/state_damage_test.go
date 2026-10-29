@@ -8,11 +8,14 @@ package main
 // an empty instance" reads as "there is nothing to restore".
 
 import (
+	"bytes"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/sys/unix"
 
 	"dustkeeper/internal/store"
@@ -88,5 +91,82 @@ func TestStatusRefusesADatabaseWithoutAnInstanceIdentity(t *testing.T) {
 	}
 	if msg := r.str(t, "message"); !strings.Contains(msg, "instance identity") {
 		t.Errorf("the message does not say what is missing: %q", msg)
+	}
+}
+
+// C03 through the command an operator actually runs.
+//
+// `init` is the one entry point that is allowed to create a state database, and
+// the staging name next to it is fixed. A database somebody else put there - a
+// backup, an export, another product's file - satisfied every check there was:
+// right owner, 0600, one link, a valid SQLite header, a version number in range.
+// It was then migrated and published as this installation, with its own rows still
+// inside. The ownership question has to be answered before the first pragma, and
+// the answer for a file this build cannot account for is "no".
+func TestInitRefusesAForeignDatabaseAtTheStagingName(t *testing.T) {
+	base := newHome(t)
+	stateDir := filepath.Join(base, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("mkdir state: %v", err)
+	}
+	staging := filepath.Join(stateDir, "state.db.init")
+
+	db, err := sql.Open("sqlite3", "file:"+staging+"?_busy_timeout=1000")
+	if err != nil {
+		t.Fatalf("create the foreign database: %v", err)
+	}
+	for _, statement := range []string{
+		"CREATE TABLE customer_records (id INTEGER PRIMARY KEY, name TEXT)",
+		"INSERT INTO customer_records(name) VALUES('a row that is not ours')",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	beforeBytes, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+	var before unix.Stat_t
+	if err := unix.Lstat(staging, &before); err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+
+	r := cli(t, "init", "--json")
+	if r.code == 0 {
+		t.Fatalf("init adopted a foreign database at the staging name: %s", r.stdout)
+	}
+	if got := r.str(t, "code"); got != "RECOVERY_REQUIRED" {
+		t.Errorf("code = %q, want RECOVERY_REQUIRED; stdout:\n%s", got, r.stdout)
+	}
+	if msg := r.str(t, "message"); !strings.Contains(msg, "customer_records") {
+		t.Errorf("the refusal does not say what the file is: %q", msg)
+	}
+
+	afterBytes, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("the file was removed by the refusal: %v", err)
+	}
+	if !bytes.Equal(beforeBytes, afterBytes) {
+		t.Fatal("the refusal modified the file it refused")
+	}
+	var after unix.Stat_t
+	if err := unix.Lstat(staging, &after); err != nil {
+		t.Fatalf("lstat after: %v", err)
+	}
+	if after.Ino != before.Ino {
+		t.Fatal("the refused file was replaced: the inode changed")
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "state.db")); !os.IsNotExist(err) {
+		t.Fatal("a refused init published a state database")
+	}
+
+	// And it keeps saying so: a refusal that only works once is a file that gets
+	// adopted on the second attempt.
+	if again := cli(t, "init", "--json"); again.code == 0 {
+		t.Fatalf("the second init adopted the same file: %s", again.stdout)
 	}
 }

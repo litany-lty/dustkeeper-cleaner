@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -306,16 +307,18 @@ func createStateFile(path string) error {
 //     between the check and the driver's open;
 //   - an empty regular file: an attempt that stopped before SQLite wrote its
 //     first page. SQLite initialises it normally;
-//   - a SQLite database whose header says a schema this build can finish
-//     migrating (user_version <= CurrentVersion): the residue of an interrupted
-//     first installation, which is exactly what resuming is for;
+//   - a SQLite database whose schema is the one this build writes at the version
+//     in its header: the residue of an interrupted first installation, which is
+//     exactly what resuming is for;
 //   - anything else - a symlink, a hard link, a FIFO, a file owned by somebody
 //     else, a truncated database, a file that is not SQLite, a database from a
-//     newer build - is refused with the bytes untouched.
+//     newer build, a database whose schema and contents are not this build's own
+//     initialisation - is refused with the bytes untouched.
 //
 // The header is read here rather than through SQLite on purpose: "which schema is
 // this" has to be answered before the driver gets a chance to rewrite the journal
-// mode. CheckSupportedState makes the same argument for the published name.
+// mode. CheckSupportedState makes the same argument for the published name, and
+// requireOwnStagingSchema makes it for the schema itself.
 func prepareStaging(staging string) error {
 	for {
 		var st unix.Stat_t
@@ -393,7 +396,328 @@ func checkResumableStaging(staging string, size int64) error {
 			"%s is at schema version %d and this build writes %d; a newer installation cannot be finished by an older binary, and the file was left as it is",
 			staging, version, migrations.CurrentVersion)
 	}
+	return requireOwnStagingSchema(staging, size)
+}
+
+// maxStagingBytes bounds the copy the ownership check makes. An installation that
+// has not been published yet contains the baseline and the meta rows the
+// migrations write - no items, no observations, no events - so it is a few pages
+// wide. A file past this size is not something this build produced, and copying
+// it to ask would turn a refusal into a wait.
+const maxStagingBytes = 16 << 20
+
+// requireOwnStagingSchema answers the question the version number cannot: is the
+// schema in this file the one this build's own initialisation writes at that
+// version?
+//
+// user_version is a number any SQLite database can carry, and the staging name is
+// fixed. A backup, an export or another product's database sitting at
+// state.db.init with user_version 0 and a table of its own used to pass every
+// check there was - type, owner, mode, link count, SQLite header - and then be
+// migrated and published as the installation: its own rows intact, this build's
+// schema added, `init` reporting a fresh start. "It is a SQLite database with a
+// plausible version" is not evidence that this build produced it.
+//
+// So the schema is compared with the schema this build produces at that version,
+// and the file must hold nothing else: a first installation that was never
+// published carries the migrations' meta rows and has never taken data.
+//
+// The comparison runs on a copy, for the same reason all of this happens before
+// SQLite is opened: the first thing SQLite does with a database is recover a hot
+// journal, and that is a write. The copy also makes an interrupted migration
+// readable - the journal goes with it and recovery happens there, so the version
+// that comes back out of the copy is the one a resume would actually find.
+func requireOwnStagingSchema(staging string, size int64) error {
+	if size > maxStagingBytes {
+		return refuseStaging(staging,
+			"it is %d bytes, and an installation that was never published holds the schema and nothing else", size)
+	}
+	dir, err := os.MkdirTemp("", "dustkeeper-staging-")
+	if err != nil {
+		return errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	defer os.RemoveAll(dir)
+
+	// A private copy, in a directory only this process can read, named the way
+	// SQLite expects to find a database and its log.
+	work := filepath.Join(dir, "state.db")
+	if err := copyStagingFile(staging, work); err != nil {
+		return err
+	}
+	for _, suffix := range []string{"-journal", "-wal"} {
+		if err := copyStagingFile(staging+suffix, work+suffix); err != nil {
+			return err
+		}
+	}
+	return compareStagingSchema(work, staging)
+}
+
+// copyStagingFile copies one file, or accepts that it is not there.
+//
+// Only regular files are copied. A symbolic link at the staging name was already
+// refused before this point, and the same answer holds for its journal: a log this
+// build cannot read is a log it cannot account for, and "somebody else's journal"
+// is not a state to resume from.
+func copyStagingFile(src, dst string) error {
+	in, err := unix.Open(src, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	srcFile := os.NewFile(uintptr(in), src)
+	defer srcFile.Close()
+	var st unix.Stat_t
+	if err := unix.Fstat(in, &st); err != nil {
+		return errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return refuseStaging(src, "it is not a regular file, so it is not a log this build can read")
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	if _, err := io.Copy(out, srcFile); err != nil {
+		out.Close()
+		return errs.Wrap(errs.CodeIOError, err)
+	}
+	if err := out.Close(); err != nil {
+		return errs.Wrap(errs.CodeIOError, err)
+	}
 	return nil
+}
+
+// compareStagingSchema decides, from the copy, whether the file is a first
+// installation this build may finish.
+func compareStagingSchema(work, staging string) error {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?_busy_timeout=1000&_txlock=immediate", work))
+	if err != nil {
+		return errs.Wrap(errs.CodeDBError, err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return errs.Wrap(errs.CodeDBError, err)
+	}
+	defer conn.Close()
+
+	got, err := stagingShapeOf(ctx, conn)
+	if err != nil {
+		return refuseStaging(staging,
+			"it cannot be read as a SQLite database this build knows (%v)", err)
+	}
+	if got.version > migrations.CurrentVersion {
+		return errs.Newf(errs.CodeMigrationTooNew,
+			"%s is at schema version %d and this build writes %d; a newer installation cannot be finished by an older binary, and the file was left as it is",
+			staging, got.version, migrations.CurrentVersion)
+	}
+	want, err := expectedStagingShape(ctx, got.version)
+	if err != nil {
+		return errs.Wrap(errs.CodeDBError, err)
+	}
+	switch {
+	case !sameStrings(got.objects, want.objects):
+		return refuseStaging(staging,
+			"it is a SQLite database at version %d, but its schema is not the one this build writes at that version: %s",
+			got.version, describeDifference(got.objects, want.objects))
+	case !sameStrings(got.meta, want.meta):
+		return refuseStaging(staging,
+			"its schema is this build's, but its meta table says something else: %s",
+			describeDifference(got.meta, want.meta))
+	case got.rows != want.rows:
+		return refuseStaging(staging,
+			"it holds %d row(s) outside meta, and an installation that was never published has taken no data; if this is a state database, it belongs at the published name",
+			got.rows)
+	}
+	return nil
+}
+
+// stagingShape is what a file says about itself: the objects in its schema, the
+// rows in its meta table, and how much data everything else holds.
+type stagingShape struct {
+	version int
+	objects []string
+	meta    []string
+	rows    int64
+}
+
+// schemaQueryer is the part of *sql.DB and *sql.Conn this needs, so the same code
+// can look at the copy and at the schema this build would have produced.
+type schemaQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func stagingShapeOf(ctx context.Context, q schemaQueryer) (stagingShape, error) {
+	var out stagingShape
+	if err := q.QueryRowContext(ctx, "PRAGMA user_version").Scan(&out.version); err != nil {
+		return out, err
+	}
+	// SQLite's own bookkeeping is included on purpose: sqlite_sequence only exists
+	// after an AUTOINCREMENT table, so its presence is one more fact this build
+	// produces and a foreign schema would have to reproduce. Autoindexes are not:
+	// they are named after their table and carry no independent information.
+	rows, err := q.QueryContext(ctx, `
+SELECT type, name FROM sqlite_master
+WHERE name NOT LIKE 'sqlite_autoindex%'
+ORDER BY type, name`)
+	if err != nil {
+		return out, err
+	}
+	var tables []string
+	for rows.Next() {
+		var kind, name string
+		if err := rows.Scan(&kind, &name); err != nil {
+			rows.Close()
+			return out, err
+		}
+		out.objects = append(out.objects, kind+" "+name)
+		if kind == "table" && name != "meta" {
+			tables = append(tables, name)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return out, err
+	}
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+
+	if containsString(out.objects, "table meta") {
+		metaRows, err := q.QueryContext(ctx, "SELECT key || '=' || value FROM meta ORDER BY key")
+		if err != nil {
+			return out, err
+		}
+		for metaRows.Next() {
+			var row string
+			if err := metaRows.Scan(&row); err != nil {
+				metaRows.Close()
+				return out, err
+			}
+			out.meta = append(out.meta, row)
+		}
+		if err := metaRows.Close(); err != nil {
+			return out, err
+		}
+		if err := metaRows.Err(); err != nil {
+			return out, err
+		}
+	}
+
+	for _, table := range tables {
+		var n int64
+		if err := q.QueryRowContext(ctx, "SELECT count(*) FROM "+quoteIdent(table)).Scan(&n); err != nil {
+			return out, err
+		}
+		out.rows += n
+	}
+	return out, nil
+}
+
+// expectedStagingShape builds, in memory, the schema this build would have at the
+// given version. It replays the migrations the product ships rather than keeping a
+// second copy of the answer: a table name list maintained by hand would be wrong
+// the first time a migration is added, and wrong quietly.
+func expectedStagingShape(ctx context.Context, version int) (stagingShape, error) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		return stagingShape{}, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return stagingShape{}, err
+	}
+	defer conn.Close()
+
+	for _, step := range migrations.Steps {
+		if step.Version > version {
+			break
+		}
+		if _, err := conn.ExecContext(ctx, step.SQL); err != nil {
+			return stagingShape{}, fmt.Errorf("replay schema %03d: %w", step.Version, err)
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version=%d", step.Version)); err != nil {
+			return stagingShape{}, fmt.Errorf("replay schema %03d: %w", step.Version, err)
+		}
+		// The same row migrate writes, in the same place: a staging file that was
+		// interrupted and one that finished are told apart by the schema, not by
+		// this row, but a file that carries the schema without it did not come
+		// through this code.
+		if _, err := conn.ExecContext(ctx,
+			"INSERT INTO meta(key,value) VALUES('schema_version',?) "+
+				"ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+			fmt.Sprintf("%d", step.Version)); err != nil {
+			return stagingShape{}, fmt.Errorf("replay schema %03d: %w", step.Version, err)
+		}
+	}
+	return stagingShapeOf(ctx, conn)
+}
+
+// refuseStaging reports why a staged file is not an interrupted first
+// installation.
+//
+// The code is RECOVERY_REQUIRED and not DURABILITY_FAILED: nothing about the bytes
+// failed, they are intact and were never written to. What is missing is proof that
+// this build produced them, and that is a decision for the person who put the file
+// there - move it aside, or point the installation somewhere else.
+func refuseStaging(staging, format string, args ...any) error {
+	return errs.Newf(errs.CodeRecoveryRequired,
+		"%s: %s; nothing here was opened for writing, removed or migrated, and the file was left as it is",
+		staging, fmt.Sprintf(format, args...))
+}
+
+// describeDifference names the first object that does not match, so the message
+// says what the file is rather than only what it is not.
+func describeDifference(got, want []string) string {
+	for i, name := range got {
+		if i >= len(want) {
+			return fmt.Sprintf("found %q, which this build does not create at that version", name)
+		}
+		if want[i] != name {
+			return fmt.Sprintf("expected %q, found %q", want[i], name)
+		}
+	}
+	if len(want) > len(got) {
+		return fmt.Sprintf("expected %q, which is not there", want[len(got)])
+	}
+	return "the two schemas differ"
+}
+
+func containsString(list []string, want string) bool {
+	for _, got := range list {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// quoteIdent renders a table name as an SQLite identifier. The names come from the
+// file being inspected, so they are escaped rather than trusted.
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // isEmptyFile reports whether path is a regular file of zero length.
