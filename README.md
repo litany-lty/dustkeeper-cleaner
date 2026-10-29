@@ -9,9 +9,10 @@
 一期是一个 Go + 原生 SQLite 的可执行文件：无常驻进程、无后台模型、不依赖 Python/Java。
 
 > **状态：FINAL-1.0 收口完成，独立复核的 D01–D14 已按最小修补处理（逐条修改、反例与未关闭项见
-> `docs/compliance.md` §1.1），第二轮复核的 C01–C08 与 A09/C05 也已在 §1.2/§1.3 里逐条给出修改与
-> 结论。两个目标都由 CI 的原生 runner 产出并冒烟：`darwin-arm64` 在 `macos-latest`（arm64）、
-> `linux-amd64` 在 `ubuntu-latest`（x86_64）。模型能力仍未验收（A12 的唯一缺口）。**
+> `docs/compliance.md` §1.1），第二轮复核的 C01–C08 与 A09/C05 在 §1.2/§1.3、第三轮复核剩下的
+> C03/C05 两处余量在 §1.4 里逐条给出修改与结论。两个目标都由 CI 的原生 runner 产出并冒烟：
+> `darwin-arm64` 在 `macos-latest`（arm64）、`linux-amd64` 在 `ubuntu-latest`（x86_64）。
+> 模型能力仍未验收（A12 的唯一缺口）。**
 > 逐条结论见 [`docs/compliance.md`](docs/compliance.md) 的 FINAL 状态表（A01–A12）。
 > 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
 
