@@ -351,7 +351,13 @@ dustkeeper resume     # 清除标记
 
 - `pause` 只影响**新的** intent。已经在处理中的文件会走到一个安全边界（当前的 rename + 记账完成）再停。
 - `pause` 不改任何 scope 的状态。scope 级别的 `scope pause` 是另一件事：那会阻止该 scope 产生新计划。
-- 被 `held` 的 scope 不能靠 `resume` 恢复，必须重新注册——原因是根身份已经不可信，换个标记没有意义。
+- 被 `held` 的 scope 有两条出路，取决于它为什么被 hold：
+  - **还有未解决对象**（held / parked / 某个 intent / pending）：先处理那个对象（`quarantine list` 能看到它，
+    `quarantine restore` 能把它拿回来）。这时 `scope resume` 一律拒绝，加旗标也一样。
+  - **一个都没有**：说明 hold 已经不描述任何东西。这是旧版本留下的状态——补偿把对象放回去了，
+    但 scope 没跟着放行，也没有 pending 留给对账。此时 `scope resume` 会说明这一点，加上
+    `--accept-stale-hold` 才会执行。它只写 scope 那一行，树和对象都不动；下一次打开这个 scope
+    仍会重新校验根身份，所以它不能用来绕过"根身份变了"的 hold——那种情况仍然要重新注册。
 
 ---
 

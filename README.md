@@ -9,8 +9,9 @@
 一期是一个 Go + 原生 SQLite 的可执行文件：无常驻进程、无后台模型、不依赖 Python/Java。
 
 > **状态：FINAL-1.0 收口完成，独立复核的 D01–D14 已按最小修补处理（逐条修改、反例与未关闭项见
-> `docs/compliance.md` §1.1）。`darwin-arm64` 在开发机上产出并冒烟验收；`linux-amd64` 在 CI 的原生
-> x86_64 runner 上产出并冒烟（这台 arm64 机器不能执行它，见「支持平台」）。模型能力仍未验收。**
+> `docs/compliance.md` §1.1），第二轮复核的 C01–C08 与 A09/C05 也已在 §1.2/§1.3 里逐条给出修改与
+> 结论。两个目标都由 CI 的原生 runner 产出并冒烟：`darwin-arm64` 在 `macos-latest`（arm64）、
+> `linux-amd64` 在 `ubuntu-latest`（x86_64）。模型能力仍未验收（A12 的唯一缺口）。**
 > 逐条结论见 [`docs/compliance.md`](docs/compliance.md) 的 FINAL 状态表（A01–A12）。
 > 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
 
@@ -159,8 +160,8 @@ envelope `code=OK`）；中断续跑 10 批、累计只扫 1.00× 树大小。�
 
 | 目标 | 构建入口 | 验证到哪一步 |
 |---|---|---|
-| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | CI `macos-latest` 上产出（run `40845574824`，代码 `3a7da29`）：`sha256=90445bbf…093e`；`version` 与临时目录内 Q/R 冒烟真实执行，并核对 apply 后原路径不存在、restore 后字节逐字节相同 |
-| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | CI `ubuntu-latest`（x86_64）上产出（同一 run）：`readelf` 复核 X86-64 / `interp=0` / `needed=0`，Q/R 冒烟同样带独立断言，`sha256=e3a7f083…d1da` |
+| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | CI `macos-latest` 上产出（run `40848835280`，代码 `2924938`）：`sha256=dc0b9c26…7868`；`version` 与临时目录内 Q/R 冒烟真实执行，并核对 apply 后原路径不存在、restore 后字节逐字节相同 |
+| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | CI `ubuntu-latest`（x86_64）上产出（同一 run）：`readelf` 复核 X86-64 / `interp=0` / `needed=0`，Q/R 冒烟同样带独立断言，`sha256=8b77dd93…2115` |
 
 本机 `./build/build.sh --release`（`d138594`，`sha256=d116069b…ccbd`）跑的是同一套冒烟，
 checksum 不同是因为嵌了构建时间与 commit。更早的 checksum（`5f365a46…`、`16d0b839…`、
