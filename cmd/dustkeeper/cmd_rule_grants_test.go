@@ -135,12 +135,20 @@ func TestSlimSmallerApprovalWins(t *testing.T) {
 	}
 
 	// 2. The retained single-capability command approves 10. Under the old code
-	// this inserted a second active row and left the 100-file approval in force.
+	// this inserted a second active row and left the 100-file approval in force;
+	// it also printed a confirmation line without the ceiling, so copying that
+	// line reverted to the configured default and the digest no longer matched.
+	// The line is therefore run exactly as printed.
 	proposal := mustCLI(t, "rule", "authorize", "--id", "r1", "--revision", "1",
 		"--auto-purge", "--max-files", "10", "--json")
 	approval := dataString(t, proposal, "approval_digest")
-	mustCLI(t, "rule", "authorize", "--id", "r1", "--revision", "1",
-		"--auto-purge", "--max-files", "10", "--digest", approval, "--json")
+	confirmed := runPrintedCommand(t, nextSteps(t, proposal)[0])
+	if got, _ := dataOf(t, confirmed)["max_files"].(float64); got != 10 {
+		t.Fatalf("the printed confirmation committed %v files, not the 10 that were approved", got)
+	}
+	if got := dataString(t, confirmed, "digest"); got != approval {
+		t.Fatalf("the printed confirmation committed digest %s, not the approved %s", got, approval)
+	}
 
 	actives := activeGrants(t, ruleStateGrants(t), "auto_purge")
 	if len(actives) != 1 {

@@ -680,9 +680,12 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 		if rule.Status != domain.RuleActive {
 			continue
 		}
-		// No active grant is "no authority" and skips this rule. Anything else -
-		// including the ambiguous multiple-active-grant refusal - is a state this
-		// scope cannot act on, so it stops instead of being skipped silently.
+		// GRANT_REQUIRED is "this rule has no authority for this action", and it
+		// is skipped: a rule with only an auto_quarantine grant is a normal setup.
+		// Everything else - including the ambiguous multiple-active-grant refusal,
+		// which carries RECOVERY_REQUIRED - is a record this scope cannot act on,
+		// so the scope stops and the reason reaches the run report instead of
+		// being read as "nothing to do here".
 		qg, qerr := r.Store.ActiveGrant(ctx, sc.Scope.ID, rule.ID, rule.Revision, domain.CapAutoQuarantine)
 		if qerr != nil {
 			if errs.CodeOf(qerr) == errs.CodeGrantRequired {

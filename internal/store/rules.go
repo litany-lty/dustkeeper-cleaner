@@ -317,6 +317,14 @@ func (s *Store) GetGrant(ctx context.Context, id domain.GrantID) (Grant, error) 
 // means two approvals exist for one action, and whichever row a SELECT happened
 // to return first would become the authority the object runs under. The rows are
 // therefore read in full and a second one is refused rather than picked.
+//
+// The two refusals carry different codes on purpose. "No grant" is an ordinary
+// state that the scheduler is expected to skip; "two active grants" is a state
+// that contradicts itself and needs a decision. Both used to be GRANT_REQUIRED,
+// so the runner - which skips GRANT_REQUIRED as "this rule has no authority" -
+// silently swallowed the ambiguity and reported a clean run in which nothing was
+// cleaned up. RECOVERY_REQUIRED is the existing code for "the record cannot be
+// acted on until somebody looks at it", and it makes the runner stop the scope.
 func (s *Store) ActiveGrant(ctx context.Context, scope domain.ScopeID, rule domain.RuleID, rev int64, capability string) (Grant, error) {
 	rows, err := s.read(ctx, "SELECT "+grantColumns+` FROM grants
 WHERE scope_id=? AND rule_id=? AND rule_revision=? AND capability=? AND status='active'
@@ -348,7 +356,7 @@ ORDER BY approved_at_ns, grant_id`,
 		for _, g := range found {
 			ids = append(ids, string(g.ID))
 		}
-		return Grant{}, errs.Newf(errs.CodeGrantRequired,
+		return Grant{}, errs.Newf(errs.CodeRecoveryRequired,
 			"%d active %s grants exist for rule %s revision %d (%v); the authority is ambiguous, so no action is taken - re-enable the rule to keep exactly the approval that was last confirmed",
 			len(found), capability, rule, rev, ids)
 	}

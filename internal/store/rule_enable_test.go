@@ -476,11 +476,17 @@ func TestSlimOneActiveGrantPerCapability(t *testing.T) {
 		if err == nil {
 			t.Fatalf("an ambiguous pair was resolved to %s", got.ID)
 		}
-		if code := errs.CodeOf(err); code != errs.CodeGrantRequired {
-			t.Fatalf("code = %s, want %s", code, errs.CodeGrantRequired)
+		// Not GRANT_REQUIRED: that code means "this rule has no authority", which
+		// the scheduler skips as an ordinary state. Two active grants is a record
+		// that contradicts itself, and it has to stop the scope instead.
+		if code := errs.CodeOf(err); code != errs.CodeRecoveryRequired {
+			t.Fatalf("code = %s, want %s", code, errs.CodeRecoveryRequired)
 		}
 		if !strings.Contains(err.Error(), "grant_a") || !strings.Contains(err.Error(), "grant_b") {
 			t.Fatalf("the refusal does not name both rows: %v", err)
+		}
+		if !strings.Contains(err.Error(), "re-enable the rule") {
+			t.Fatalf("the refusal does not say how to resolve it: %v", err)
 		}
 	})
 

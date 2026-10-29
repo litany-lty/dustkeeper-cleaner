@@ -256,7 +256,7 @@ type Ceiling struct {
 // ceiling that happens to equal the default produces the same digest.
 func enableConfirmCommand(r store.Rule, mode string, ceilings map[string]Ceiling, digest string) string {
 	cmd := fmt.Sprintf("dustkeeper rule enable --id %s --revision %d --mode %s",
-		r.ID, r.Revision, mode)
+		shellQuote(string(r.ID)), r.Revision, mode)
 	if c, ok := ceilings[domain.CapAutoQuarantine]; ok {
 		cmd += fmt.Sprintf(" --max-files %d --max-bytes %d", c.Files, c.Bytes)
 	}

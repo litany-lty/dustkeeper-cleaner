@@ -452,6 +452,35 @@ func (a *app) openStore() error {
 	return nil
 }
 
+// shellQuote renders a string as one POSIX shell word.
+//
+// The confirmation commands this CLI prints are meant to be copied and run. A rule
+// ID is any non-empty string, so an ID such as "daily exports" used to produce a
+// command that no longer addressed the rule - the printed line was not the
+// approval it claimed to be. IDs made of ordinary characters are printed as they
+// are, so the simple case stays readable.
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	plain := true
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune("-_.:@+=", r):
+		default:
+			plain = false
+		}
+		if !plain {
+			break
+		}
+	}
+	if plain {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // flagset builds a quiet flag set: usage errors must become structured output,
 // not a wall of usage text on stderr.
 func flagset(name string, errOut io.Writer) *flag.FlagSet {

@@ -628,8 +628,8 @@ func ruleAuthorize(ctx context.Context, a *app, args []string) (output, error) {
 			"  " + string(grantDigest),
 		}
 		out.Next = []string{
-			fmt.Sprintf("dustkeeper rule authorize --id %s --revision %d --%s --digest %s",
-				r.ID, r.Revision, capabilityFlag(capability), grantDigest),
+			fmt.Sprintf("dustkeeper rule authorize --id %s --revision %d --%s --max-files %d --max-bytes %d --digest %s",
+				shellQuote(string(r.ID)), r.Revision, capabilityFlag(capability), files, bytes, grantDigest),
 		}
 		return out, nil
 	}
