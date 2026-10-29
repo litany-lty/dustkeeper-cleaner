@@ -258,6 +258,10 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		}
 	}
 
+	if err := runBeforeCompleteHook("purge"); err != nil {
+		return res, errs.Newf(errs.CodeStateWriteFailed,
+			"the object was deleted but its record could not be closed: %v; the operation stays pending for `recover reconcile`", err)
+	}
 	if err := e.Store.CompletePurge(ctx, intent, `{"source":"observed"}`); err != nil {
 		return res, err
 	}

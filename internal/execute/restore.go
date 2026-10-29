@@ -227,6 +227,10 @@ func (e *Executor) Restore(ctx context.Context, sc *ScopeCtx, itemID domain.Item
 	// reason is gone now that the object is back and its record says so. The
 	// item's terminal record and the scope's transition commit together, so a
 	// failure cannot leave a restored file behind a scope nobody can resume.
+	if err := runBeforeCompleteHook("restore"); err != nil {
+		return res, errs.Newf(errs.CodeStateWriteFailed,
+			"the file is back at its destination but its record could not be closed: %v; the operation stays pending for `recover reconcile`", err)
+	}
 	if err := e.Store.CompleteRestoreReleasingHold(ctx, intent, `{"source":"observed"}`, it.ScopeID); err != nil {
 		return res, err
 	}

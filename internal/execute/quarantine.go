@@ -414,6 +414,10 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 		return res, errs.Wrap(errs.CodeStateWriteFailed, err)
 	}
 
+	if err := runBeforeCompleteHook("quarantine"); err != nil {
+		return res, errs.Newf(errs.CodeStateWriteFailed,
+			"the object is in the vault but its record could not be closed: %v; the operation stays pending for `recover reconcile`", err)
+	}
 	if err := e.Store.CompleteQuarantine(ctx, intent, store.QuarantineResult{
 		CapturedIdentityJSON: string(capturedIDJSON),
 		CapturedTokenJSON:    string(capturedTokJSON),

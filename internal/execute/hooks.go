@@ -52,6 +52,21 @@ var TestHookBeforeAcceptance func()
 // Returning nil leaves the real flush to run.
 var TestHookManifestDirSync func() error
 
+// TestHookBeforeComplete fails the terminal write of an action whose namespace
+// change has already landed and been made durable. It is fault injection for the
+// same reason as the hook above: the window is real (a full disk, an I/O error,
+// a rollback of the state database all leave exactly this state), but nothing
+// outside the process can put it there on purpose, and the state it produces -
+// the object is where the action put it, the record still says "intent" - is
+// the one reconciliation exists to finish.
+//
+// The argument is the action name ("quarantine", "restore", "purge") so one
+// hook can fail one action while the others run normally. Returning an error
+// replaces the terminal write; returning nil leaves it to run. It does not
+// clear itself, because a test that sets it is describing every action in the
+// batch, not one item.
+var TestHookBeforeComplete func(action string) error
+
 func runBeforeStableReadHook() {
 	if f := TestHookBeforeStableRead; f != nil {
 		TestHookBeforeStableRead = nil
@@ -83,4 +98,11 @@ func runCompensateHook() {
 	if TestHookPreCompensateRename != nil {
 		TestHookPreCompensateRename()
 	}
+}
+
+func runBeforeCompleteHook(action string) error {
+	if f := TestHookBeforeComplete; f != nil {
+		return f(action)
+	}
+	return nil
 }
