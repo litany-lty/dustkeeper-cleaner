@@ -254,6 +254,14 @@ artifact `12886825025`（`dustkeeper-darwin-arm64`，3 970 989 B）、
    制品 `version` 显示 `commit unknown`（同一个 git 拒绝让 `git rev-parse` 落空）。前者补 `-buildvcs=false`，
    后者只把 `/src` 加进容器内的 `safe.directory`——commit 仍由 git 给出，不由调用方注入。
 
+**当前 HEAD 的门禁（`d0b46c1`，R03/R04 的证据补齐与 §7.3.1 的文档修正）：**
+`gh run 40876511267`，两个 job 均 success，artifact `12897768894`（`dustkeeper-darwin-arm64`，
+3 970 982 B）/ `12898935465`（`dustkeeper-linux-amd64`，4 315 402 B），
+`sha256=413c7545…1ec5` / `61f58a4c…d428`，两份 `smoke_qr` 同样带
+`source_gone_after_apply=yes restored_bytes_match=yes`。这一轮的提交只增加测试与文档，
+没有触碰生产路径，所以 §3 的制品表不跟着换：换一个 checksum 要再跑一次归档，
+而它们描述的是同一份行为。checksum 不同是因为制品里嵌的 commit 字符串变了。
+
 
 ## 3. 制品执行过哪些动作（与源码测试分开记录）
 
