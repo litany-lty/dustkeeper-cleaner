@@ -102,7 +102,7 @@ performance JSON 的 `commit` 标注与 §2 标题不一致的问题见下面 §
 扫描/存储代码 + 尚未提交的构建脚本），不是两次测量。本轮没有重跑 bench，也没有为了让标注好看而改
 generated 文件。
 
-以下命令在本轮最终提交 `d138594` 的树上实跑（`go test ./...` 与 `-race` 各 18 个包 ok）：
+以下命令在代码提交 `d138594` 的树上实跑（之后只有文档改动；`go test ./...` 与 `-race` 各 18 个包 ok）：
 
 ```sh
 go build ./...                 干净
@@ -175,8 +175,8 @@ target=linux-amd64 format=elf arch=amd64 linkage=static toolchain=x86_64-linux-g
 
 `ubuntu-latest`（x86_64）跑 `./build/build-linux-release.sh`、`macos-latest`（arm64）跑
 `./build/build.sh --release`，两个 job 均 success（`gh run view 40845574824`：
-`headSha=3a7da29b9434e1a21c56897c238a6032087eb0bc`，`conclusion=success`）。这个提交就是本轮
-C01–C08 修补与文档更新之后的 HEAD，所以这一份输出覆盖了那些改动。每步结果：
+`headSha=3a7da29b9434e1a21c56897c238a6032087eb0bc`，`conclusion=success`）。这个提交包含本轮
+C01–C08 的全部代码修补，也包含第一版文档更新，所以这一份输出覆盖了那些改动。每步结果：
 
 ```
 job (ubuntu-latest, linux-amd64)   4 assert the runner is the target this job claims   success
