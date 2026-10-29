@@ -545,7 +545,9 @@ Commands:
   init                     initialise the local state directory
   doctor                   check permissions, database, capabilities and clock
   scope add|list|show|pause|resume
-                           register and manage scopes
+                           register and manage scopes; resume
+                           --accept-stale-hold releases a hold that has
+                           no unresolved object behind it
   scan --scope ID          metadata-only scan and candidate index
   rule enable              activate a revision and approve its capabilities once
   rule draft|import|show|validate|preview|activate|authorize|revoke|disable

@@ -186,6 +186,8 @@ func scopePause(ctx context.Context, a *app, args []string, resume bool) (output
 	}
 	fs := flagset(name, io.Discard)
 	ref := fs.String("id", "", "scope ID")
+	acceptStale := fs.Bool("accept-stale-hold", false,
+		"resume a held scope whose hold no longer describes anything; refused while any object is unresolved")
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
 	}
@@ -209,8 +211,30 @@ func scopePause(ctx context.Context, a *app, args []string, resume bool) (output
 			target = domain.ScopeActive
 		}
 		if sc.Status == domain.ScopeHeld && resume {
-			return output{}, errs.Newf(errs.CodeHeld,
-				"scope %s is held because its identity could not be proven; run doctor and re-register rather than resuming", sc.ID)
+			// "Held" used to have exactly one explanation in this message - a
+			// root that no longer proves itself - and that explanation was
+			// wrong for the other way a scope gets here: an older build could
+			// finish a compensation and stop between closing the object and
+			// releasing the scope, leaving a scope held over nothing. Telling
+			// that operator to re-register sends them to change a registration
+			// that is fine.
+			//
+			// The two cases are told apart by the fact rather than by a stored
+			// reason, because the schema has no field for one: is anything in
+			// this scope still unresolved? A held object, a parked one, an open
+			// intent - any of those means the hold still has a subject.
+			unresolved, uerr := a.store.ScopeHasUnresolved(ctx, sc.ID)
+			if uerr != nil {
+				return output{}, uerr
+			}
+			if unresolved {
+				return output{}, errs.Newf(errs.CodeHeld,
+					"scope %s is held and still has an unresolved object; finish it or restore it before resuming (`dustkeeper quarantine list` shows what is left). If doctor reports that the root no longer matches its registration, re-register the scope instead", sc.ID)
+			}
+			if !*acceptStale {
+				return output{}, errs.Newf(errs.CodeHeld,
+					"scope %s is held but nothing in it is unresolved, so the hold no longer describes anything: this is what an older build left behind when a compensation finished and the scope was not released with it. Accepting it changes nothing about the tree, and the root is checked again the next time the scope is opened; pass --accept-stale-hold to resume", sc.ID)
+			}
 		}
 		if err := a.store.SetScopeStatus(ctx, sc.ID, target); err != nil {
 			return output{}, err
