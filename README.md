@@ -159,10 +159,12 @@ envelope `code=OK`）；中断续跑 10 批、累计只扫 1.00× 树大小。�
 
 | 目标 | 构建入口 | 验证到哪一步 |
 |---|---|---|
-| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | 产物 `sha256=d116069b…ccbd`（`commit=d138594`）；`version` 与临时目录内 Q/R 冒烟在本机真实执行通过，并核对 apply 后原路径不存在、restore 后字节逐字节相同 |
-| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | 由 CI 的 `ubuntu-latest`（x86_64）产出（run `40740165469`，代码 `dd7c791`）：`readelf` 复核 X86-64 / `interp=0` / `needed=0`，`version` 与临时目录内 Q/R 冒烟通过，`sha256=96be5921…8c89`；该 run 早于 C01–C08 的修复提交 |
+| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | CI `macos-latest` 上产出（run `40845574824`，代码 `3a7da29`）：`sha256=90445bbf…093e`；`version` 与临时目录内 Q/R 冒烟真实执行，并核对 apply 后原路径不存在、restore 后字节逐字节相同 |
+| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | CI `ubuntu-latest`（x86_64）上产出（同一 run）：`readelf` 复核 X86-64 / `interp=0` / `needed=0`，Q/R 冒烟同样带独立断言，`sha256=e3a7f083…d1da` |
 
-更早的制品 checksum（`5f365a46…`、`16d0b839…`、`1fa83ce4…`）保留在
+本机 `./build/build.sh --release`（`d138594`，`sha256=d116069b…ccbd`）跑的是同一套冒烟，
+checksum 不同是因为嵌了构建时间与 commit。更早的 checksum（`5f365a46…`、`16d0b839…`、
+`1fa83ce4…`、`533e372c…`、`96be5921…`）保留在
 [`docs/compliance.md`](docs/compliance.md) §3 的历史行里，不与上面这两行拼成同一份证据。
 
 `build.sh` 是单目标构建：它在**它所在的那台机器上**编译，产物架构从产物本身读回来，不接受 GOOS/GOARCH 覆盖。
