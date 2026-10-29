@@ -13,27 +13,29 @@
 本轮五个提交：F1 `50c9df3`（去重/adopt 退出）、F2 `1c7b1ec`（启用原子化）、F3 `754a21d`（执行闭环）、
 F4 `0f9a371`（扫描/日志/盘点如实）、F5 `82c29ee`（两个原生目标发布 + 文档收口）。
 
-FINAL-1.0 之后按独立复核报告修补了 D01–D14（基于 `9d9af21`），逐条修改、反例与结果见 **§1.1**。
-下表各行的证据已把 §1.1 的提交并入，判定按并入后的实际覆盖重新给出。
+FINAL-1.0 之后按两份独立复核报告修补：D01–D14（基于 `9d9af21`）逐条修改、反例与结果见 **§1.1**；
+其后的 C01–C08（基于 `dd7c791`）见 **§1.2**。
+下表各行的证据已把 §1.1、§1.2 的提交并入，判定按并入后的实际覆盖重新给出。
 
 | ID | 验收组 | 判定 | 证据（commit / 命令 / 结果） |
 |---|---|---|---|
-| A01 | 有限旧格式兼容 | 通过 | F1 `50c9df3`：`go test ./test/integration -run TestSlimLegacyCompatibility -count=1`。三个子用例：hot journal 先由 SQLite 回滚再核版本；当前格式正常打开；其它版本写出的库在写入前以 `INCOMPATIBLE_SCHEMA` 拒绝，且文件字节的 sha256 在拒绝前后相同。旧 vault 不被改写、正常 lifecycle pending 不被整体拒绝、terminal 事件不重复写终结由同一用例与 `TestCompleteQuarantineIsIdempotent` 覆盖。D11 `7ac620a`：首次初始化改为在 `state.db.init` 上建库、逐条迁移、全部提交后才 `os.Link` 成 `state.db`——`TestAnInterruptedFirstInstallationResumes`（停在 000/001/002 三个迁移点）、`TestAnEmptyStateFileIsInitialisedNotRefused`、`TestARealOlderStateFileIsStillRefused`（旧格式库字节不变且不留 staging）。 |
+| A01 | 有限旧格式兼容 | 通过 | F1 `50c9df3`：`go test ./test/integration -run TestSlimLegacyCompatibility -count=1`。三个子用例：hot journal 先由 SQLite 回滚再核版本；当前格式正常打开；其它版本写出的库在写入前以 `INCOMPATIBLE_SCHEMA` 拒绝，且文件字节的 sha256 在拒绝前后相同。旧 vault 不被改写、正常 lifecycle pending 不被整体拒绝、terminal 事件不重复写终结由同一用例与 `TestCompleteQuarantineIsIdempotent` 覆盖。D11 `7ac620a`：首次初始化改为在 `state.db.init` 上建库、逐条迁移、全部提交后才 `os.Link` 成 `state.db`——`TestAnInterruptedFirstInstallationResumes`（停在 000/001/002 三个迁移点）、`TestAnEmptyStateFileIsInitialisedNotRefused`、`TestARealOlderStateFileIsStillRefused`（旧格式库字节不变且不留 staging）。C03/C04 `6f250cc`：暂存库在交给 SQLite 之前先验类型/链接数/属主/来源；只读入口改用 `store.OpenExisting`，零字节的状态库报 `RECOVERY_REQUIRED` 而不是被重建为空实例（`status` 不再把损坏库变成"正常"）。 |
 | A02 | 去重/adopt 真正退出 | 通过 | F1 + F3：`TestSlimLegacyActionsAreBlocked`（`reference` scope 注册被拒且不建 vault；duplicate 计划经 `plan apply` 被拒）、`TestSlimUnresolvedObjectBlocksBothEntrances`（普通入口与高级入口都拒，且不产生新 intent）、`TestAQuarantineOnlyApprovalNeverBecomesADeletion`。健康旧对象仍可恢复、且恢复后 keeper pin 释放：`test/integration/slim_f1_test.go:351-356`；不支持 pending 未被清空：同一用例逐行核对 pending 行数。CLI 侧 `dedup`/`adopt` 命令已不存在（`cmd/dustkeeper/main.go` 路由表）。 |
 | A03 | 范围和规则严格性 | 通过 | `TestSlimLegacyActionsAreBlocked` 的 reference 子用例（非 `managed_disposable` 不自动 Q/P）；`internal/rules` 的字段合同用例：`TestEveryDocumentedFieldIsRequired`、`TestRequiredFieldsRejectNull`、`TestEmptyCollectionsAreNotMissingFields`、`TestParseRejectsTwoSpellingsOfOneField`、`TestParseDraftRejectsCaseVariantsOfItsOwnKeys`、`TestModelDraftsGoThroughTheSameFieldContract`；歧义/不支持语义不生成可执行草稿：`internal/rules/corpus_test.go` + `test/eval` 的 semantic 判定（模型侧结论见 A12）。 |
-| A04 | 原子、幂等启用 | 通过 | F2 `1c7b1ec`：`go test ./internal/store -run TestSlimEnableTransaction`、`go test ./cmd/dustkeeper -count=1`（`cmd_rule_enable_test.go`）。覆盖：无 digest 不改 rules/grants；陈旧 digest 拒绝；中途错误整体回滚（rules 与 grants 都不留痕）；相同 active binding 重复启用不新增 grant；撤销后重新启用不复活旧 ID；Q/P 上限分开取。D01/D09 `d0f9dfb`：`replaceGrantTx` 先撤销同能力其余 active 再复用同 digest 的行，`ActiveGrant` 读全量并拒绝多活动授权；确认命令带这次屏幕上的实际额度（`TestSlimSmallerApprovalWins`、`TestSlimEnableCommandCarriesTheApprovedCeilings`）。 |
+| A04 | 原子、幂等启用 | 通过 | F2 `1c7b1ec`：`go test ./internal/store -run TestSlimEnableTransaction`、`go test ./cmd/dustkeeper -count=1`（`cmd_rule_enable_test.go`）。覆盖：无 digest 不改 rules/grants；陈旧 digest 拒绝；中途错误整体回滚（rules 与 grants 都不留痕）；相同 active binding 重复启用不新增 grant；撤销后重新启用不复活旧 ID；Q/P 上限分开取。D01/D09 `d0f9dfb`：`replaceGrantTx` 先撤销同能力其余 active 再复用同 digest 的行，`ActiveGrant` 读全量并拒绝多活动授权；确认命令带这次屏幕上的实际额度（`TestSlimSmallerApprovalWins`、`TestSlimEnableCommandCarriesTheApprovedCeilings`）。C07 `21af564`：同一能力出现两条 active 授权不再报 `GRANT_REQUIRED`（runner 当作"没有授权"跳过），改报 `RECOVERY_REQUIRED` 并停 scope；C08 让 `rule authorize` 打印的确认命令带着刚批准的额度，含空格的规则 ID 也加引号。 |
 | A05 | 权限和保留期不追溯扩大 | 通过 | `TestAutoPurgeIsNotRetroactive`（先隔离后开自动清空，旧对象仍不可清空）、`TestZeroBudgetForbidsTheAction`、`TestAutomaticPurgeHonoursTheGrantCeiling`、`TestAQuarantineOnlyApprovalNeverBecomesADeletion`（Q 授权不会被当成 P 授权）。 |
-| A06 | 正常 Q/R/P 真能完成 | 通过 | 源码：`TestQuarantineMovesOnlyWhatTheRuleSelected`（命中隔离，排除/受保护/不命中保留）、`TestRestoreRefusesToOverwrite`、`TestManualPurgeRemovesOnlyListedObjects`、`TestSlimClockSeamDrivesRetention`（受控时钟推进后授权 P 成功）；仅 Q 模式到期仍保留由 `TestAQuarantineOnlyApprovalNeverBecomesADeletion` 覆盖。制品：`darwin-arm64` 的 Q/R 冒烟，见 §3。 |
+| A06 | 正常 Q/R/P 真能完成 | 通过 | 源码：`TestQuarantineMovesOnlyWhatTheRuleSelected`（命中隔离，排除/受保护/不命中保留）、`TestRestoreRefusesToOverwrite`、`TestManualPurgeRemovesOnlyListedObjects`、`TestSlimClockSeamDrivesRetention`（受控时钟推进后授权 P 成功）；仅 Q 模式到期仍保留由 `TestAQuarantineOnlyApprovalNeverBecomesADeletion` 覆盖。C02 `0ff6fa0`：`quarantine restore` 的前置状态扩到 `quarantined \| held`，被 hold 住的对象终于能从正式入口恢复（此前 CLI 只认 `quarantined`，而列表说它 `restorable`）。制品：`darwin-arm64` 的 Q/R 冒烟，见 §3。 |
 | A07 | 动作前证据与资源检查 | 通过 | `TestDiskPressurePausesQuarantineButNotADuePurge`（低空间零新 Q，到期清空照常）、`TestBudgetExhaustionLeavesTheRestAlone`、`TestClockGoingBackwardsSuspendsPurge`、`TestAcknowledgingTheClockRestartsUnprovableWindows`、`TestANonZeroInodeFlagDoesNotBlockThePurge`（反向：正常 rename 正例通过）。 |
 | A08 | 保护及控制不绕过 | 通过 | `TestPurgeFreezesWhenAliasCannotBeResolved`、`TestAPlanDoesNotOfferAnObjectWhoseAncestryCannotBeInspected`（预览与执行同一套祖先判定）、`TestSlimUninspectableProtectionRefusesThePurge`、`TestSlimControlPropagation`（`stop_run` 即使 Go error=nil 也非成功退出，后续零新 intent）、`TestPauseStopsNewIntents`、`TestGlobalProtectionWinsOverTheRule`。D04 `27c65e4`：对账无法记录结果时本轮零 scope 启动并 `ControlStopRun`，时钟仍记录（`TestARunThatCannotRecordItsOutcomesStartsNothing`）。 |
-| A09 | 故障可收敛 | 部分 | 已有：`TestReconcileRetriesEveryActionUntilTheScopeIsFree`（临时故障连续两轮不终结，解除后完成）、`TestReconcileCompletesACrashedQuarantine`（中断恢复）、`TestCrashDiscoveredMiscaptureRecordsTheActualObject`、`TestWrongCaptureIsPutBackWithProtections`、`TestCompensationCrashReturnsToTheHold`、`TestSlimTwoPurgeRoutesAgree`（同一初始状态下 `purge apply` 与 `plan apply` 逐字段相同）。D02/D03/D06/D07/D08 `27c65e4` 补了"证据成立才收敛"的一半：验证窗口内被改动的源被拒（`CodePlanStale`，不写成 Held）、不可读的 manifest/vault 对象 park 而不是当结论、stat 失败的源不算证据、合同坏/绑错/无 prior 状态一律不猜、补偿成功收敛为 `StateRestored` + scope 需重新确认、目录同步失败的 manifest 被撤回。**未覆盖**：Q/R/P 各自"系统调用成功后注入同步/complete 失败"的完整矩阵——`internal/testkit` 故障注入点仍不存在，现有用例只在现有协议点上手工插入中断或者用一次性测试钩子。按最终计划 §6.4-1 的口径，这一组只能算部分。 |
+| A09 | 故障可收敛 | 部分 | 已有：`TestReconcileRetriesEveryActionUntilTheScopeIsFree`（临时故障连续两轮不终结，解除后完成）、`TestReconcileCompletesACrashedQuarantine`（中断恢复）、`TestCrashDiscoveredMiscaptureRecordsTheActualObject`、`TestWrongCaptureIsPutBackWithProtections`、`TestCompensationCrashReturnsToTheHold`、`TestSlimTwoPurgeRoutesAgree`（同一初始状态下 `purge apply` 与 `plan apply` 逐字段相同）。D02/D03/D06/D07/D08 `27c65e4` 补了"证据成立才收敛"的一半：验证窗口内被改动的源被拒（`CodePlanStale`，不写成 Held）、不可读的 manifest/vault 对象 park 而不是当结论、stat 失败的源不算证据、合同坏/绑错/无 prior 状态一律不猜、补偿成功收敛为 `StateRestored` + scope 需重新确认、目录同步失败的 manifest 被撤回。C01/C05/C06 `0ff6fa0` 继续同一方向：restore 合同里的路径按"批准的目的地"解释（自定义目的地不再被误拒、目的地身份照旧比对）、补偿收尾与 scope 放行同一事务（中断不会留下"对象回来了但 scope 仍拒绝 resume"）、Q 对账也走同一条合同绑定检查且 P 缺 prior 时两种结果都不产出结论。**未覆盖**：Q/R/P 各自"系统调用成功后注入同步/complete 失败"的完整矩阵——`internal/testkit` 故障注入点仍不存在，现有用例只在现有协议点上手工插入中断或者用一次性测试钩子。按最终计划 §6.4-1 的口径，这一组只能算部分。 |
 | A10 | 扫描完整性诚实 | 通过 | F4 `0f9a371`：`TestSlimIncompleteScanKeepsTheEpochOpen`（去掉 `unverifiedCount > 0` 分支后报 "an entry that could not be inspected completed the epoch"）、`TestSlimVanishedEntryIsNotAFailure`（ENOENT 只记 vanished，目录照常完成）、`TestSlimIncompleteScopeStartsNoAutomaticQuarantine`（去掉 `!scanState.Complete` 分支后报 "collected 2 objects"）、`TestAFailedDirectoryCannotCompleteTheEpochOrRetireItsOwnObservations`。 |
 | A11 | 诊断不修改他人文件、不虚报缺失 | 通过 | F4 `0f9a371`：`internal/diag` 六个拒绝用例（symlink / FIFO / 宽权限 / 硬链 / 目录 / 设备，全部 `ErrNotPrivate` 且原对象字节与 mode 不变）+ `TestAPrivateLogIsCreatedAndStillRotates`；`internal/rescue`：`TestSlimRescueEntryLevelUnverified`、`TestSlimRescueDirectoryLevelUnverified`（回退成 `read` 即报 `object_state="read", want "partial"`）、`TestSlimRescuePartialManifestsDoNotBecomeOrphans`、`TestAnUnreadableObjectsDirectoryDoesNotClaimTheObjectsAreGone`。D12 `e14855c`：日志目录持 FD 并校验（拒 symlink/非目录/group-other 可写/非本人），创建与轮转都相对该 FD（`TestASymlinkedLogDirectoryIsRefusedAndItsTargetUnchanged`、`TestARotatedNameStaysInsideTheVerifiedDirectory`）。D13 `e14855c`：`readManifests` 只有 ENOENT 才算 missing，orphan 判定排除 partial 与 unreadable；零计数 + 目录不可读也 `RECOVERY_REQUIRED`（`TestRecoverInspectDoesNotCallObjectsOrphansWhenManifestsAreUnreadable`、`TestRecoverInspectWithNoEntriesAndAnUnreadableDirectoryStillFails`）。 |
-| A12 | 有限发布证据 | 部分 | 两个目标都有本轮 checksum 与真实执行记录（§3）：`darwin-arm64` 在本机产出并冒烟；`linux-amd64` 在 CI 的原生 x86_64 runner 上产出并冒烟（`gh run 40642359982`，两 job 均 success）。两个平台的 `build`/`vet`/`test`/`race` 分别在本机与 CI 跑过，CI 每个 job 构建前先断言 runner 实际架构等于声明目标。10 万文件扫描完成性成立：wall 54.5 s、峰值 RSS 29.5 MiB ≤ 256 MiB（§2，`commit` 记在证据文件里）。D14 `1ffbc43` 把发布门禁收紧到"证据与产物必须对得上"：libc 判定改读真实链接输入、Q/R 冒烟独立断言移动与内容、后段失败清理本轮产物、CI 归档本目标四个文件、宿主断言改用 `GOHOSTOS/GOHOSTARCH`。**仍差一项**：真实模型的固定语料报告——本机没有获准端点，`test/eval` 保持 skip，不以 skip 当通过；另外 CI 归档步骤本轮**未实跑**（见 §1.1 的 D14 行）。因此这一组记部分。 |
+| A12 | 有限发布证据 | 部分 | 两个目标都有 checksum 与真实执行记录（§3）：`darwin-arm64` 在本机产出并冒烟（`d138594`，`sha256=d116069b…ccbd`）；`linux-amd64` 在 CI 的原生 x86_64 runner 上产出并冒烟（`gh run 40740165469`，代码 `dd7c791`，两 job 均 success，`sha256=96be5921…8c89`）。两个平台的 `build`/`vet`/`test`/`race` 分别在本机与 CI 跑过，CI 每个 job 构建前先断言 runner 实际架构等于声明目标。10 万文件扫描完成性成立：wall 54.5 s、峰值 RSS 29.5 MiB ≤ 256 MiB（§2）。D14 `1ffbc43` 把发布门禁收紧到"证据与产物必须对得上"：libc 判定改读真实链接输入、Q/R 冒烟独立断言移动与内容、后段失败清理本轮产物、CI 归档本目标四个文件、宿主断言改用 `GOHOSTOS/GOHOSTARCH`。D14.4 的归档步骤在 `40740165469` 里实跑成功：两个 job 各上传 4 个文件，artifact `12838673841`（darwin-arm64）/ `12838009604`（linux-amd64）。**仍差一项**：真实模型的固定语料报告——本机没有获准端点，`test/eval` 保持 skip，不以 skip 当通过。因此这一组记部分。 |
 
 结论：12 组里 **10 组通过、2 组部分（A09、A12）、0 组未验收**；A09 的部分是 Q/R/P 同步/complete
-失败矩阵未建（`internal/testkit` 注入点不存在），A12 的部分是真实模型语料报告缺失、以及本轮新增的
-CI 归档步骤尚未实跑。两条都写在这里，不用"结构齐全"顶替；也没有把未执行的检查算成通过。
+失败矩阵未建（`internal/testkit` 注入点不存在），A12 的部分是真实模型语料报告缺失。
+D14.4 原先的"CI 归档步骤未实跑"已由 `40740165469` 关闭（见 §1.1）。
+两条都写在这里，不用"结构齐全"顶替；也没有把未执行的检查算成通过。
 
 ### 1.1 复核报告 D01–D14 的修补（2026-10-29，基于 `9d9af21`）
 
@@ -58,7 +60,7 @@ CI 归档步骤尚未实跑。两条都写在这里，不用"结构齐全"顶替
 | D14.1 libc 判定依赖目录名 | `1ffbc43`：探针改成真实静态链接（失败即失败），证据取自 driver 转录里 collect2 的 startfile 与 `-L`，两者必须同为 musl；libc.a 不再作证据 | 空 `musl-headers-placeholder` CPATH 目录 + 真实 glibc gcc → "an empty musl-named include directory proved a glibc compiler" | 通过：容器内真实 musl-gcc 仍通过（`startfile=/usr/lib/x86_64-linux-musl/Scrt1.o`、`musl_libdir=-L/usr/lib/x86_64-linux-musl`、`musl_pkgs=musl=1.2.3-1,…`） | 通用入口没有第三种 libc 目标，也不新增 |
 | D14.2 Q/R 冒烟可 no-op | `1ffbc43`：保存原始字节；apply 后断言原路径不存在；restore 后 `cmp` 比内容；再列一次确认对象已不在可恢复列表 | 完全不移动文件 → 旧脚本 exit 0；restore 写错内容 → 旧脚本 exit 0 | 通过：两条都失败在具体断言上 | — |
 | D14.3 失败留半成品 | `1ffbc43`：`fail_release` 清理本轮 binary/SHA256SUMS/manifest；启动先删上一次 manifest；清单临时名写完再 `mv` | shasum 写失败、SHA256SUMS 校验失败 → 本轮 binary 与上一份 manifest 都留在 dist | 通过：其他版本产物不被删 | — |
-| D14.4 CI 未归档 | `1ffbc43`：验证后 `upload-artifact` 归档本目标 binary + SHA256SUMS + release-manifest + build-facts，`if-no-files-found: error` | 本次 API 返回 `artifacts=[]`（报告所记） | 工件已加进 job | **未实跑**：本轮没有 CI 运行，归档是否真出现在 run 里没有证据 |
+| D14.4 CI 未归档 | `1ffbc43`：验证后 `upload-artifact` 归档本目标 binary + SHA256SUMS + release-manifest + build-facts，`if-no-files-found: error` | 本次 API 返回 `artifacts=[]`（报告所记） | 已关闭：`gh run 40740165469`（代码 `dd7c791`，两 job 均 success）第 12 步"archive this target's verified artifact"成功，各上传 4 个文件；artifact `12838673841`（darwin-arm64，3 967 691 B）、`12838009604`（linux-amd64，4 311 415 B），`gh api .../artifacts` 可查 | — |
 | D14.5 宿主断言用目标变量 | `1ffbc43`：脚本与 CI 改用 `GOHOSTOS/GOHOSTARCH`，并拒绝与 `GOOS/GOARCH` 不一致 | `GOOS=linux` 在 darwin 宿主上跑 → 旧脚本按宿主名产出，失败信息里也没有宿主/目标之分 | 通过：`TestACrossCompiledSettingIsRefused` | GOHOST 不是虚拟化/硬件鉴定，本期不做 |
 
 同时按 §6.3/§6.4 收了三处口径：`ru.Inblock` 存原值并改名 `inblock_ops`（不再 ×512 冒充字节）、
@@ -66,7 +68,40 @@ CI 归档步骤尚未实跑。两条都写在这里，不用"结构齐全"顶替
 `rule enable`（预览 + 确认两次调用，示例已按顺序实跑）、本文件第 31–32 行的"9 组通过 + 2 组部分"改为
 与表一致的 10 + 2。
 
-## 2. 本轮实跑（2026-10-29，darwin/arm64, APFS，`commit=1ffbc43`）
+### 1.2 第二轮复核报告 C01–C08 的修补（2026-10-29，基于 `dd7c791`）
+
+范围纪律：只修报告点名的 2 项 P1 + 6 项 P2 与非阻塞的引用问题；不恢复 dedup/adopt，不加新服务，
+不改磁盘合同版本，不引入通用故障注入框架，不重做扫描/发布/后台服务。三个提交：
+`0ff6fa0`（C01、C02、C05、C06）、`6f250cc`（C03、C04）、`21af564`（C07、C08 与命令引用）。
+
+反证方法与前一轮相同：把被测文件整文件回退到 `dd7c791`（`git checkout dd7c791 -- <file>`），保留新用例，
+在旧代码上跑出报告描述的现象；对只依赖旧 API 的临时用例，先 `git stash -u` 再放进干净旧树。
+"全量测试通过"不作为任何一条的证据。
+
+| 缺陷 | 修改 | 反例（旧代码上的实际结果） | 结果 | 未关闭 |
+|---|---|---|---|---|
+| C01 自定义目的地恢复被误拒 | `0ff6fa0`：`checkContractBinding` 按**写合同的动作用**读路径——restore 合同记的是批准的目的地，只校验它是合法相对路径（`fsops.SplitRelative`），不再要求等于 `item.RawRelative`；目的地目录身份仍由 `reconcileRestore` 完成分支与 `contract.DestParentIdentity` 比对 | 回退 `internal/recovery/reconcile.go`：`TestACustomDestinationRestoreThatNeverHappenedIsAborted` 与 `...ThatHappenedIsCompleted` 都停在 `Outcome: held`、`Detail: RESTORE_CONTRACT_UNREADABLE: RECOVERY_REQUIRED: the contract names path "recovered/a.zip", but the item is "a.zip"`——rename 之前中断和之后中断都进终结 hold | 通过：未移动 → aborted（文件留在原处），已移动 → completed（目的地在位、身份一致） | — |
+| C02 held 对象无法从正式入口恢复 | `0ff6fa0`：`quarantine restore` 的前置状态改为 `quarantined \| held`，其余门禁（pending、已捕获证据、目的地占用、身份核对）一条不减；不新增"强制恢复"，也不把 held 改写成 quarantined | 回退 `cmd/dustkeeper/cmd_object.go`：真实 CLI 退出 4，`ITEM_NOT_FOUND`，`object obj_… is held, not quarantined`（`TestQuarantineRestoreTakesAHeldObjectOutOfTheVault`） | 通过：held 对象经正式入口恢复，且 scope 的 hold 随之释放；目的地被占用、对象进行中仍被拒（同文件另两条） | — |
+| C03 暂存库在 SQLite 写入前未验证 | `6f250cc`：`prepareStaging` 在 `sql.Open` 之前——不存在则 `O_CREAT\|O_EXCL\|O_NOFOLLOW\|O_CLOEXEC`、0600（关掉 check→open 的替换窗口）；已存在要求 `S_IFREG`、`Nlink==1`、`Uid==euid`、`mode&0o022==0`；0 字节视为"停在第一页之前"可续；否则 `checkResumableStaging` 读 100 字节头，要求 `SQLite format 3\0` 且 `user_version <= migrations.CurrentVersion` | 干净旧树 + `/tmp/c03c04` 临时用例：暂存名是软链、指向 `user_version=99` 的 WAL 库 → `CE: the symlink target was modified (journal byte 2 -> 1)`，即旧代码照着写进了别人的文件 | 通过：`TestAStagedSymlinkIsRefusedBeforeAnythingIsWritten`（目标字节不变、仍是 symlink）、`TestAStagedHardLinkIsRefused`、`TestAStagedFileThatIsNotADatabaseIsRefused` | — |
+| C04 只读入口会把损坏库重建成空库 | `6f250cc`：新增 `store.OpenExisting`——缺失 → `INVALID_ARGUMENT`，零字节 → `RECOVERY_REQUIRED` 并明说"没有创建、没有删除、没有重建"；随后统一走 `openPublished`（`CheckSupportedState` + `requireCurrentSchema` + pragma + chmod）。`app.openStore` 改用 `OpenExisting` 并要求 `instance_id` 存在。`Open` 的创建语义只留给 `init` | 干净旧树：把 `state.db` 截成 0 字节后跑真实 `status` → 旧代码 exit 0、`"status": "ok"`、零 scope 零对象 | 通过：`TestStatusRefusesATruncatedStateDatabase`（非零退出、`RECOVERY_REQUIRED`、消息含 "zero bytes"、size 0 与 inode 不变、无 `.init` 残留、二次运行仍失败）、`TestStatusRefusesADatabaseWithoutAnInstanceIdentity` | — |
+| C05 补偿收尾分两次提交 | `0ff6fa0`：`AbortIntentReleasingHold` / `CompleteRestoreReleasingHold` + `releaseScopeHoldTx`，把 item 终结与该 scope `held → needs_reapproval` 放进同一事务；`releaseScopeHoldTx` 三个条件——只动 `status='held'` 的 scope、只在该 scope 无其它未解决 item（`pending_op_id IS NOT NULL OR state IN ('held','unknown','q_intent','r_intent','p_intent')`）时动、只落到 `needs_reapproval`（绝不直接 active） | 回退 `internal/store/intents.go`、`internal/store/scopes.go`、`internal/execute/quarantine.go`、`internal/execute/restore.go`：补偿后中断 → `the scope is held: the object is back but the scope still refuses 'scope resume'`；正常恢复 held 对象 → `the scope is held after its held object was restored` | 通过：补偿由对账收尾、补偿当场收尾、恢复 held 对象三条都会释放 hold；同一 scope 还有别的 held 对象时不释放 | 已完成补偿却死在两次提交之间的**历史**状态仍存在，且不再补 pending，只能人工处理（与 §1.1 的 D06 同口径）。`TestACompensatedMiscaptureSettlesItemAndScopeTogether` 在旧代码上也能通过（旧码两次写都成功），只作守卫，不作反证 |
+| C06 Q 对账未接绑定、P 对账 prior 检查晚 | `0ff6fa0`：Q 分支改用 `r.operationContract(po)`（与 P 同一条合同读取与绑定检查）；P 分支在 `priorStateOf` 之后立刻判 `!priorKnown → RECOVERY_REQUIRED`，不再只在"对象仍在"分支里判 | 回退 `reconcile.go`：Q 合同绑到别的路径 → `Outcome: aborted` / `the file was never moved`；P 缺 prior 且对象已消失 → `Outcome: completed` / `RECONCILED_ABSENT` | 通过：绑错的 Q 合同不消费（记 `INTENT_CONTRACT_UNREADABLE`），缺 prior 的 P 不产出结论；合同完整的 P 仍记 `RECONCILED_ABSENT` | — |
+| C07 授权歧义被当成"没有授权" | `21af564`：`ActiveGrant` 的多活动行改返回 `CodeRecoveryRequired`（零授权仍是 `CodeGrantRequired`）；runner 的判断没有变，它本来就只跳过 `CodeGrantRequired`，注释写明两个码为何必须分开 | 回退 `internal/store/rules.go`、`internal/run/runner.go`：`TestAnAmbiguousQuarantineGrantStopsTheScope`、`TestAnAmbiguousPurgeGrantStopsTheScope` 均为 `the run ended with ""`，即 Q、P 两种歧义都被静默跳过；正例 `TestAQuarantineOnlyGrantStillRuns` 新旧都通过 | 通过：真实 run 里歧义 → `RECOVERY_REQUIRED` + `stop_scope` + 消息点名 `auto_quarantine`/`auto_purge grants`，且零隔离、零清空；只有 Q 授权（真的没有 P）仍正常跑 | 用例夹具必须直接写库造第二条 active 行（当前 API 每次确认都会撤销被替换的行），注释已写明这一点 |
+| C08 确认命令漏额度 | `21af564`：`rule authorize` 的 `next_steps` 补 `--max-files/--max-bytes`；两处打印命令的规则 ID 走 `shellQuote`（简单字符原样，其余单引号包裹并 `'\''` 转义） | 回退 `cmd/dustkeeper/cmd_rule.go`、`cmd_rule_enable.go`：`TestThePrintedAuthorizeCommandCarriesTheApprovedCeilings` 报"打印出来的命令不含 `--max-files 3`"；`TestSlimSmallerApprovalWins` 执行打印出来的命令后 `committed 0 files, not the 10 that were approved`；含空格 ID 报 `--id daily exports` 未加引号 | 通过：预览用非默认额度（3 / 4096，配置里是 100 / 1 GiB），执行打印出来的命令后 grant 就是 3 / 4096 且 digest 一致；测试不自己补参数 | `shellQuote` 按 POSIX `sh` 转义；Windows 宿主不在两个发布目标内 |
+
+非阻塞项：命令生成器的引用随 C08 一并处理（`shellQuote` 有独立表驱动用例）；
+performance JSON 的 `commit` 标注与 §2 标题不一致的问题见下面 §2 的口径说明，本轮不重跑 bench。
+
+## 2. 本轮实跑（2026-10-29，darwin/arm64, APFS）
+
+关于本节标注的 `commit`：下表的 10 万文件数字来自 `docs/evidence/performance-100k.json`，该文件由
+`test/bench` 自动生成，里面记 `commit=e14855c`——那是测量时工作树上的最后一个提交。测量时工作树还带着
+随后提交为 `1ffbc43` 的构建/CI 改动，而那些改动不触及被测量的扫描与存储路径。所以这里不再写一个
+`commit=1ffbc43` 的标题去覆盖 generator 的标注：两个标注描述的是**同一棵被测代码**（`e14855c` 的
+扫描/存储代码 + 尚未提交的构建脚本），不是两次测量。本轮没有重跑 bench，也没有为了让标注好看而改
+generated 文件。
+
+以下命令在本轮最终提交 `d138594` 的树上实跑（`go test ./...` 与 `-race` 各 18 个包 ok）：
 
 ```sh
 go build ./...                 干净
@@ -76,6 +111,12 @@ go test -race ./... -count=1   exit 0，18 个包 ok
 ./build/test-linux.sh          exit 0，18 个包 ok（容器内 ext2/ext3 loop，aarch64）
 ./build/build.sh --release     exit 0，darwin-arm64 制品 + 清单 + SHA256SUMS
 ```
+
+`test-linux.sh` 这一轮抓到一处**测试自身**的缺陷并已修（`d138594`）：
+`TestACustomDestinationRestoreRejectsAReplacedDirectory` 原来用"删掉目录再建同名目录"造"被换掉的目录"，
+删目录会释放 inode，而 ext4/loop 会立刻把同一个号还给新目录，于是新旧身份相同、恢复被当成已完成；
+APFS 不会这么快复用，所以本机一直通过。现在改成把原目录改名挪开（inode 不释放）再建同名目录，
+并先断言新目录的身份确实不同。这不是产品缺陷，但"只在开发机上验证"正是它藏了两轮的原因。
 
 10 万文件扫描（`DUSTKEEPER_BENCH=1 DUSTKEEPER_BENCH_FILES=100000`，证据文件里记了 `commit`）：
 
@@ -92,7 +133,8 @@ go test -race ./... -count=1   exit 0，18 个包 ok
 原始 JSON 与生成命令在 [`docs/evidence/performance-100k.md`](evidence/performance-100k.md) 同目录的 `.json`。
 本轮 wall 比上一轮长（54.5 s vs 39.6 s）是同一台机器上并发跑其它构建的结果，没有为了数字好看调整资源预算。
 
-`linux-amd64` 发布路径（`./build/build-linux-release.sh`，固定 digest 镜像）本机结果：
+`linux-amd64` 发布路径（`./build/build-linux-release.sh`，固定 digest 镜像）**在 arm64 开发机上的**结果
+（这是 `1ffbc43` 那一轮的历史记录，保留下来解释为什么这个目标不在本机产出）：
 
 ```
 builder image: golang:1.26-bookworm@sha256:88750ccd…daf9d9
@@ -111,7 +153,8 @@ release is incomplete: linux-amd64 produced no acceptable artifact
 
 这是设计的结果，不是被吞掉的失败：构建、`version`、ELF 复核都通过，冒烟跑不动就整轮失败，
 `dist/` 里不留下这个目标任何产物（`fail_target` 会删掉半成品；`1ffbc43` 之后连本轮清单也会一起清掉）。
-这一轮的 libc 证据记在 `dist/build-facts.txt` 里，取自真实链接输入：
+当时那一轮的 libc 证据取自真实链接输入（`dist/` 是每次构建重写的，现在里面是本轮 darwin 的清单，
+所以这段话只是历史记录的转抄）：
 
 ```
 target=linux-amd64 format=elf arch=amd64 linkage=static toolchain=x86_64-linux-gnu compiler=musl-gcc
@@ -127,40 +170,79 @@ target=linux-amd64 format=elf arch=amd64 linkage=static toolchain=x86_64-linux-g
 同一镜像在原生 arm64 容器里 `openat2` 正常（`errno=18 EXDEV` 是路径跨挂载的预期返回），
 在 amd64 容器里是 `errno=38 ENOSYS`（arm64 宿主上的 Rosetta）。
 
-### 2.1 同一个脚本在原生 x86_64 上：CI（`gh run 40642359982`）
+### 2.1 同一个脚本在原生 x86_64 上：CI（`gh run 40740165469`，代码 `dd7c791`）
 
-`ubuntu-latest`（x86_64）跑 `./build/build-linux-release.sh` 的结果，两个 job 均 success
-（这是 `d823542` 时的门禁输出；`1ffbc43` 把证据换成链接输入之后没有新的 CI 运行，见 §1.1 的 D14.4/D14.5）：
+`ubuntu-latest`（x86_64）跑 `./build/build-linux-release.sh`、`macos-latest`（arm64）跑
+`./build/build.sh --release`，两个 job 均 success（`gh run view 40740165469`：
+`headSha=dd7c7912ec7039f8b19d1e7ebe00496e330d7722`，`conclusion=success`）。每步结果：
 
 ```
-digest: sha256:88750ccd…daf9d9   (固定 builder 镜像)
-go:   go version go1.26.10 linux/amd64
-musl: x86_64-linux-gnu-gcc (Debian 12.2.0-14+deb12u1) 12.2.0
-dustkeeper-1.0.0-phase1-linux-amd64: machine=Advanced Micro Devices X86-64 interp=0 needed=0
-linux_libc=musl-static
+job (ubuntu-latest, linux-amd64)   4 assert the runner is the target this job claims   success
+                                   5 build / 6 vet / 7 test / 8 race                   success
+                                   9 release (pinned container)                        success
+                                  11 assert this target's artifact exists, matches its
+                                     checksum, and runs                              success
+                                  12 archive this target's verified artifact           success
+job (macos-latest, darwin-arm64)   9 release (pinned container)                        skipped
+                                  10 release (native) / 11 assert / 12 archive         success
+```
+
+`linux-amd64`（该 job 的 `build-facts` 输出；`1ffbc43` 之后取自真实链接输入）：
+
+```
 target=linux-amd64 format=elf arch=amd64 linkage=static toolchain=x86_64-linux-gnu
-  compiler=musl-gcc musl_evidence=/usr/include/x86_64-linux-musl
+  compiler=musl-gcc compiler_version="x86_64-linux-gnu-gcc (Debian 12.2.0-14+deb12u1) 12.2.0"
+  sysroot=none startfile=/usr/lib/x86_64-linux-musl/Scrt1.o musl_libdir=-L/usr/lib/x86_64-linux-musl
+  libc_a=/usr/lib/gcc/x86_64-linux-gnu/12/../../../x86_64-linux-gnu/libc.a
+  musl_evidence=/usr/lib/x86_64-linux-musl/Scrt1.o
+  musl_pkgs=musl=1.2.3-1,musl-dev=1.2.3-1,musl-tools=1.2.3-1
+  build_env=docker:golang:1.26-bookworm@sha256:88750ccd…daf9d9 platform=linux/amd64
   artifact=[format=elf machine=amd64 linkage=static interp=none needed=0]
-target=linux-amd64 smoke=ok smoke_output="dustkeeper 1.0.0-phase1 (linux/amd64, SQLite 3.53.4, commit d823542)"
-target=linux-amd64 smoke_qr=ok flow="init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore"
-sha256=1fa83ce4e35553b07d37e273e501abf4515f27855fb1ac2448e4ae066633ffd6
-dustkeeper-1.0.0-phase1-linux-amd64 sha256=1fa83ce4…ffd6 (matches the manifest)
+target=linux-amd64 smoke=ok smoke_output="dustkeeper 1.0.0-phase1 (linux/amd64, SQLite 3.53.4, commit dd7c791)"
+target=linux-amd64 smoke_qr=ok flow="init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore,quarantine list" source_gone_after_apply=yes restored_bytes_match=yes
+sha256=96be59213afc0ca0316a3143130d944bf12c80c25596367e1e9ef3f879318c89
 ```
 
-这套门禁第一次跑就抓到两个真问题，两个都修了而不是绕开：容器内 `go build ./build/verify-artifact`
-因 VCS stamping 退出 128（挂载点属另一个 uid，git 拒绝该仓库）；以及制品 `version` 当时显示
-`commit unknown`（同一个 git 拒绝让 `git rev-parse` 落空）。前者补 `-buildvcs=false`，后者只把
-`/src` 加进容器内的 `safe.directory`——commit 仍由 git 给出，不由调用方注入。
+`darwin-arm64`（同一 run 的另一个 job）：`sha256=533e372ca59beb6d0e6cf584753905f7ff9e849bcab5a53f028e800bc504aea8`，
+`version=1.0.0-phase1 commit=dd7c791 target=darwin-arm64`。
+
+归档（D14.4）在同一 run 里实跑：两个 job 各"4 files uploaded"，
+artifact `12838673841`（`dustkeeper-darwin-arm64`，3 967 691 B）、
+`12838009604`（`dustkeeper-linux-amd64`，4 311 415 B），`gh api .../runs/40740165469/artifacts` 可查。
+
+三件需要说清楚的事：
+
+1. 这次 run 的代码是 `dd7c791`，**早于** C01–C08 的三个修复提交（`0ff6fa0`、`6f250cc`、`21af564`）
+   与随后的测试健壮性修复 `d138594`。这些提交之后还没有新的 CI 运行；它们的证据是上面 §2 的本机
+   命令与容器内 `test-linux.sh`，不是这份 CI 输出。不要把两者拼成"新代码的 CI 证据"。
+2. 这份输出才是 D14.2 的独立断言真正跑在 CI 里的第一次：`source_gone_after_apply=yes restored_bytes_match=yes`
+   与 flow 末尾多出来的第二次 `quarantine list`。§3 里 `linux-amd64` 那一行早先的"命令序列跑通"已经作废。
+3. 历史的第一次 CI 运行（`40642359982`，代码 `d823542`，`sha256=1fa83ce4…ffd6`）保留在 §3 的历史行里，
+   它跑的是没经过 D14.2/D14.4/D14.5 的门禁，不能和这次混为一谈。那次门禁第一次跑就抓到两个真问题且都修了：
+   容器内 `go build ./build/verify-artifact` 因 VCS stamping 退出 128（挂载点属另一个 uid，git 拒绝该仓库）；
+   制品 `version` 显示 `commit unknown`（同一个 git 拒绝让 `git rev-parse` 落空）。前者补 `-buildvcs=false`，
+   后者只把 `/src` 加进容器内的 `safe.directory`——commit 仍由 git 给出，不由调用方注入。
+
 
 ## 3. 制品执行过哪些动作（与源码测试分开记录）
 
+本轮的制品（当前代码）：
+
 | 制品 | checksum | 在哪里、真实执行过什么 | 源码测试能证明的 |
 |---|---|---|---|
-| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=16d0b8397e8c3b081420221325e65971c05e0f8df722c001d73db636d3950263`（`commit=1ffbc43`） | 本机（darwin/arm64）：`version`；临时目录内 `init → scope add → scan → rule import → rule preview → rule activate → plan create → plan apply → quarantine list → quarantine restore`，并**独立**核对原路径在 apply 后不存在、restore 后字节与原件逐字节相同、该对象不再出现在可恢复列表（本轮新增断言） | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、日志与盘点拒绝 |
-| `dustkeeper-1.0.0-phase1-linux-amd64` | `sha256=1fa83ce4e35553b07d37e273e501abf4515f27855fb1ac2448e4ae066633ffd6`（`commit=d823542`，**本轮未重跑**） | CI 的 `ubuntu-latest`（x86_64）容器内，同一串动作 + `readelf` 断言 X86-64 / `interp=0` / `needed=0`。这一行的冒烟早于 D14.2 的独立断言，只覆盖"命令序列跑通 + JSON 里 restorable"，不覆盖"apply 后源不存在 / restore 后字节一致" | 同上（同一套源码测试在 linux 容器 ext2/ext3 loop 上 18 包 ok，`1ffbc43` 实跑） |
+| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=d116069b0b5a13385eccb8e750ea6f8255de38eec1b209606f925db36137ccbd`（`commit=d138594`） | 本机（darwin/arm64）`./build/build.sh --release`：`version`；临时目录内 `init → scope add → scan → rule import → rule preview → rule activate → plan create → plan apply → quarantine list → quarantine restore → quarantine list`，并**独立**核对 apply 后原路径不存在、restore 后字节与原件逐字节相同、该对象不再出现在可恢复列表（`dist/build-facts.txt`：`smoke_qr=ok … source_gone_after_apply=yes restored_bytes_match=yes`） | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、日志与盘点拒绝 |
+| `dustkeeper-1.0.0-phase1-linux-amd64` | `sha256=96be59213afc0ca0316a3143130d944bf12c80c25596367e1e9ef3f879318c89`（`commit=dd7c791`，CI run `40740165469`，artifact `12838009604`） | CI 的 `ubuntu-latest`（x86_64）容器内，同一串动作 + `readelf` 断言 X86-64 / `interp=0` / `needed=0`，冒烟带 D14.2 的独立断言（`source_gone_after_apply=yes restored_bytes_match=yes`）。**这一行的制品早于 C01–C08 的修复** | 同上（同一套源码测试在 linux 容器 ext2/ext3 loop 上 18 包 ok，`d138594` 实跑） |
+
+历史行（保留原样，不与上面拼成同一份证据）：
+
+| 制品 | checksum | 当时执行过什么 |
+|---|---|---|
+| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=5f365a46…2cf0b`，后来是 `16d0b8397e8c3b081420221325e65971c05e0f8df722c001d73db636d3950263`（`commit=1ffbc43`） | 本机 Q/R 冒烟；后者已带独立断言 |
+| `dustkeeper-1.0.0-phase1-linux-amd64` | `sha256=1fa83ce4e35553b07d37e273e501abf4515f27855fb1ac2448e4ae066633ffd6`（`commit=d823542`） | CI `40642359982`，只覆盖"命令序列跑通 + JSON 里 restorable"，不含 apply 后源不存在 / restore 后字节一致 |
 
 这张表的作用是防止一种常见夸大：源码测试通过不等于"每个 checksum 都跑过 Q/R"。
-两个 checksum 各自在一个能执行它的环境里跑过完整 Q/R，本机不能执行的那个不在本机宣称。
+每个 checksum 都只在一个能执行它的环境里被宣称执行过，本机不能执行的那个不在本机宣称。
+两个当前制品的代码不同（`d138594` / `dd7c791`），所以它们也不是同一次代码的产物。
 
 ## 4. 历史记录：第三轮核对（2026-10-26）
 

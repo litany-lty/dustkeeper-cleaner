@@ -157,10 +157,13 @@ envelope `code=OK`）；中断续跑 10 批、累计只扫 1.00× 树大小。�
 
 两个发布目标，别的都不叫支持：
 
-| 目标 | 构建入口 | 本机验证到哪一步 |
+| 目标 | 构建入口 | 验证到哪一步 |
 |---|---|---|
-| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | 产物 `sha256=5f365a46…2cf0b`；`version` 与临时目录内 Q/R 冒烟在本机真实执行通过 |
-| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | 由 CI 的 `ubuntu-latest`（x86_64）产出：`readelf` 复核 X86-64 / `interp=0` / `needed=0`，`version` 与临时目录内 Q/R 冒烟通过，`sha256=1fa83ce4…ffd6` |
+| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | 产物 `sha256=d116069b…ccbd`（`commit=d138594`）；`version` 与临时目录内 Q/R 冒烟在本机真实执行通过，并核对 apply 后原路径不存在、restore 后字节逐字节相同 |
+| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | 由 CI 的 `ubuntu-latest`（x86_64）产出（run `40740165469`，代码 `dd7c791`）：`readelf` 复核 X86-64 / `interp=0` / `needed=0`，`version` 与临时目录内 Q/R 冒烟通过，`sha256=96be5921…8c89`；该 run 早于 C01–C08 的修复提交 |
+
+更早的制品 checksum（`5f365a46…`、`16d0b839…`、`1fa83ce4…`）保留在
+[`docs/compliance.md`](docs/compliance.md) §3 的历史行里，不与上面这两行拼成同一份证据。
 
 `build.sh` 是单目标构建：它在**它所在的那台机器上**编译，产物架构从产物本身读回来，不接受 GOOS/GOARCH 覆盖。
 一台不是发布目标的机器仍然能做开发构建，但产物不会被叫作受支持，也不会写发布清单。
