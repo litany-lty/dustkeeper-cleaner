@@ -109,6 +109,38 @@ func (s *Store) ListScopesByKind(ctx context.Context, kind string) ([]Scope, err
 	return out, nil
 }
 
+// releaseScopeHoldTx takes a scope out of "held" because the item that was just
+// settled in the same transaction was the reason for that hold.
+//
+// It is deliberately three conditions, not one unconditional write:
+//
+//   - only a scope that is actually held is touched. A restore in an active scope
+//     changes nothing about the scope;
+//   - only when no other item in the scope is unresolved. Repairing one object
+//     must not hand the scope back while another is still broken;
+//   - and it lands on needs_reapproval, never on active. The hold was a verdict
+//     about this scope; clearing it needs a human, and `scope resume` is that
+//     human. Jumping straight to active would make a repair look like an approval.
+func releaseScopeHoldTx(ctx context.Context, tx *sql.Tx, scope domain.ScopeID) error {
+	var unresolved int64
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM items
+WHERE scope_id=? AND (pending_op_id IS NOT NULL
+  OR state IN ('held','unknown','q_intent','r_intent','p_intent'))`,
+		string(scope)).Scan(&unresolved); err != nil {
+		return errs.Wrap(errs.CodeDBError, err)
+	}
+	if unresolved > 0 {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE scopes SET status=? WHERE scope_id=? AND status=?",
+		domain.ScopeNeedsReapproval, string(scope), domain.ScopeHeld); err != nil {
+		return errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	return nil
+}
+
 // SetScopeStatus changes the run state of a scope.
 func (s *Store) SetScopeStatus(ctx context.Context, id domain.ScopeID, status string) error {
 	return s.write(ctx, func(tx *sql.Tx) error {

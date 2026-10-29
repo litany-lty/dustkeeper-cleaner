@@ -668,20 +668,22 @@ func (e *Executor) tryCompensate(ctx context.Context, sc *ScopeCtx, it store.Ite
 	// destination carries a protection record - and it is what lets the scope
 	// work again once its status has been re-approved. It still never regains
 	// purge eligibility on its own: a restored item is not purge-eligible.
-	if err := e.Store.AbortIntent(ctx, comp, domain.StateRestored,
-		`{"source":"compensated","result":"original slot restored; item settled as restored"}`); err != nil {
-		return false, "the object was put back but the record could not be closed; reconcile will finish it"
-	}
-	if err := e.Store.ReleaseItemKeeperPin(ctx, it.ID); err != nil {
-		return true, "put back, but the keeper pin could not be released: " + err.Error()
-	}
+	//
 	// The scope was marked held when the miscapture was detected. The reason for
 	// that hold is gone - the wrong object is back, its slot is protected, and
 	// nothing is pending - so it becomes "needs re-approval" rather than staying
-	// held, which `scope resume` refuses to clear.
-	if err := e.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeNeedsReapproval); err != nil {
-		return true, "put back, but the scope status could not be updated (" + err.Error() +
-			"); it stays held until the status write succeeds"
+	// held, which `scope resume` refuses to clear. Both writes are one commit on
+	// purpose: a separate scope write used to be able to fail after the item had
+	// already been settled and its pending marker cleared, which left nothing for
+	// a later pass to retry.
+	if err := e.Store.AbortIntentReleasingHold(ctx, comp, domain.StateRestored,
+		`{"source":"compensated","result":"original slot restored; item settled as restored"}`,
+		sc.Scope.ID); err != nil {
+		return false, "the object was put back but the record could not be closed (" + err.Error() +
+			"); the pending marker is still there, so reconcile will finish it"
+	}
+	if err := e.Store.ReleaseItemKeeperPin(ctx, it.ID); err != nil {
+		return true, "put back, but the keeper pin could not be released: " + err.Error()
 	}
 	return true, "put back"
 }

@@ -358,11 +358,17 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 	it := po.Item
 	out := Result{Item: it.ID, OpID: po.OpID, Action: "quarantine"}
 
-	contract, err := plan.ParseContractFor(po.ContractJSON, "quarantine")
-	if err != nil {
+	// The contract is read through the same binder as every other action. Parsing
+	// it as "a quarantine contract" only proves the fields exist; it does not
+	// prove they describe *this* pending operation. A well-formed contract bound
+	// to another item, scope or path used to be consumed here - the source is
+	// still present, the vault is empty, and the branch below writes "aborted"
+	// without noticing.
+	contract, cerr := r.operationContract(po)
+	if cerr != nil {
 		// The contract is the record of what was meant to move. Without it there
 		// is nothing to compare against, so this is a verdict, not a retry.
-		return r.recordFailure(ctx, po, out, "INTENT_CONTRACT_UNREADABLE", err)
+		return r.recordFailure(ctx, po, out, "INTENT_CONTRACT_UNREADABLE", cerr)
 	}
 	expected := contract.ExpectedIdent
 
@@ -668,7 +674,7 @@ func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx,
 			sc.AnchorFD(), "reconcile-restore"); serr != nil {
 			return r.recordFailure(ctx, po, out, "SYNC_FAILED", serr)
 		}
-		if err := r.Store.CompleteRestore(ctx, intentOf(po), `{"source":"reconciled"}`); err != nil {
+		if err := r.Store.CompleteRestoreReleasingHold(ctx, intentOf(po), `{"source":"reconciled"}`, it.ScopeID); err != nil {
 			return r.recordFailure(ctx, po, out, "COMPLETE_FAILED", err)
 		}
 		r.releasePin(ctx, it, &out)
@@ -777,8 +783,23 @@ func (r *Reconciler) restoreContract(po store.PendingOp) (*plan.OperationContrac
 //
 // A contract is the only record of what was meant to happen, and reconciliation
 // compares it with the filesystem. A contract for another item, another scope or
-// another path would compare the wrong two things and still "succeed"; the review
-// asks for the binding to be checked before either branch consumes it.
+// another object would compare the wrong two things and still "succeed"; the
+// review asks for the binding to be checked before either branch consumes it.
+//
+// The path field is read according to the action that wrote it, because the same
+// field means two different things:
+//
+//   - a quarantine, a purge and a compensation name the path they act on, which is
+//     the item's own path, and equality is the binding;
+//   - a restore names where the object was sent, and `quarantine restore
+//     --destination-relative` is an existing feature: the destination is allowed
+//     to differ from the item's path, and it is checked for being a usable path
+//     plus, at completion, against the destination directory recorded next to it.
+//
+// Requiring equality for every action was a regression: it judged the restore
+// contracts this build writes itself to be mismatches, and a restore to another
+// path that was interrupted then entered a terminal hold with the file sitting
+// where the operator asked for it.
 func checkContractBinding(po store.PendingOp, c plan.OperationContractV1) error {
 	if c.ItemID != string(po.Item.ID) {
 		return errs.Newf(errs.CodeRecoveryRequired,
@@ -795,7 +816,19 @@ func checkContractBinding(po store.PendingOp, c plan.OperationContractV1) error 
 	raw, err := decodeB64(c.RawRelativeB64)
 	if err != nil || len(raw) == 0 {
 		return errs.Newf(errs.CodeRecoveryRequired,
-			"the contract records a source path that is not valid base64: %v", err)
+			"the contract records a path that is not valid base64: %v", err)
+	}
+	if po.Action == "restore" {
+		// A restore records its destination. It still has to be a path this build
+		// would accept, so a corrupted or hostile record cannot point the
+		// completion at "/etc" or at "../.."; the directory it was approved for is
+		// checked separately, in reconcileRestore.
+		if _, perr := fsops.SplitRelative(raw); perr != nil {
+			return errs.Newf(errs.CodeRecoveryRequired,
+				"the restore contract records destination %q, which is not a usable relative path: %v",
+				string(raw), perr)
+		}
+		return nil
 	}
 	if string(raw) != string(po.Item.RawRelative) {
 		return errs.Newf(errs.CodeRecoveryRequired,
@@ -838,6 +871,18 @@ func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, p
 		return r.recordFailure(ctx, po, out, "PURGE_CONTRACT_UNREADABLE", cerr)
 	}
 	backState, priorKnown := priorStateOf(&contract)
+	// The prior state is required by both branches, so it is checked before the
+	// split rather than inside one of them. When it was only checked on the
+	// "object still there" branch, a contract that never recorded where the
+	// object came from could still finish as RECONCILED_ABSENT: a terminal record
+	// about a deletion, written from evidence that does not say which state the
+	// deletion started in. "The object is gone" is not the same as "this purge
+	// removed it".
+	if !priorKnown {
+		return r.recordFailure(ctx, po, out, "PRIOR_STATE_UNKNOWN",
+			errs.New(errs.CodeRecoveryRequired,
+				"the purge contract records no state to return to, so neither outcome can be recorded as a verdict; the item is held and the vault is left as it is. A contract is never rewritten by a later pass, so this needs a decision rather than a retry"))
+	}
 
 	captured, err := identityOf(ptrString(it.CapturedIdentityJSON))
 	if err != nil {
@@ -855,10 +900,6 @@ func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, p
 		if !vaultID.Equal(captured) {
 			return r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
 				"the vault object is not the recorded object")
-		}
-		if !priorKnown {
-			return r.holdUnfixable(ctx, po, out, "PRIOR_STATE_UNKNOWN",
-				"the purge did not happen and its contract records no state to return to; the object stays in the vault and the item keeps its pending marker")
 		}
 		if err := r.Store.AbortIntent(ctx, intentOf(po), backState,
 			`{"source":"reconciled","result":"object still present, purge not confirmed","back_state":`+

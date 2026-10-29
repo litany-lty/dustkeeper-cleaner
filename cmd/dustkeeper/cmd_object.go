@@ -201,9 +201,18 @@ func quarantineRestore(ctx context.Context, a *app, args []string) (output, erro
 		if err != nil {
 			return output{}, err
 		}
-		if it.State != domain.StateQuarantined {
+		// The states the executor accepts, not a narrower set of its own.
+		//
+		// A held object with complete captured evidence is exactly the object the
+		// product promises to give back: the vault keeps it, the list calls it
+		// restorable, and the executor restores it after checking identity,
+		// destination and pending markers. This entry point used to allow only
+		// "quarantined", so the one formal way to get a held file back was closed
+		// - and the tests that covered held restores called the executor directly,
+		// which is why the gap survived them.
+		if it.State != domain.StateQuarantined && it.State != domain.StateHeld {
 			return output{}, errs.Newf(errs.CodeItemNotFound,
-				"object %s is %s, not quarantined", it.ID, it.State)
+				"object %s is %s, not quarantined or held", it.ID, it.State)
 		}
 		sctx, err := execute.OpenScopeCtx(ctx, a.registrar(), it.ScopeID)
 		if err != nil {

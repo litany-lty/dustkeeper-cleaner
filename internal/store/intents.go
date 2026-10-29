@@ -400,15 +400,32 @@ WHERE item_id=? AND pending_op_id=? AND state IN ('q_intent','unknown')`,
 
 // CompleteRestore records a completed restore.
 func (s *Store) CompleteRestore(ctx context.Context, in Intent, resultJSON string) error {
-	return s.finishSimple(ctx, in, domain.StateRIntent, domain.StateRestored, resultJSON)
+	return s.finishSimple(ctx, in, domain.StateRIntent, domain.StateRestored, resultJSON, "")
+}
+
+// CompleteRestoreReleasingHold records a completed restore and, in the same
+// transaction, takes the scope out of the hold that this object was the reason
+// for.
+//
+// Two writes that must agree cannot be two commits. The old order finished the
+// item, cleared its pending marker, and then set the scope status separately: a
+// failure between them left a file that was back in place, an item that said so,
+// and a scope that still refused `scope resume` - with no pending operation left
+// for the next pass to pick up. Doing both here means the state is either "the
+// object is restored and the scope needs re-approval" or neither.
+func (s *Store) CompleteRestoreReleasingHold(ctx context.Context, in Intent, resultJSON string, scope domain.ScopeID) error {
+	return s.finishSimple(ctx, in, domain.StateRIntent, domain.StateRestored, resultJSON, scope)
 }
 
 // CompletePurge records a completed purge.
 func (s *Store) CompletePurge(ctx context.Context, in Intent, resultJSON string) error {
-	return s.finishSimple(ctx, in, domain.StatePIntent, domain.StatePurged, resultJSON)
+	return s.finishSimple(ctx, in, domain.StatePIntent, domain.StatePurged, resultJSON, "")
 }
 
-func (s *Store) finishSimple(ctx context.Context, in Intent, fromState, toState, resultJSON string) error {
+// finishSimple ends an operation whose outcome needs no extra record. scope is
+// optional: when it is set, the scope-wide hold this item caused is released in
+// the same transaction. See releaseScopeHoldTx.
+func (s *Store) finishSimple(ctx context.Context, in Intent, fromState, toState, resultJSON string, scope domain.ScopeID) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		// "unknown" is accepted for the same reason as in CompleteQuarantine: a
 		// parked operation is unfinished, not held.
@@ -430,6 +447,11 @@ WHERE item_id=? AND pending_op_id=? AND state IN (?, 'unknown')`,
 				return nil
 			}
 			return errs.Newf(errs.CodePlanStale, "item %s is not awaiting %s", in.ItemID, toState)
+		}
+		if scope != "" {
+			if err := releaseScopeHoldTx(ctx, tx, scope); err != nil {
+				return err
+			}
 		}
 		return completeTx(ctx, tx, in, resultJSON)
 	})
@@ -584,6 +606,23 @@ func quoteJSONString(s string) string {
 // is where the item returns to: "aborted" after a quarantine that never moved
 // anything, or the prior quarantine state after a failed restore/purge.
 func (s *Store) AbortIntent(ctx context.Context, in Intent, backState, resultJSON string) error {
+	return s.abortIntent(ctx, in, backState, resultJSON, "")
+}
+
+// AbortIntentReleasingHold is AbortIntent plus the scope transition that belongs
+// to the same commit.
+//
+// A compensation puts the object back in the slot it was taken from and settles
+// the item as restored; the scope was held because of that object, so the hold
+// has to go with it. Written as two commits, the second one could fail after the
+// first had already cleared the pending marker - leaving the file restored, the
+// item settled, and the scope held with nothing left to retry. See
+// releaseScopeHoldTx for what "release" is allowed to mean.
+func (s *Store) AbortIntentReleasingHold(ctx context.Context, in Intent, backState, resultJSON string, scope domain.ScopeID) error {
+	return s.abortIntent(ctx, in, backState, resultJSON, scope)
+}
+
+func (s *Store) abortIntent(ctx context.Context, in Intent, backState, resultJSON string, scope domain.ScopeID) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		r, err := tx.ExecContext(ctx, `
 UPDATE items SET state=?, pending_op_id=NULL
@@ -593,6 +632,11 @@ WHERE item_id=? AND pending_op_id=?`, backState, string(in.ItemID), string(in.Op
 		}
 		if n, _ := r.RowsAffected(); n == 0 {
 			return errs.Newf(errs.CodePlanStale, "item %s is not awaiting an abort", in.ItemID)
+		}
+		if scope != "" {
+			if err := releaseScopeHoldTx(ctx, tx, scope); err != nil {
+				return err
+			}
 		}
 		itemID := in.ItemID
 		opID := in.OpID

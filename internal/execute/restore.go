@@ -223,7 +223,11 @@ func (e *Executor) Restore(ctx context.Context, sc *ScopeCtx, itemID domain.Item
 		}
 	}
 
-	if err := e.Store.CompleteRestore(ctx, intent, `{"source":"observed"}`); err != nil {
+	// The scope was held when this object's outcome could not be proven; that
+	// reason is gone now that the object is back and its record says so. The
+	// item's terminal record and the scope's transition commit together, so a
+	// failure cannot leave a restored file behind a scope nobody can resume.
+	if err := e.Store.CompleteRestoreReleasingHold(ctx, intent, `{"source":"observed"}`, it.ScopeID); err != nil {
 		return res, err
 	}
 	if err := e.Store.ReleaseItemKeeperPin(ctx, it.ID); err != nil {
