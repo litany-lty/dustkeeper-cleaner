@@ -30,7 +30,7 @@ FINAL-1.0 之后按两份独立复核报告修补：D01–D14（基于 `9d9af21`
 | A09 | 故障可收敛 | 通过 | 已有：`TestReconcileRetriesEveryActionUntilTheScopeIsFree`（临时故障连续两轮不终结，解除后完成）、`TestReconcileCompletesACrashedQuarantine`（中断恢复）、`TestCrashDiscoveredMiscaptureRecordsTheActualObject`、`TestWrongCaptureIsPutBackWithProtections`、`TestCompensationCrashReturnsToTheHold`、`TestSlimTwoPurgeRoutesAgree`（同一初始状态下 `purge apply` 与 `plan apply` 逐字段相同）。D02/D03/D06/D07/D08 `27c65e4` 补了"证据成立才收敛"的一半：验证窗口内被改动的源被拒（`CodePlanStale`，不写成 Held）、不可读的 manifest/vault 对象 park 而不是当结论、stat 失败的源不算证据、合同坏/绑错/无 prior 状态一律不猜、补偿成功收敛为 `StateRestored` + scope 需重新确认、目录同步失败的 manifest 被撤回。C01/C05/C06 `0ff6fa0` 继续同一方向：restore 合同里的路径按"批准的目的地"解释（自定义目的地不再被误拒、目的地身份照旧比对）、补偿收尾与 scope 放行同一事务（中断不会留下"对象回来了但 scope 仍拒绝 resume"）、Q 对账也走同一条合同绑定检查且 P 缺 prior 时两种结果都不产出结论。**2026-10-29 补齐**：Q/R/P 各自"系统调用已经成功、终态记录没写成"的矩阵已建。故障点是一个具名钩子 （`internal/execute/hooks.go` 的 `TestHookBeforeComplete`，按动作名决定是否失败，生产路径为 nil），不是通用注入框架；三条用例都从真实执行路径进入——`TestAQuarantineWhoseRecordFailedIsFinishedByReconcile`、`TestARestoreWhoseRecordFailedIsFinishedByReconcile`、`TestAPurgeWhoseRecordFailedIsFinishedByReconcile`——先断言失败后的样子（对象已经在目标位置、item 停在 `q_intent`/`r_intent`/`p_intent`、`pending_op_id` 仍在、结果里是 `STATE_WRITE_FAILED` 而不是成功），再跑两轮对账：第一轮 `Completed=1` 且 `RecordFailures=0`，第二轮 `Examined=0`（重复"完成"同一操作说明第一轮写的结论记录看不见）。恢复成功的 Q 还额外核对它仍进得了清空队列，恢复成功的 R 不再出现在隔离队列里。**这三条在 `dd7c791` 的 `reconcile.go` 上也通过**，所以它们证明的是"现在这种状态可收敛"，不宣称在旧版上复现过错误行为——A09 缺的是证据，不是缺陷。**口径要说准**：钩子位于文件系统动作与其同步**之后**、终态事务**之前**，所以补的是"complete 前窗口"，不是完整的"同步/complete 矩阵"。没有注入过 Q/R/P 的数据 fsync、目录 flush 或 durability barrier 失败（那一路的证据只有 manifest 目录 flush 的 `TestAManifestThatCannotBeFlushedIsWithdrawn`，是协议里的另一个点），Q/R/P 终态事务**内部**的 UPDATE/COMMIT 失败也没有注入——唯一在事务内部注入过失败的是补偿收尾那条 `TestACompensationWhoseRecordCannotBeClosedStopsTheRun`（trigger 让 scope 更新失败，整个事务回滚）。未实测的分支在这里单列，不用这三条测试替它们记账。 |
 | A10 | 扫描完整性诚实 | 通过 | F4 `0f9a371`：`TestSlimIncompleteScanKeepsTheEpochOpen`（去掉 `unverifiedCount > 0` 分支后报 "an entry that could not be inspected completed the epoch"）、`TestSlimVanishedEntryIsNotAFailure`（ENOENT 只记 vanished，目录照常完成）、`TestSlimIncompleteScopeStartsNoAutomaticQuarantine`（去掉 `!scanState.Complete` 分支后报 "collected 2 objects"）、`TestAFailedDirectoryCannotCompleteTheEpochOrRetireItsOwnObservations`。 |
 | A11 | 诊断不修改他人文件、不虚报缺失 | 通过 | F4 `0f9a371`：`internal/diag` 六个拒绝用例（symlink / FIFO / 宽权限 / 硬链 / 目录 / 设备，全部 `ErrNotPrivate` 且原对象字节与 mode 不变）+ `TestAPrivateLogIsCreatedAndStillRotates`；`internal/rescue`：`TestSlimRescueEntryLevelUnverified`、`TestSlimRescueDirectoryLevelUnverified`（回退成 `read` 即报 `object_state="read", want "partial"`）、`TestSlimRescuePartialManifestsDoNotBecomeOrphans`、`TestAnUnreadableObjectsDirectoryDoesNotClaimTheObjectsAreGone`。D12 `e14855c`：日志目录持 FD 并校验（拒 symlink/非目录/group-other 可写/非本人），创建与轮转都相对该 FD（`TestASymlinkedLogDirectoryIsRefusedAndItsTargetUnchanged`、`TestARotatedNameStaysInsideTheVerifiedDirectory`）。D13 `e14855c`：`readManifests` 只有 ENOENT 才算 missing，orphan 判定排除 partial 与 unreadable；零计数 + 目录不可读也 `RECOVERY_REQUIRED`（`TestRecoverInspectDoesNotCallObjectsOrphansWhenManifestsAreUnreadable`、`TestRecoverInspectWithNoEntriesAndAnUnreadableDirectoryStillFails`）。 |
-| A12 | 有限发布证据 | 部分 | 两个目标都有 checksum 与真实执行记录（§3）：都由 CI 的原生 runner 产出并冒烟（`gh run 40880714185`，代码 `7b9c2a1`——第三轮复核两处余量 `805cdb3`/`7b951be` 与随后文档的 HEAD——两 job 均 success），`darwin-arm64` `sha256=e9f59992…76d9`、`linux-amd64` `sha256=f8afc0d9…efba`；更早的 `40848835280`（`2924938`）、`40845574824`（`3a7da29`）与 `40740165469`（`dd7c791`）同样两 job success，四份输出各自对应各自的 commit。两个平台的 `build`/`vet`/`test`/`race` 分别在本机与 CI 跑过，CI 每个 job 构建前先断言 runner 实际架构等于声明目标。10 万文件扫描完成性成立：wall 54.5 s、峰值 RSS 29.5 MiB ≤ 256 MiB（§2）。D14 `1ffbc43` 把发布门禁收紧到"证据与产物必须对得上"：libc 判定改读真实链接输入、Q/R 冒烟独立断言移动与内容、后段失败清理本轮产物、CI 归档本目标四个文件、宿主断言改用 `GOHOSTOS/GOHOSTARCH`。D14.4 的归档步骤四次 run 都实跑成功：`40880714185` 的 artifact `12900272002`（darwin-arm64）/ `12900880692`（linux-amd64），`40848835280` 的 `12886825025`/`12886401575`，`40845574824` 的 `12885305469`/`12884847000`，`40740165469` 的 `12838673841`/`12838009604`。**仍差一项**：真实模型的固定语料报告——本机没有获准端点，`test/eval` 保持 skip，不以 skip 当通过。因此这一组记部分。 |
+| A12 | 有限发布证据 | 部分 | 两个目标都有 checksum 与真实执行记录（§3）：都由 CI 的原生 runner 产出并冒烟（`gh run 41003990196`，代码 `d4dc8dc`——C03 定义比较 `e7e779f` 与随后文档的 HEAD——两 job 均 success），`darwin-arm64` `sha256=4c3c6854…479e`、`linux-amd64` `sha256=aecf8496…3df4`；更早的 `40880714185`（`7b9c2a1`）、`40848835280`（`2924938`）、`40845574824`（`3a7da29`）与 `40740165469`（`dd7c791`）同样两 job success，四份输出各自对应各自的 commit。两个平台的 `build`/`vet`/`test`/`race` 分别在本机与 CI 跑过，CI 每个 job 构建前先断言 runner 实际架构等于声明目标。10 万文件扫描完成性成立：wall 54.5 s、峰值 RSS 29.5 MiB ≤ 256 MiB（§2）。D14 `1ffbc43` 把发布门禁收紧到"证据与产物必须对得上"：libc 判定改读真实链接输入、Q/R 冒烟独立断言移动与内容、后段失败清理本轮产物、CI 归档本目标四个文件、宿主断言改用 `GOHOSTOS/GOHOSTARCH`。D14.4 的归档步骤五次 run 都实跑成功：`41003990196` 的 artifact `12954672344`（darwin-arm64）/ `12954219401`（linux-amd64），`40880714185` 的 `12900272002`/`12900880692`，`40848835280` 的 `12886825025`/`12886401575`，`40845574824` 的 `12885305469`/`12884847000`，`40740165469` 的 `12838673841`/`12838009604`。**仍差一项**：真实模型的固定语料报告——本机没有获准端点，`test/eval` 保持 skip，不以 skip 当通过。因此这一组记部分。 |
 
 结论：12 组里 **11 组通过、1 组部分（A12）、0 组未验收**；A12 的部分是真实模型语料报告缺失——
 本机没有获准端点，`test/eval` 保持 skip，不用回放或手写报告冒充。A09 记的是通过，但通过的范围
@@ -272,12 +272,12 @@ target=linux-amd64 format=elf arch=amd64 linkage=static toolchain=x86_64-linux-g
 同一镜像在原生 arm64 容器里 `openat2` 正常（`errno=18 EXDEV` 是路径跨挂载的预期返回），
 在 amd64 容器里是 `errno=38 ENOSYS`（arm64 宿主上的 Rosetta）。
 
-### 2.1 同一个脚本在原生 x86_64 上：CI（`gh run 40880714185`，代码 `7b9c2a1`）
+### 2.1 同一个脚本在原生 x86_64 上：CI（`gh run 41003990196`，代码 `d4dc8dc`）
 
 `ubuntu-latest`（x86_64）跑 `./build/build-linux-release.sh`、`macos-latest`（arm64）跑
-`./build/build.sh --release`，两个 job 均 success（`gh run view 40880714185`：
-`headSha` 以 `7b9c2a1` 开头，`conclusion=success`）。这个提交包含第三轮复核的两处余量
-（`805cdb3` 的 C03、`7b951be` 的 C05）和随后那份文档，所以这一份输出覆盖了全部代码改动。每步结果：
+`./build/build.sh --release`，两个 job 均 success（`gh run view 41003990196`：
+`headSha` 以 `d4dc8dc` 开头，`conclusion=success`）。这个提交包含 C03 定义比较（`e7e779f`）
+与随后的文档（含 `docs/phase2-design.md`），所以这一份输出覆盖了本轮全部代码改动。每步结果：
 
 ```
 job (ubuntu-latest, linux-amd64)   4 assert the runner is the target this job claims   success
@@ -301,21 +301,24 @@ target=linux-amd64 format=elf arch=amd64 linkage=static toolchain=x86_64-linux-g
   musl_pkgs=musl=1.2.3-1,musl-dev=1.2.3-1,musl-tools=1.2.3-1
   build_env=docker:golang:1.26-bookworm@sha256:88750ccd…daf9d9 platform=linux/amd64
   artifact=[format=elf machine=amd64 linkage=static interp=none needed=0]
-target=linux-amd64 smoke=ok smoke_output="dustkeeper 1.0.0-phase1 (linux/amd64, SQLite 3.53.4, commit 7b9c2a1)"
+target=linux-amd64 smoke=ok smoke_output="dustkeeper 1.0.0-phase1 (linux/amd64, SQLite 3.53.4, commit d4dc8dc)"
 target=linux-amd64 smoke_qr=ok flow="init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore,quarantine list" source_gone_after_apply=yes restored_bytes_match=yes
-sha256=f8afc0d939601aa658e3ef775ee5218b6eb25547ad95ecb144678cf6e2abefba
+sha256=aecf849692cf204b10d7851b5e5937c16698b0d05dfcef987caaee9dbdc73df4
 ```
 
-`darwin-arm64`（同一 run 的另一个 job）：`sha256=e9f59992545c33d69250da9898bf651f159f171b36e5036bf72eea76dd4276d9`，
-`version=1.0.0-phase1 commit=7b9c2a1 target=darwin-arm64`。
+`darwin-arm64`（同一 run 的另一个 job）：`sha256=4c3c6854b1f1c5b8b540a1048faff9586ce85a309b21365e831035c9fc27479e`，
+`version=1.0.0-phase1 commit=d4dc8dc target=darwin-arm64`。
 
 归档（D14.4）在同一 run 里实跑：两个 job 各"4 files uploaded"，
-artifact `12900272002`（`dustkeeper-darwin-arm64`，3 978 903 B）、
-`12900880692`（`dustkeeper-linux-amd64`，4 326 772 B），`gh api .../runs/40880714185/artifacts` 可查。
+artifact `12954672344`（`dustkeeper-darwin-arm64`，3 981 441 B）、
+`12954219401`（`dustkeeper-linux-amd64`，4 329 284 B），`gh api .../runs/41003990196/artifacts` 可查。
 
 三件需要说清楚的事：
 
-1. 更早的三次 run 也两 job 均 success，各自对应各自的 commit，不互相顶替：
+1. 更早的 run 也两 job 均 success，各自对应各自的 commit，不互相顶替：
+   `40881337190` / `40880714185`（代码 `4e35267` / `7b9c2a1`，`sha256=e9f59992…76d9` /
+   `f8afc0d9…efba`，artifact `12900880692` / `12900272002`）覆盖第三轮复核的 C03/C05 两处余量
+   与随后的文档；
    `40848835280`（代码 `2924938`，`dc0b9c26…7868` / `8b77dd93…2115`，artifact
    `12886825025` / `12886401575`）覆盖 C01–C08 与 A09/C05 两个收尾提交；
    `40845574824`（代码 `3a7da29`，`90445bbf…093e` / `e3a7f083…d1da`，artifact
@@ -340,17 +343,18 @@ artifact `12900272002`（`dustkeeper-darwin-arm64`，3 978 903 B）、
 
 ## 3. 制品执行过哪些动作（与源码测试分开记录）
 
-本轮的制品（CI run `40880714185`，代码 `7b9c2a1`，两个目标同一份代码、同一套门禁）：
+本轮的制品（CI run `41003990196`，代码 `d4dc8dc`，两个目标同一份代码、同一套门禁）：
 
 | 制品 | checksum | 在哪里、真实执行过什么 | 源码测试能证明的 |
 |---|---|---|---|
-| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=e9f59992545c33d69250da9898bf651f159f171b36e5036bf72eea76dd4276d9`（artifact `12900272002`） | `macos-latest`（arm64）`./build/build.sh --release`：`version`；临时目录内 `init → scope add → scan → rule import → rule preview → rule activate → plan create → plan apply → quarantine list → quarantine restore → quarantine list`，并**独立**核对 apply 后原路径不存在、restore 后字节与原件逐字节相同、该对象不再出现在可恢复列表（`smoke_qr=ok … source_gone_after_apply=yes restored_bytes_match=yes`） | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、日志与盘点拒绝 |
-| `dustkeeper-1.0.0-phase1-linux-amd64` | `sha256=f8afc0d939601aa658e3ef775ee5218b6eb25547ad95ecb144678cf6e2abefba`（artifact `12900880692`） | `ubuntu-latest`（x86_64）容器内，同一串动作 + `readelf` 断言 X86-64 / `interp=0` / `needed=0`，冒烟带 D14.2 的独立断言（同上两项） | 同上（同一套源码测试在 linux 容器 ext2/ext3 loop 上 18 包 ok，`d138594` 实跑） |
+| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=4c3c6854b1f1c5b8b540a1048faff9586ce85a309b21365e831035c9fc27479e`（artifact `12954672344`） | `macos-latest`（arm64）`./build/build.sh --release`：`version`；临时目录内 `init → scope add → scan → rule import → rule preview → rule activate → plan create → plan apply → quarantine list → quarantine restore → quarantine list`，并**独立**核对 apply 后原路径不存在、restore 后字节与原件逐字节相同、该对象不再出现在可恢复列表（`smoke_qr=ok … source_gone_after_apply=yes restored_bytes_match=yes`） | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、日志与盘点拒绝 |
+| `dustkeeper-1.0.0-phase1-linux-amd64` | `sha256=aecf849692cf204b10d7851b5e5937c16698b0d05dfcef987caaee9dbdc73df4`（artifact `12954219401`） | `ubuntu-latest`（x86_64）容器内，同一串动作 + `readelf` 断言 X86-64 / `interp=0` / `needed=0`，冒烟带 D14.2 的独立断言（同上两项） | 同上（同一套源码测试在 linux 容器 ext2/ext3 loop 上 18 包 ok，`d138594` 实跑） |
 
 本机另有一份同源构建（`d138594`，`sha256=d116069b…ccbd`），`build.sh --release` 的
 `smoke_qr` 同样带独立断言；它与 CI 制品的 checksum 不同是因为嵌了构建时间与 commit，
-不是两份不同的代码。A09/C05 与第三轮 C03/C05 的提交只动了 `internal/store`、`internal/execute`、
-`cmd/dustkeeper` 与测试文档，没有重新构建本机制品，所以这里不写一个本机没有量过的 checksum。
+不是两份不同的代码。A09/C05、第三轮 C03/C05 与 C03 定义比较（`e7e779f`）的提交只动了
+`internal/store`、`internal/execute`、`cmd/dustkeeper` 与测试文档，没有重新构建本机制品，
+所以这里不写一个本机没有量过的 checksum。
 
 历史行（保留原样，不与上面拼成同一份证据）：
 
