@@ -540,6 +540,141 @@ VALUES('ev_somebody_elses', 'quarantine', 'info', 1, '{}')`); err != nil {
 	}
 }
 
+// C03, the half that names alone could not see: the same objects, defined
+// differently.
+//
+// A staging file can carry this build's version, this build's object names, this
+// build's meta rows and no data at all, and still not be this build's state
+// database. ALTER TABLE ... RENAME COLUMN is the narrowest way to get there: the
+// set of objects is unchanged, so the earlier check matched on everything it
+// looked at; migrate() sees the version it expects and returns without restoring
+// the column; and the first grant query fails with "no such column:
+// approved_at_ns". The definition is the only part that carries the difference.
+func TestAStagingDatabaseWithADifferentDefinitionIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	staging := path + stagingSuffix
+	buildStaging(t, staging, migrations.CurrentVersion)
+
+	db, err := sql.Open("sqlite3", "file:"+staging+"?_busy_timeout=1000")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec("ALTER TABLE grants RENAME COLUMN approved_at_ns TO approved_at_legacy"); err != nil {
+		t.Fatalf("rename the column: %v", err)
+	}
+	// The premise of the case, checked rather than assumed: the version and the
+	// object names are untouched, which is exactly why the file used to pass.
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if version != migrations.CurrentVersion {
+		t.Fatalf("the fixture changed the version to %d, so it is not the case under test", version)
+	}
+	names, err := schemaNames(db)
+	if err != nil {
+		t.Fatalf("read object names: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	want, err := schemaNamesOfBuild(t, migrations.CurrentVersion)
+	if err != nil {
+		t.Fatalf("read this build's object names: %v", err)
+	}
+	if !sameStrings(names, want) {
+		t.Fatalf("the fixture changed the object names (%v vs %v), so it is not the case under test", names, want)
+	}
+
+	var before unix.Stat_t
+	if err := unix.Lstat(staging, &before); err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	bytesBefore, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+
+	got, oerr := Open(path)
+	if oerr == nil {
+		got.Close()
+		t.Fatal("a staging database with a renamed column was adopted as this installation")
+	}
+	if code := errs.CodeOf(oerr); code != errs.CodeRecoveryRequired {
+		t.Fatalf("code = %s, want %s (%v)", code, errs.CodeRecoveryRequired, oerr)
+	}
+	// Both sides of the difference, so the message says which column moved
+	// instead of only that something did.
+	for _, fragment := range []string{"table grants", "approved_at_ns", "approved_at_legacy"} {
+		if !strings.Contains(oerr.Error(), fragment) {
+			t.Fatalf("the refusal does not mention %q: %v", fragment, oerr)
+		}
+	}
+	bytesAfter, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("the refused file is gone: %v", err)
+	}
+	if !bytes.Equal(bytesBefore, bytesAfter) {
+		t.Fatal("the refusal modified the file it refused")
+	}
+	var after unix.Stat_t
+	if err := unix.Lstat(staging, &after); err != nil {
+		t.Fatalf("lstat after: %v", err)
+	}
+	if after.Ino != before.Ino {
+		t.Fatal("the refused file was replaced: the inode changed")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("a refused installation published a state database")
+	}
+}
+
+// schemaNames lists a file's objects the way the ownership check names them.
+func schemaNames(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(`
+SELECT type, name FROM sqlite_master
+WHERE name NOT LIKE 'sqlite_autoindex%'
+ORDER BY type, name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var kind, name string
+		if err := rows.Scan(&kind, &name); err != nil {
+			return nil, err
+		}
+		out = append(out, kind+" "+name)
+	}
+	return out, rows.Err()
+}
+
+// schemaNamesOfBuild is the same list for the schema this build writes, produced
+// by replaying the shipped migrations rather than by a second copy of the answer.
+func schemaNamesOfBuild(t *testing.T, version int) ([]string, error) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	for _, step := range migrations.Steps {
+		if step.Version > version {
+			break
+		}
+		if _, err := db.Exec(step.SQL); err != nil {
+			return nil, err
+		}
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", step.Version)); err != nil {
+			return nil, err
+		}
+	}
+	return schemaNames(db)
+}
+
 // setUserVersionAndWAL turns a database into one from another build: a version
 // this build does not implement, and a journal mode of its own.
 func setUserVersionAndWAL(t *testing.T, path string, version int) error {

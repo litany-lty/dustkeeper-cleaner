@@ -10,6 +10,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"dustkeeper/internal/store"
+	"dustkeeper/migrations"
 )
 
 func TestStatusRefusesATruncatedStateDatabase(t *testing.T) {
@@ -168,5 +170,87 @@ func TestInitRefusesAForeignDatabaseAtTheStagingName(t *testing.T) {
 	// adopted on the second attempt.
 	if again := cli(t, "init", "--json"); again.code == 0 {
 		t.Fatalf("the second init adopted the same file: %s", again.stdout)
+	}
+}
+
+// C03 through the same command, for the file that agrees about everything a name
+// can show.
+//
+// This staging file is built from this build's own migrations: the right version,
+// the right objects, the right meta rows, no data. Only one column of `grants` has
+// been renamed, so `migrate` sees the version it expects, does nothing, and the
+// first grant query dies with "no such column: approved_at_ns". The definition is
+// the only evidence that separates it from an interrupted installation.
+func TestInitRefusesAStagingDatabaseWhoseDefinitionDiffers(t *testing.T) {
+	base := newHome(t)
+	stateDir := filepath.Join(base, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("mkdir state: %v", err)
+	}
+	staging := filepath.Join(stateDir, "state.db.init")
+
+	db, err := sql.Open("sqlite3", "file:"+staging+"?_busy_timeout=1000&_txlock=immediate")
+	if err != nil {
+		t.Fatalf("create the staging database: %v", err)
+	}
+	for _, step := range migrations.Steps {
+		if _, err := db.Exec(step.SQL); err != nil {
+			t.Fatalf("apply %03d: %v", step.Version, err)
+		}
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", step.Version)); err != nil {
+			t.Fatalf("set user_version %d: %v", step.Version, err)
+		}
+		if _, err := db.Exec(
+			"INSERT INTO meta(key,value) VALUES('schema_version',?) "+
+				"ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+			fmt.Sprintf("%d", step.Version)); err != nil {
+			t.Fatalf("record schema_version %d: %v", step.Version, err)
+		}
+	}
+	if _, err := db.Exec("ALTER TABLE grants RENAME COLUMN approved_at_ns TO approved_at_legacy"); err != nil {
+		t.Fatalf("rename the column: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	beforeBytes, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+	var before unix.Stat_t
+	if err := unix.Lstat(staging, &before); err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+
+	r := cli(t, "init", "--json")
+	if r.code == 0 {
+		t.Fatalf("init adopted a staging database whose definition differs: %s", r.stdout)
+	}
+	if got := r.str(t, "code"); got != "RECOVERY_REQUIRED" {
+		t.Errorf("code = %q, want RECOVERY_REQUIRED; stdout:\n%s", got, r.stdout)
+	}
+	msg := r.str(t, "message")
+	for _, fragment := range []string{"table grants", "approved_at_ns", "approved_at_legacy"} {
+		if !strings.Contains(msg, fragment) {
+			t.Errorf("the refusal does not mention %q: %q", fragment, msg)
+		}
+	}
+
+	afterBytes, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("the file was removed by the refusal: %v", err)
+	}
+	if !bytes.Equal(beforeBytes, afterBytes) {
+		t.Fatal("the refusal modified the file it refused")
+	}
+	var after unix.Stat_t
+	if err := unix.Lstat(staging, &after); err != nil {
+		t.Fatalf("lstat after: %v", err)
+	}
+	if after.Ino != before.Ino {
+		t.Fatal("the refused file was replaced: the inode changed")
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "state.db")); !os.IsNotExist(err) {
+		t.Fatal("a refused init published a state database")
 	}
 }

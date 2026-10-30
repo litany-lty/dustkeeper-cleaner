@@ -27,6 +27,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/sys/unix"
@@ -418,9 +419,10 @@ const maxStagingBytes = 16 << 20
 // schema added, `init` reporting a fresh start. "It is a SQLite database with a
 // plausible version" is not evidence that this build produced it.
 //
-// So the schema is compared with the schema this build produces at that version,
-// and the file must hold nothing else: a first installation that was never
-// published carries the migrations' meta rows and has never taken data.
+// So the schema is compared with the schema this build produces at that version -
+// every object's type, name, owning table and CREATE statement - and the file must
+// hold nothing else: a first installation that was never published carries the
+// migrations' meta rows and has never taken data.
 //
 // The comparison runs on a copy, for the same reason all of this happens before
 // SQLite is opened: the first thing SQLite does with a database is recover a hot
@@ -522,10 +524,10 @@ func compareStagingSchema(work, staging string) error {
 		return errs.Wrap(errs.CodeDBError, err)
 	}
 	switch {
-	case !sameStrings(got.objects, want.objects):
+	case !sameObjects(got.objects, want.objects):
 		return refuseStaging(staging,
 			"it is a SQLite database at version %d, but its schema is not the one this build writes at that version: %s",
-			got.version, describeDifference(got.objects, want.objects))
+			got.version, describeObjectDifference(got.objects, want.objects))
 	case !sameStrings(got.meta, want.meta):
 		return refuseStaging(staging,
 			"its schema is this build's, but its meta table says something else: %s",
@@ -538,13 +540,34 @@ func compareStagingSchema(work, staging string) error {
 	return nil
 }
 
-// stagingShape is what a file says about itself: the objects in its schema, the
-// rows in its meta table, and how much data everything else holds.
+// stagingShape is what a file says about itself: the objects in its schema and
+// what each of them is made of, the rows in its meta table, and how much data
+// everything else holds.
 type stagingShape struct {
 	version int
-	objects []string
+	objects []schemaObject
 	meta    []string
 	rows    int64
+}
+
+// schemaObject is one row of sqlite_master, kept whole.
+//
+// The set of names is not the schema. ALTER TABLE ... RENAME COLUMN leaves every
+// name, the version, the meta rows and the row counts exactly where they were and
+// turns a state database into one whose queries fail with "no such column":
+// migrate() sees the version it expects and returns without repairing anything.
+// A name is a claim; the definition is the evidence for it.
+type schemaObject struct {
+	kind  string // table, index, view or trigger
+	name  string
+	table string // the object this one belongs to; empty when NULL
+	sql   string // the CREATE statement; empty when NULL
+}
+
+// String is how an object is named in a refusal: the same "table grants" the
+// earlier check printed, with the definition available separately.
+func (o schemaObject) String() string {
+	return o.kind + " " + o.name
 }
 
 // schemaQueryer is the part of *sql.DB and *sql.Conn this needs, so the same code
@@ -563,23 +586,34 @@ func stagingShapeOf(ctx context.Context, q schemaQueryer) (stagingShape, error) 
 	// after an AUTOINCREMENT table, so its presence is one more fact this build
 	// produces and a foreign schema would have to reproduce. Autoindexes are not:
 	// they are named after their table and carry no independent information.
+	//
+	// tbl_name and sql are read with the names because the definition is the part
+	// a version number cannot vouch for. Both can be NULL - sql is NULL for the
+	// rows SQLite writes for itself - so the query folds NULL to the empty string
+	// and both sides fold it the same way. Nothing this build creates has an empty
+	// name or an empty CREATE statement, so the fold cannot make two different
+	// objects look the same.
 	rows, err := q.QueryContext(ctx, `
-SELECT type, name FROM sqlite_master
+SELECT type, name, COALESCE(tbl_name, ''), COALESCE(sql, '') FROM sqlite_master
 WHERE name NOT LIKE 'sqlite_autoindex%'
 ORDER BY type, name`)
 	if err != nil {
 		return out, err
 	}
 	var tables []string
+	hasMeta := false
 	for rows.Next() {
-		var kind, name string
-		if err := rows.Scan(&kind, &name); err != nil {
+		var obj schemaObject
+		if err := rows.Scan(&obj.kind, &obj.name, &obj.table, &obj.sql); err != nil {
 			rows.Close()
 			return out, err
 		}
-		out.objects = append(out.objects, kind+" "+name)
-		if kind == "table" && name != "meta" {
-			tables = append(tables, name)
+		out.objects = append(out.objects, obj)
+		if obj.kind == "table" && obj.name != "meta" {
+			tables = append(tables, obj.name)
+		}
+		if obj.kind == "table" && obj.name == "meta" {
+			hasMeta = true
 		}
 	}
 	if err := rows.Close(); err != nil {
@@ -589,7 +623,7 @@ ORDER BY type, name`)
 		return out, err
 	}
 
-	if containsString(out.objects, "table meta") {
+	if hasMeta {
 		metaRows, err := q.QueryContext(ctx, "SELECT key || '=' || value FROM meta ORDER BY key")
 		if err != nil {
 			return out, err
@@ -676,12 +710,85 @@ func refuseStaging(staging, format string, args ...any) error {
 		staging, fmt.Sprintf(format, args...))
 }
 
-// describeDifference names the first object that does not match, so the message
-// says what the file is rather than only what it is not.
+// describeObjectDifference names the first object that does not match, so the
+// message says what the file is rather than only what it is not.
+//
+// A different definition under an agreed name is reported as that, with both
+// statements shortened: "table grants" being present is exactly the fact the
+// version number already established, and repeating it would tell the reader
+// nothing about why the file was refused.
+func describeObjectDifference(got, want []schemaObject) string {
+	for i, obj := range got {
+		if i >= len(want) {
+			return fmt.Sprintf("found %q, which this build does not create at that version", obj.String())
+		}
+		if want[i].String() != obj.String() {
+			return fmt.Sprintf("expected %q, found %q", want[i].String(), obj.String())
+		}
+		if want[i].table != obj.table {
+			return fmt.Sprintf("%s belongs to %q here and to %q there", obj.String(), want[i].table, obj.table)
+		}
+		if want[i].sql != obj.sql {
+			return fmt.Sprintf("%s differs: %s",
+				obj.String(), differenceAround(want[i].sql, obj.sql))
+		}
+	}
+	if len(want) > len(got) {
+		return fmt.Sprintf("expected %q, which is not there", want[len(got)].String())
+	}
+	return "the two schemas differ"
+}
+
+// differenceAround shows both statements around the first byte where they part
+// ways.
+//
+// A prefix of each would be easier, and wrong for the case this exists for: a
+// renamed column sits at the end of a long CREATE TABLE, so a truncated prefix
+// would print two identical-looking beginnings and say nothing. The window is
+// wide enough to recognise the table and centred far enough past the start to
+// include the column that moved.
+func differenceAround(want, got string) string {
+	at := 0
+	for at < len(want) && at < len(got) && want[at] == got[at] {
+		at++
+	}
+	from, to := at-48, at+48
+	if from < 0 {
+		from = 0
+	}
+	return fmt.Sprintf("expected %q, found %q", window(want, from, to), window(got, from, to))
+}
+
+// window cuts [from,to) out of s, backing off to a character boundary so a
+// refusal cannot contain half a multi-byte name. It marks the cuts it made.
+func window(s string, from, to int) string {
+	if to > len(s) {
+		to = len(s)
+	}
+	if from > to {
+		from = to
+	}
+	for from > 0 && from < len(s) && !utf8.RuneStart(s[from]) {
+		from--
+	}
+	for to > 0 && to < len(s) && !utf8.RuneStart(s[to]) {
+		to--
+	}
+	out := s[from:to]
+	if from > 0 {
+		out = "..." + out
+	}
+	if to < len(s) {
+		out += "..."
+	}
+	return out
+}
+
+// describeDifference names the first meta row that does not match.
 func describeDifference(got, want []string) string {
 	for i, name := range got {
 		if i >= len(want) {
-			return fmt.Sprintf("found %q, which this build does not create at that version", name)
+			return fmt.Sprintf("found %q, which this build does not write at that version", name)
 		}
 		if want[i] != name {
 			return fmt.Sprintf("expected %q, found %q", want[i], name)
@@ -693,13 +800,16 @@ func describeDifference(got, want []string) string {
 	return "the two schemas differ"
 }
 
-func containsString(list []string, want string) bool {
-	for _, got := range list {
-		if got == want {
-			return true
+func sameObjects(a, b []schemaObject) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func sameStrings(a, b []string) bool {
