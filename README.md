@@ -4,21 +4,25 @@
 ![Go](https://img.shields.io/badge/go-1.26.1-00ADD8)
 
 一次有边界、可恢复的文件清理器。它把「策略」「授权」「执行」「恢复」拆成四件互不代劳的事：
-模型只写规则草稿，程序只按已批准的规则和额度行动，任何删除都能先撤销，删不干净的状态一律停下来等人看。
+模型只写规则草稿，程序只按已批准的规则和额度行动，**被隔离的对象在永久清空前可以申请恢复；永久清空之后
+Dustkeeper 无法撤销；恢复不会覆盖已存在的目标**；删不干净的状态一律停下来等人看。
 
 一期是一个 Go + 原生 SQLite 的可执行文件：无常驻进程、无后台模型、不依赖 Python/Java。
 
-> **状态：FINAL-1.0 收口完成，独立复核的 D01–D14 已按最小修补处理（逐条修改、反例与未关闭项见
-> `docs/compliance.md` §1.1），第二轮复核的 C01–C08 与 A09/C05 在 §1.2/§1.3、第三轮复核剩下的
-> C03/C05 两处余量在 §1.4 里逐条给出修改与结论。两个目标都由 CI 的原生 runner 产出并冒烟：
-> `darwin-arm64` 在 `macos-latest`（arm64）、`linux-amd64` 在 `ubuntu-latest`（x86_64）。
-> 模型能力仍未验收（A12 的唯一缺口）。**
-> 逐条结论见 [`docs/compliance.md`](docs/compliance.md) 的 FINAL 状态表（A01–A12）。
-> 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
+> **状态：FINAL-1.0 收口。** 独立复核的 D01–D14（§1.1）、第二轮 C01–C08 与 A09/C05（§1.2/§1.3）、
+> 第三轮 C03/C05 两处余量（§1.4）、C03 的定义比较（§1.5）、`status` 到期计数（§1.6）都已按最小修补
+> 处理。两个发布目标由 CI 的原生 runner 产出并冒烟：`darwin-arm64` 在 `macos-latest`（arm64）、
+> `linux-amd64` 在 `ubuntu-latest`（x86_64）；**制品与 checksum 只登记在
+> [`docs/compliance.md`](docs/compliance.md) §3，README 不再维护第二份**。
 >
-> 二期的边界与设计已经单独成文：[`docs/phase2-design.md`](docs/phase2-design.md)（JEV 初判 + LLM 复核
-> 约束新隔离、`schema 4` 的有限升级、共用执行器的校验点、失败矩阵与验收语料）。那份文档是设计，
-> 不是已实现能力——真实模型部分明确标为未验证。
+> 交付范围就一句：**按你预览并批准过的离线 JSON 规则，在明确登记的可丢弃目录里做可恢复的隔离与独立授权的清空**。
+> 模型能力（自然语言规则草稿）未验收（A12 的唯一缺口）。
+>
+> 二期的 JEV + LLM 复核**只是设计，已暂缓，不属于本次发布**：正文留在
+> [`docs/phase2-design.md`](docs/phase2-design.md) 供以后查阅，本轮不实现 schema 4、`state upgrade`、
+> 审核表或任何模型调用链。因此不能把本版本描述成"已完成 JEV 判定 + LLM 二次确认"。
+>
+> 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
 
 ```
 dustkeeper init
@@ -130,7 +134,8 @@ scope / plan / object ID。退出码：`0` 成功（含「无候选」）、`2` 
    没有常驻进程和后台模型。扫描不读取文件内容（证据里 `content_bytes_read` 为 null）。
 7. **Windows 不是目标**：本实现依赖 `flock`、`renameatx_np`/`renameat2`、`F_FULLFSYNC` 这些 unix 原语。
 
-规模上限有实测：10 万普通文件、1 051 个目录，完整扫描 wall 54.5 s、峰值 RSS 29.5 MiB（既定上限 256 MiB），
+规模上限有实测（**历史提交 `e14855c`，不是当前 HEAD 的实测**，也不能外推到别的文件系统或目录形状）：
+10 万普通文件、1 051 个目录，完整扫描 wall 54.5 s、峰值 RSS 29.5 MiB（既定上限 256 MiB），
 数据库 180 KiB → 59.0 MiB（约 619 B/文件）；默认预算下的一轮运行扫描完整、未被预算中断（`control=continue`，
 envelope `code=OK`）；中断续跑 10 批、累计只扫 1.00× 树大小。数字、commit 与测量口径见
 [`docs/evidence/performance-100k.md`](docs/evidence/performance-100k.md)。
@@ -165,13 +170,13 @@ envelope `code=OK`）；中断续跑 10 批、累计只扫 1.00× 树大小。�
 
 | 目标 | 构建入口 | 验证到哪一步 |
 |---|---|---|
-| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | CI `macos-latest` 上产出（run `40848835280`，代码 `2924938`）：`sha256=dc0b9c26…7868`；`version` 与临时目录内 Q/R 冒烟真实执行，并核对 apply 后原路径不存在、restore 后字节逐字节相同 |
-| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | CI `ubuntu-latest`（x86_64）上产出（同一 run）：`readelf` 复核 X86-64 / `interp=0` / `needed=0`，Q/R 冒烟同样带独立断言，`sha256=8b77dd93…2115` |
+| `darwin-arm64` | `./build/build.sh --release`（本机原生编译 + ad-hoc 签名） | CI `macos-latest`（arm64）上产出：`version` 冒烟，临时目录内 `init → scope add → scan → plan apply → quarantine restore` 真实执行，并独立核对 apply 后原路径不存在、restore 后字节逐字节相同 |
+| `linux-amd64` | `./build/build-linux-release.sh`（固定 digest 的 `linux/amd64` 镜像，`CC=musl-gcc`） | CI `ubuntu-latest`（x86_64）上产出：`readelf` 复核 X86-64 / `interp=0` / `needed=0`，Q/R 冒烟同样带独立断言 |
 
-本机 `./build/build.sh --release`（`d138594`，`sha256=d116069b…ccbd`）跑的是同一套冒烟，
-checksum 不同是因为嵌了构建时间与 commit。更早的 checksum（`5f365a46…`、`16d0b839…`、
-`1fa83ce4…`、`533e372c…`、`96be5921…`）保留在
-[`docs/compliance.md`](docs/compliance.md) §3 的历史行里，不与上面这两行拼成同一份证据。
+**具体的 checksum、artifact ID 与对应的 commit 只登记在
+[`docs/compliance.md`](docs/compliance.md) §3**（当前发布候选 + 历史行）。README 不复制这些值：
+两份文档各写一份哈希，只会出现"哪份是新的"这种无法回答的问题。历史 checksum 留在 §3 的历史行里，
+不与当前候选拼成同一份证据。
 
 `build.sh` 是单目标构建：它在**它所在的那台机器上**编译，产物架构从产物本身读回来，不接受 GOOS/GOARCH 覆盖。
 一台不是发布目标的机器仍然能做开发构建，但产物不会被叫作受支持，也不会写发布清单。
@@ -189,8 +194,8 @@ checksum、这份制品实际跑过哪些动作。发布清单来自这些事实
 - [`docs/operations.md`](docs/operations.md)：安装、定时任务、恢复流程、故障处理、备份与卸载。
 - [`docs/architecture.md`](docs/architecture.md)：模块边界、状态机、对账矩阵、跨平台文件操作。
 - [`docs/compliance.md`](docs/compliance.md)：FINAL 状态表（A01–A12）与证据；旧清单已标为历史。
-- [`docs/phase2-design.md`](docs/phase2-design.md)：二期设计（模型复核约束新隔离、schema 4 升级、失败矩阵、验收语料）。
-- [`docs/evidence/`](docs/evidence/)：扫描/资源实测的原始 JSON 与摘要。
+- [`docs/phase2-design.md`](docs/phase2-design.md)：二期设计（模型复核约束新隔离、schema 4 升级、失败矩阵、验收语料）。**已暂缓，非本次发布范围，当前不实施。**
+- [`docs/evidence/`](docs/evidence/)：扫描/资源实测的原始 JSON 与摘要；`deployment-*.md` 是目标机器的有限部署记录。
 - [`packaging/`](packaging/)：`install.sh` / `uninstall.sh`，在目标机器上渲染并安装定时任务模板。
 
 ## 协议

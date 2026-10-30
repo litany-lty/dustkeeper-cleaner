@@ -12,7 +12,7 @@
 
 | 项目 | 要求 |
 |---|---|
-| 平台 | Linux（x86_64 / arm64）或 macOS（arm64 / x86_64）；其他平台会在 `doctor` 报 `UNSUPPORTED_FS` |
+| 平台 | 正式发布的制品只有两个：`linux-amd64`、`darwin-arm64`。其它系统或架构没有制品，也没有发布验证；自行从源码构建属于自建，不是受支持的发布 |
 | 文件系统 | 与被清理目录同卷的普通本地文件系统。需要支持排他 rename（Linux `renameat2`、macOS `renameatx_np`）；网络卷、FUSE、部分容器 overlay 不支持 |
 | 内核 | Linux ≥ 5.6（`openat2`）；以下版本会在打开 scope 时失败，而不是降级 |
 | 权限 | 以**要清理的文件的所有者**身份运行。不要用 root 去清理用户目录 |
@@ -24,20 +24,26 @@
 
 ## 2. 安装
 
+发布目录里是四个文件，来自同一次构建，必须一起下载：`dustkeeper-1.0.0-phase1-<target>`
+（二进制本身，没有压缩包）、`SHA256SUMS`、`release-manifest.txt`、`build-facts.txt`。
+
 ```sh
-tar xzf dustkeeper-1.0.0-phase1-<os>-<arch>.tar.gz     # 或直接复制二进制
-install -m 0755 dustkeeper /usr/local/bin/dustkeeper
+# 在当前目录（四个文件都在这里）
+shasum -a 256 -c SHA256SUMS
+grep -E '^(version|commit|target|artifact|sha256)=' release-manifest.txt
+install -m 0755 dustkeeper-1.0.0-phase1-linux-amd64 /usr/local/bin/dustkeeper
 dustkeeper version
 ```
 
-核对下载文件（发布目录里的 `SHA256SUMS` 是在 `dist/` 内生成的相对路径）：
+第一步用 `SHA256SUMS` 核对二进制字节，第二步核对这份清单说的是哪个 commit、哪个 target：
+清单里的 `commit` 是二进制的内嵌值，不是文档写的值。macOS 上把最后两行的文件名换成
+`dustkeeper-1.0.0-phase1-darwin-arm64`。
 
-```sh
-cd dist && shasum -a 256 -c SHA256SUMS
-```
+`version` 的输出里带 `commit`，应当与清单里的 `commit` 一致——不一致说明装错了文件。
 
 macOS 上 `build/build.sh` 产出的二进制已做 ad-hoc 签名（`codesign --force --sign -`）。如果你自己重新编译，
-也用同样的方式签一下，否则每次执行都会被系统重新评估，首次运行会明显变慢。
+也用同样的方式签一下，否则每次执行都会被系统重新评估，首次运行会明显变慢。通过浏览器下载的文件可能带
+`com.apple.quarantine`，首次执行前用 `xattr -d com.apple.quarantine <binary>` 去掉，或改用命令行下载。
 
 ---
 
@@ -96,7 +102,7 @@ dustkeeper scope add --path /srv/app/disposable-exports --kind managed_disposabl
 | `observe` | 否 | 只扫描、只报告 |
 | `assisted` | 是 | 需要人工逐个批准（一期通过 `plan create` + `plan apply`） |
 | `managed_disposable` | 是 | 唯一可以被自动隔离、并在到期后被自动清空的类型 |
-| `reference` | 否 | 查重时的"正本"目录，永不移动 |
+| `reference` | 否 | 永不移动，也不进入 `run`。这是早期查重功能留下的"正本"目录类型，现在的版本不再产生查重计划；保留它是为了让已经登记的对象继续被认出来，不要为新用途注册这个类型 |
 
 `managed_disposable` 会在目录内创建 `.dustkeeper/`： `owner.json`（所有权标记）、`objects/`（隔离区）、
 `manifests/`（移动前落盘的清单）、`tmp/`、`durability.anchor`（耐久同步锚点）。
@@ -135,39 +141,56 @@ dustkeeper doctor --scope exports
 每个 scope 还会额外做一次"根目录身份复核 + 能力探测"。根被替换过（重装系统、恢复备份、`mv` 过目录）
 会报 `SCOPE_CHANGED`：这不会自动修复，需要重新注册该范围。
 
-`--acknowledge-clock` 只记录"当前墙钟可信"，**不会**修改任何已存对象的 `quarantined_at` / `purge_not_before`。
-不确定的时间不能被一次确认抹平，这是刻意的。
+`--acknowledge-clock` 是一个事务，不是一个时间戳：它清除时钟闸门，并把**保留窗口无法证明的对象**按现在
+重新给足一个完整窗口（`doctor` 的输出会写明有几个对象被重新计时），然后记下这次确认。它只会把窗口往后推，
+不会缩短任何对象的保留期，也不会让谁提前变成可清空。已经有确定起始时间的对象不受影响。
+
+这也是它和"什么都不做"的区别：闸门在时清空是停住的，确认之后清空会恢复，但恢复的第一个动作是重新给窗口，
+而不是立刻删。不确定的时间不能被一次确认抹平成"早就到期了"。
 
 ---
 
 ## 6. 规则：从草稿到授权
 
-规则的生命周期是四步，每一步都有自己的检查点：
+规则预览要有候选可看，所以先扫一遍：
 
 ```sh
-# 1) 导入（或让模型写草稿，草稿不构成任何授权）
-dustkeeper rule import --file rule.json --id rule-001
-dustkeeper rule validate --file rule.json            # 只校验，不入库
-
-# 2) 冻结一份不落库的预览，拿到 review 摘要
-dustkeeper rule preview --id rule-001 --revision 1
-
-# 3) 用摘要激活这个版本（旧版本授权同时作废）
-dustkeeper rule activate --id rule-001 --revision 1 --digest sha256:...
-
-# 4) 单独授予后台能力
-dustkeeper rule authorize --id rule-001 --revision 1 --auto-quarantine
-dustkeeper rule authorize --id rule-001 --revision 1 --auto-quarantine --digest sha256:...
+dustkeeper scan --scope exports     # 只读；把观察到的东西记进观察表，不移动任何文件
 ```
 
-第 4 步不带 `--digest` 时**只输出提案**，里面写明能力、额度、保留期，并明确标注
-`retroactive: false` 与 "objects already isolated: NOT covered"。把提案里的 `approval_digest` 原样传回去
-才真正写库。这个"两步"是为了让"批准了什么"有据可查，而不是一条命令改掉权限。
+扫描不完整的 scope（权限缺失、有目录读不了）不会进入新的自动隔离，这条在执行时还会再查一次。
 
-日常用 `rule enable` 代替 2–4 步：`rule enable --id rule-001 --revision 1` 只打印会批准什么与
-`enable digest`，`--digest` 那次把"激活 + review 绑定 + 选定能力"放进一个事务，要么全成要么全不成，
-不会留下半激活的规则。上面 2–4 是它的底层入口，分开做时两次确认之间任何变化都要重新确认；
+然后是规则的导入与授权。日常只有两条命令：`rule enable` 打印提案，`rule enable --digest` 确认。
+
+```sh
+# 1) 导入（手写 JSON 规则；导入本身不构成任何授权）
+dustkeeper rule import --file rule.json --id rule-001
+
+# 2) 提案：会激活哪个修订、绑定哪次 review、授予哪种能力、额度与保留期
+dustkeeper rule enable --id rule-001 --revision 1
+
+# 3) 确认：把上一步给出的 enable digest 原样传回去
+dustkeeper rule enable --id rule-001 --revision 1 --digest sha256:...
+```
+
+`rule enable` 不带 `--digest` 时**只输出提案**，里面写明能力、额度、保留期，并明确标注
+`retroactive: false` 与 "objects already isolated: NOT covered"。把提案里的 `approval_digest` 原样传回去
+才真正写库，而且"激活 + review 绑定 + 选定能力"在同一个事务里，要么全成要么全不成，不会留下半激活的规则。
 `--mode cleanup` 才是"隔离后到期清空"，`--mode quarantine`（默认）只隔离。
+
+底层入口仍然保留，需要分开做或逐项核对时用：
+
+```sh
+dustkeeper rule validate --file rule.json            # 只校验，不入库
+dustkeeper rule preview --id rule-001 --revision 1   # 冻结一份不落库的预览，返回 review 摘要
+dustkeeper rule activate --id rule-001 --revision 1 --digest sha256:...   # 旧版本授权同时作废
+dustkeeper rule authorize --id rule-001 --revision 1 --auto-quarantine    # 不带 --digest 时只打印提案
+```
+
+分开做时，两次确认之间规则或目录有任何变化，都要重新确认——摘要算的就是当时那份内容。
+
+`rule draft`（让模型写规则草稿）是**未验收**的入口，默认没有可用端点时直接 `MODEL_UNAVAILABLE`（exit 8），
+它写出的草稿不构成任何授权。正式上手路径用上面手写的离线 JSON 规则。
 
 额度语义：`--max-files` / `--max-bytes` 取 `min(配置默认, grant 批准值)`。**`0` 表示禁止**，不是无限。
 
@@ -179,6 +202,19 @@ dustkeeper rule disable --id rule-001 --revision 1
 ```
 
 `revoke` 只撤一种能力；`disable` 停用整个版本。两者都不移动文件、也不恢复已隔离对象。
+
+### 6.1 两种模式：隔离与清空
+
+| 模式 | 实际作用 | 什么时候用 |
+|---|---|---|
+| `--mode quarantine`（默认） | 只把匹配文件移到 `.dustkeeper/objects`，随时可以用 `quarantine restore` 拿回来；保留期到了也不会自动清空 | 第一次试运行、目录用途还在确认 |
+| `--mode cleanup` | 在隔离之外再批准"保留期结束后自动永久清空"；每轮仍受独立额度、授权与本地检查约束 | 目录用途明确、规则已经跑过几轮确认无误 |
+
+**隔离是同卷 rename，通常不释放文件的数据块。** 真正的空间回收发生在永久删除之后；APFS 快照、仍被进程
+打开的文件也会让系统显示的可用空间滞后。所以不要把"隔离了多少字节"当成"已经释放了多少空间"。
+
+后来把规则改成 `--mode cleanup`，不会让之前只隔离的对象追溯获得自动清空权限——它们仍然要走人工计划或恢复。
+永久清空之后，Dustkeeper 不能把它撤销。
 
 ---
 
@@ -257,12 +293,16 @@ launchctl bootout gui/"$(id -u)" ~/Library/LaunchAgents/dustkeeper.plist
 ## 8. 日常运行与观察
 
 ```sh
-dustkeeper run --dry-run     # 只对账 + 报告，不扫描不执行
+dustkeeper run --dry-run     # 只读：列出 pending 操作，不对账、不扫描、不移动
 dustkeeper run               # 对账 → 到期清空 → 扫描 → 已授权隔离
 dustkeeper status
 dustkeeper events --limit 50
 dustkeeper events --item <item_id>
 ```
+
+`--dry-run` 回答的是"现在有什么没结完"，不是"下一轮会删什么"：它连对账都不做，列出来的 pending 仍然要由
+`recover reconcile` 处理。垃圾候选的预览不在这个命令里——先 `scan` 把目录扫进观察表，再用 `rule preview`
+（或 `rule enable` 不带 `--digest` 时的提案）看这条规则会选中哪些文件。
 
 `run` 的顺序是有意的：先把上次没结束的事说清楚，再考虑新工作。任何一步遇到 `held` / `unknown` /
 时钟异常 / 预算耗尽，都会在本轮停在这里，不会带着不确定继续下一个文件。
@@ -363,22 +403,38 @@ dustkeeper resume     # 清除标记
 
 ## 11. 备份
 
-要备份两样东西，它们必须**一起**备份：
+四样东西必须**一起**备份，缺一样就会在恢复时解释不通：
 
-1. `<state>/state.db`（含 `-journal` 文件，如果存在）
-2. 每个 `managed_disposable` scope 下的 `.dustkeeper/`（`owner.json`、`objects/`、`manifests/`）
+| 要备份的 | 为什么 |
+|---|---|
+| 配置目录（`<config>/config.json` 等） | 规则额度、时钟设置、保留期默认值在这里 |
+| `<state>/state.db`，连同 `state.db-journal`（存在时） | 库用的是 `journal_mode=DELETE`，没有 `-wal`/`-shm`；漏掉日志文件会得到一个"差最后一步"的库 |
+| 每个 scope 下的 `.dustkeeper/`（`owner.json`、`objects/`、`manifests/`、`durability.anchor`） | 隔离区里是原文件本身；清单记录移动前的身份 |
+| 当前运行的二进制 | 旧库只有对应版本的二进制解释得动；升级后回退需要它 |
 
 只备份数据库会得到一堆指向不存在对象的记录；只备份隔离区则失去身份与保留期信息。
 
 ```sh
-# 先确保没有任务在跑
+# 1) 先停调度，再等进程走完。pause 只阻止新的 intent，不阻止定时任务再拉一次 run。
+systemctl --user disable --now dustkeeper.timer      # macOS: launchctl bootout gui/"$(id -u)" ...
 dustkeeper pause
-dustkeeper status                 # 确认没有 pending_operations
+dustkeeper status                                    # pending_operations 必须为 0，且没有 run 在跑
+ps -o pid,command -p "$(cat "$STATE/instance.lock" 2>/dev/null)" 2>/dev/null   # 应当没有输出
+
+# 2) 数据库用 SQLite 自己的备份，不要 cp 一个正在写的文件
 sqlite3 "$STATE/state.db" ".backup '/backup/state.db'"
+
+# 3) 配置、隔离区、二进制
+tar czf /backup/dustkeeper-config.tgz -C "$CONFIG" .
 tar czf /backup/vault-exports.tgz -C /srv/app/disposable-exports .dustkeeper
+cp /usr/local/bin/dustkeeper /backup/dustkeeper-1.0.0-phase1-linux-amd64
 ```
 
 `status` 里只要还有 pending 操作，就先跑 `recover reconcile` 再备份。备份一个"半途"状态，恢复时会更难解释。
+
+**副本不是沙箱。** 把 `DUSTKEEPER_STATE_DIR` 指向备份、然后对着它跑 `run` 或 `quarantine restore`，是很危险的
+动作：库里的 scope 根路径仍然是原目录的绝对路径，副本会照着这些路径去动真实文件。恢复演练要么在一个真正
+隔离的测试目录里做（重新 `scope add` 那个测试目录），要么只做只读命令（`status`、`events`、`recover inspect`）。
 
 ---
 
@@ -422,7 +478,7 @@ rm -rf /srv/app/disposable-exports/.dustkeeper           # 仅在第 4 步确认
 | `run` 一直隔离 0 个 | `rule preview` 是否还有候选；`rule authorize` 是否只打印了提案没提交摘要 |
 | 刚恢复的文件又被选中 | 预期行为：恢复后自动加路径保护；若仍被选中，看 `protect list` 是否写失败 |
 | 计划刚生成就 `PLAN_STALE` | 有进程在写该目录（父目录身份或 mtime 变了）；`--writers-stopped` 之后重建计划 |
-| `plan apply` 报 `INVALID_ARGUMENT` | `manual_duplicate` 计划必须显式 `--writers-stopped` |
+| `plan apply` 报 `INVALID_ARGUMENT` | `assisted` scope 的手工计划必须显式 `--writers-stopped`：先确认没有进程在写这棵目录 |
 | `purge apply` 报 `DIGEST_MISMATCH` | 计划内容在生成后变了；`purge show` 会说明重算摘要是否与存档一致 |
 | 隔离区一直增长 | `auto_purge` 没开，或保留期还没到；`purge plan` 会列出到期对象 |
 | `INSTANCE_BUSY` 反复出现 | 有残留实例或另一个定时任务；`ps` 查一下，锁文件在 `<state>/instance.lock` |

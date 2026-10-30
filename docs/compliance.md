@@ -194,6 +194,42 @@ ALTER TABLE grants RENAME COLUMN approved_at_ns TO approved_at_legacy;
 复核同时明确了二期边界（保留隔离区布局、ManifestV1、Q/R/P 恢复合同，允许有限 schema 升级，
 不提高全局 `BindingVersion`），设计见 `docs/phase2-design.md`。
 
+### 1.6 `status` 的到期计数：一个页大小被当成了积压量（2026-10-30，基于 `f3c0d6d`）
+
+这不是 C03 引入的回归，是既有诊断问题，影响的是"看不看得懂"而不是删除权限。
+
+`status` 用 `ItemsDueForPurge(ctx, sc.ID, nowNS, 1)` 取一页，再用 `len()` 当计数。底层是
+`LIMIT ?`，所以 0 个报 0、1 个报 1、3 个报 1、100 个也报 1。同一段还有四处 `_ :=`：observation、
+quarantined、due 三个计数和 `last_run_ns`，读失败会变成屏幕上的零——而在这个视图里，零的意思正好是
+"没有积压"。
+
+改法（`fca60b8`）：
+
+- `internal/store/items.go` 把到期队列的 `WHERE` 收成一个常量 `purgeQueueWhere`，分页查询与新的
+  `CountDueForPurge` 共用它。计数和实际走队列的必须是同一个筛选条件，各写一份迟早会分叉。
+- 计数走 `SELECT COUNT(*)`，不加载对象、不 `ListAllItems` 再数长度。
+- `status` 与 `scope show` 的计数读取全部改成"失败就停"；`last_run_ns` 的键不存在仍是合法空值
+  （`MetaGet` 对 `sql.ErrNoRows` 返回空串），但数据库错误不再被当成"还没跑过"。
+- JSON 字段、权限、删除路径都没变。`--dry-run` 的帮助文案顺手改准：它只列 pending，不对账。
+
+反证（回退 `internal/store/items.go`、`cmd/dustkeeper/commands.go`、`cmd/dustkeeper/cmd_scope.go`
+到 `f3c0d6d`，保留新用例）：
+
+- `TestStatusReportsEveryDueObject/three`：`due_for_purge_count = 1, want 3`，人类输出同一行是
+  `quarantined=3 due=1`。
+- `TestStatusCountsOnlyThePurgeQueue`：`due_for_purge_count = 1, want 3`。
+- `TestStatusDoesNotReportAFailedCountAsZero`：`status` 返回 `"code": "OK"` 与
+  `"observation_count": 0`，即一次真实的 `no such column: status` 被印成了正常零。
+
+故障注入的选择也说明一下：把 `items` 整表换成视图这个更粗的故障**没用**——`Stats` 与 `PendingOps`
+会先报错，而它们原本就透传错误，测不到这个缺陷。所以用的是只影响这一条读的改法：
+`ALTER TABLE observations RENAME COLUMN status TO status_renamed`。`COUNT(*)` 不点名列，表级统计照常；
+pending 扫描不碰这张表；只有"按 scope 数 status 不是 stale 的观察"这一条会失败。它证明的是命令的接线，
+不是数据库引擎的行为。
+
+计数语义按复核要求保留区别：**到期数只是队列规模，不是删除许可。** 执行时仍然要过绑定授权、
+保护与对象身份检查；`CountDueForPurge` 的注释里写了这一点，免得下一个读代码的人把它当授权。
+
 ## 2. 本轮实跑（2026-10-29，darwin/arm64, APFS）
 
 关于本节标注的 `commit`：下表的 10 万文件数字来自 `docs/evidence/performance-100k.json`，该文件由
