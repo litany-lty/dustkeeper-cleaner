@@ -104,11 +104,11 @@ pause_marker / pending_operations / clock）全为 True——那是本机构建�
 | `launchctl bootstrap user/501 …` | 同上 |
 | `launchctl submit -l dk-accept -- …` | 无输出、`launchctl list` 里没有该作业 |
 
-`launchctl managername` 报告 `Aqua`，所以不是"不在 GUI 会话"这种常规原因；实际原因是这个执行环境
-对 `launchctl` 的 bootstrap Mach 服务没有权限。装进去的 plist **已经删掉**，`launchctl print
-gui/501/dustkeeper` 仍然是 `Could not find service`，主机上没有留下任何 dustkeeper 作业。
+`launchctl managername` 报告 `Aqua`；当前记录能确认 bootstrap 返回错误 `5: Input/output error`，
+但没有足以确认权限问题或其它根因的日志，**失败原因尚未定位**。装进去的 plist **已经删掉**，
+`launchctl print gui/501/dustkeeper` 仍然是 `Could not find service`，主机上没有留下任何 dustkeeper 作业。
 
-因此这一项如实记为：**本机 launchd 调度验证未做。** plist 的字段、路径与命令是核对过的，模板生成的
+因此这一项如实记为：**本机 launchd 调度已尝试，但验收未通过。** plist 的字段、路径与命令是核对过的，模板生成的
 逻辑有 `internal/schedule` 的用例覆盖，但那不等于"launchd 真的按点跑了一次"。
 
 systemd 一侧同样未做：本次没有 Linux 目标机。`linux-amd64` 的制品由 CI 的 `ubuntu-latest` 产出并冒烟，
@@ -127,6 +127,6 @@ systemd 一侧同样未做：本次没有 Linux 目标机。`linux-amd64` 的制
 
 没覆盖到（如实记录，不用别的证据顶替）：
 
-- **launchd / systemd 按点运行**：本环境 launchctl bootstrap 被拒，没有 Linux 目标机。
+- **launchd / systemd 按点运行**：本环境 launchctl bootstrap 返回错误 5，调度验收未通过；没有 Linux 目标机，systemd 未执行。
 - **到期后的永久清空**：30 天保留期，短期试运行碰不到；只有受控时钟的用例覆盖。
 - **大目录、多 scope、真实增量压力**：本次只有 5 个文件，吞吐结论仍以历史性能记录为参考，不外推。
