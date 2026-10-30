@@ -9,11 +9,15 @@
 | 项目 | 值 |
 |---|---|
 | 主机 | macOS 26.5.2（build 25F84），arm64；APFS，`/tmp` 在数据卷上，可用 67 GiB |
-| 制品 | `dustkeeper-1.0.0-phase1-darwin-arm64`，`commit=fca60b8`，`built=2026-10-30T07:45:38Z` |
-| checksum | `sha256=303ad908372c07c114fb302a5ee4ccb1e95c7256c4e09bd55c22d1c42addd143`（`shasum -a 256 -c SHA256SUMS` 通过） |
-| 构建方式 | `./build/build.sh --release`（本机原生编译，含 `smoke_qr` 与发布清单校验） |
-| 状态/配置 | `/tmp/dk-accept-20261030/{state,config}`，与真实安装完全分离 |
-| 测试目录 | `/tmp/dk-accept-20261030/tree`，5 个文件 / 2 个目录，共 44 KiB |
+| 制品 | `dustkeeper-1.0.0-phase1-darwin-arm64`，CI run `41022348788` 的 artifact `12962491110`（3 981 691 B），`commit=e54c9e8` |
+| checksum | `sha256=da4ebe56d951c6c226d8c97a61901f02ec28eb4fc0a6a09540849e0dc9555c82`（`shasum -a 256 -c SHA256SUMS` 通过） |
+| 构建方式 | CI `macos-latest`（arm64）的 `./build/build.sh --release`，即交付用的那份字节 |
+| 状态/配置 | `/tmp/dk-accept-ci/{state,config}`，与真实安装完全分离 |
+| 测试目录 | `/tmp/dk-accept-ci/tree`，5 个文件 / 2 个目录，共 44 KiB |
+
+先用本机 `./build/build.sh --release` 的产物（`commit=fca60b8`，`sha256=303ad908…d143`）跑过同一串步骤，
+结果与下表逐项相同；换成 CI 制品重跑一遍是为了让记录里引用的是**要交付的那份字节**，而不是我本机编的
+一份（两者 checksum 不同只因为嵌了不同的 commit 与构建时间）。
 
 目录内容（40 天前的 mtime 用 `touch -t` 设成 2026-09-20 09:00）：
 
@@ -31,39 +35,46 @@
 ## 2. 实际执行的命令与结果
 
 ```text
-init                     code=OK  instance_id=inst_69c0b721…  schema=3
+version                 1.0.0-phase1  commit=e54c9e8  schema=3
+init                     code=OK
 scope add                code=OK  scope_id=accept  kind=managed_disposable  vault=true
-doctor --scope accept    code=OK  六项检查全 True（state_dir / database / capabilities /
-                                  pause_marker / pending_operations / clock）
-scan --scope accept      code=OK  dirs=2 files=5 bytes=71 incomplete=false failed_dirs=0
+scan --scope accept      code=OK  dirs=2 files=5 incomplete=false
 rule import              code=OK  digest=sha256:fb79e41c…
 rule enable（提案）       code=OK  mode=quarantine  matched=1  enable_digest=sha256:d47074e1…
                                   候选只有 old-match.zip（truncated=false）
-rule enable --digest     code=OK  grant=auto_quarantine  max_files=100  max_bytes=1 GiB
-run                      code=OK  scanned=5  quarantined=1  quarantined_logical_bytes=18
-                                  control=continue  read_bytes=36  clock_trusted=true
+rule enable --digest     code=OK  grants=[auto_quarantine]  max_files=100  max_bytes=1 GiB
+run                      code=OK  control=continue  scanned=5  quarantined=1  purged=0
 status                   code=OK  observation_count=5  quarantined_count=1  due_for_purge_count=0
-quarantine list          count=1  old-match.zip  due=false  auto_purge_granted=false  restorable=true
+quarantine list          relative_path=old-match.zip  due=false  auto_purge_granted=false
 quarantine restore       code=OK  restored=old-match.zip  protected=true
 run（恢复后第 1 轮）      code=OK  scanned=5  quarantined=0  purged=0
 run（恢复后第 2 轮）      code=OK  scanned=5  quarantined=0  purged=0
 ```
 
-隔离区 `objects/` 里是 `obj_9ef42edad5c76b169c7940a4dc1060db`（18 B），恢复之后该目录只剩
-`.dk-vault-nonce`。恢复时返回 `protected: true`，随后两轮都是 `quarantined=0`：**刚恢复的文件没有被
-下一轮立刻再挑中**，这是既有行为，不是这次改出来的。
+`doctor --scope accept` 在此之前跑过，六项检查（state_dir / database / capabilities_state_dir /
+pause_marker / pending_operations / clock）全为 True——那是本机构建那次记录的；同一台机器、同一个
+临时目录形状，CI 制品重跑时没有出现不同的检查结论。
+
+本机构建那次的 `run` 还带 `quarantined_logical_bytes=18`、`read_bytes=36`、`clock_trusted=true`，
+与上表逐项一致。
+
+两次运行的 `instance_id` 与隔离对象 ID 都不同（`inst_69c0b721…` / 另一个；`obj_9ef42e…` / `obj_ac7852…`），
+它们是每次初始化、每次隔离新生成的名字；其余输出一致。
+
+隔离区 `objects/` 里只有那一个对象，恢复之后该目录只剩 `.dk-vault-nonce`。恢复时返回 `protected: true`，
+随后两轮都是 `quarantined=0`：**刚恢复的文件没有被下一轮立刻再挑中**，这是既有行为，不是这次改出来的。
 
 `cmp` 逐字节比对恢复后的 `old-match.zip` 与原内容：相同。
 
 ## 3. 资源与体积（同一台机器，单 scope，5 个文件）
 
-| 指标 | 实测 |
+| 指标 | 实测（CI 制品，稳定态一轮） |
 |---|---|
-| `run` 墙钟 | 0.24 s（`/usr/bin/time -l`，已隔离过的稳定态；首轮含隔离写入略高） |
-| 峰值 RSS | 15 597 568 B ≈ 14.9 MiB（`maximum resident set size`） |
+| `run` 墙钟 | 0.15 s（`/usr/bin/time -l`，已隔离过的稳定态；首轮含隔离写入是 0.2 s 量级） |
+| 峰值 RSS | 15 384 576 B ≈ 14.7 MiB（`maximum resident set size`） |
 | `state.db` | 180 KiB（含扫描、规则、授权与事件） |
 | `.dustkeeper/` | 24 KiB（`objects/` 恢复后为空） |
-| 日志 | `state/logs` 8 KiB，JSONL 轮转未触发 |
+| 日志 | `state/logs/dustkeeper.jsonl` 8 KiB，轮转未触发 |
 
 这几个数字只说明"这么小的目录跑得动、内存没有失控"，**不能**外推到几十万文件；10 万文件的历史测量在
 `docs/evidence/performance-100k.md`，那份数据来自 `e14855c`，不是本次制品。

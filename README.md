@@ -24,6 +24,16 @@ Dustkeeper 无法撤销；恢复不会覆盖已存在的目标**；删不干净�
 >
 > 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
 
+**收口清单（2026-10-30）**
+
+- [x] `status` 的到期计数准确，读失败不再印成零（`fca60b8`，见 §1.6）
+- [x] README / `operations.md` 对齐：平台、安装、备份、时钟确认、dry-run、隔离与清空语义
+- [x] 二期设计标为暂缓；schema 仍为 3，没有新增审核模块、模型门禁或命令
+- [x] 固定候选 `e54c9e8` 的两平台 CI 与制品校验成功（checksum 在 §3）
+- [x] darwin-arm64 用交付字节跑过一次真实闭环；**launchd 与 systemd 调度验证未做**，已如实记录
+- [ ] 真实模型语料报告（A12）——没有获准端点，保持未验收，不阻断离线版本交付
+- [x] 受支持范围内没有未解决的严重数据安全或基本可用性问题
+
 ```
 dustkeeper init
 dustkeeper scope add --path /srv/app/disposable-exports --kind managed_disposable --name exports
