@@ -218,10 +218,38 @@ func (s *Store) ListItemsByState(ctx context.Context, scope domain.ScopeID, stat
 	return out, errs.Wrap(errs.CodeDBError, rows.Err())
 }
 
+// purgeQueueWhere is the one definition of "in the automatic purge queue": the
+// retention bound has elapsed and no operation is in flight.
+//
+// The page and the count both read this, because a report that answers "how many
+// are due" from a different filter than the one a run walks is the same defect as
+// a wrong number. Note what it does not say: being due is not permission to
+// delete. The executor still checks the bound grant, the protections and the
+// object's identity at the moment it acts, so this count is a backlog size, not
+// an authorisation.
+const purgeQueueWhere = `
+ WHERE i.scope_id=? AND i.state='quarantined' AND i.pending_op_id IS NULL
+   AND i.reason='lifecycle'
+   AND i.purge_not_before_ns IS NOT NULL AND i.purge_not_before_ns <= ?`
+
 // ItemsDueForPurge lists quarantined objects whose retention has elapsed and
 // which have no operation in progress.
+//
+// The limit is a page size for callers that are about to act. A caller that only
+// wants to know how many are due must use CountDueForPurge: asking this for one
+// row and reporting len() answers "one" for every backlog of one or more.
 func (s *Store) ItemsDueForPurge(ctx context.Context, scope domain.ScopeID, nowNS int64, limit int) ([]Item, error) {
 	return s.PurgeQueuePage(ctx, scope, nowNS, 0, "", limit)
+}
+
+// CountDueForPurge reports how many objects are in the automatic purge queue.
+func (s *Store) CountDueForPurge(ctx context.Context, scope domain.ScopeID, nowNS int64) (int64, error) {
+	var n int64
+	err := s.queryRow(ctx, "SELECT COUNT(*) FROM items i"+purgeQueueWhere, string(scope), nowNS).Scan(&n)
+	if err != nil {
+		return 0, errs.Wrap(errs.CodeDBError, err)
+	}
+	return n, nil
 }
 
 // PurgeQueuePage returns one page of due objects using a keyset cursor.
@@ -243,11 +271,7 @@ func (s *Store) PurgeQueuePage(ctx context.Context, scope domain.ScopeID, nowNS 
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.read(ctx, "SELECT "+prefixedItemColumns("i")+`
- FROM items i
- WHERE i.scope_id=? AND i.state='quarantined' AND i.pending_op_id IS NULL
-   AND i.reason='lifecycle'
-   AND i.purge_not_before_ns IS NOT NULL AND i.purge_not_before_ns <= ?
+	rows, err := s.read(ctx, "SELECT "+prefixedItemColumns("i")+" FROM items i"+purgeQueueWhere+`
    AND (i.purge_not_before_ns > ? OR (i.purge_not_before_ns = ? AND i.item_id > ?))
  ORDER BY i.purge_not_before_ns, i.item_id LIMIT ?`,
 		string(scope), nowNS, afterDue, afterDue, afterItem, limit)

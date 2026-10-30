@@ -136,15 +136,36 @@ func scopeShow(ctx context.Context, a *app, args []string) (output, error) {
 		return output{}, err
 	}
 
-	obs, _ := a.store.CountObservations(ctx, sc.ID)
-	planned, _ := a.store.CountItemsByState(ctx, sc.ID, domain.StatePlanned)
-	quarantined, _ := a.store.CountItemsByState(ctx, sc.ID, domain.StateQuarantined)
-	held, _ := a.store.CountItemsByState(ctx, sc.ID, domain.StateHeld)
-	unknown, _ := a.store.CountItemsByState(ctx, sc.ID, domain.StateUnknown)
+	// The counts are reads that either succeed or stop the command. Ignoring the
+	// error here would print an empty scope whenever the database could not be
+	// read, which is the one reading a person must not get from this command.
+	obs, err := a.store.CountObservations(ctx, sc.ID)
+	if err != nil {
+		return output{}, err
+	}
+	planned, err := a.store.CountItemsByState(ctx, sc.ID, domain.StatePlanned)
+	if err != nil {
+		return output{}, err
+	}
+	quarantined, err := a.store.CountItemsByState(ctx, sc.ID, domain.StateQuarantined)
+	if err != nil {
+		return output{}, err
+	}
+	held, err := a.store.CountItemsByState(ctx, sc.ID, domain.StateHeld)
+	if err != nil {
+		return output{}, err
+	}
+	unknown, err := a.store.CountItemsByState(ctx, sc.ID, domain.StateUnknown)
+	if err != nil {
+		return output{}, err
+	}
+	due, err := a.store.CountDueForPurge(ctx, sc.ID, a.clock.Wall().UnixNano())
+	if err != nil {
+		return output{}, err
+	}
 	protections, _ := a.store.ListProtections(ctx, sc.ID, true)
 	rules, _ := a.store.ListRules(ctx, sc.ID)
 	grants, _ := a.store.ListGrants(ctx, sc.ID)
-	due, _ := a.store.ItemsDueForPurge(ctx, sc.ID, a.clock.Wall().UnixNano(), 1000)
 
 	out := ok()
 	out.ScopeID = string(sc.ID)
@@ -154,7 +175,7 @@ func scopeShow(ctx context.Context, a *app, args []string) (output, error) {
 		"items": map[string]int64{
 			"planned": planned, "quarantined": quarantined, "held": held, "unknown": unknown,
 		},
-		"due_for_purge": dueCount(due),
+		"due_for_purge": due,
 		"protections":   protections,
 		"rules":         rules,
 		"grants":        grants,
@@ -164,7 +185,7 @@ func scopeShow(ctx context.Context, a *app, args []string) (output, error) {
 		"  root:        " + string(sc.RawRoot),
 		fmt.Sprintf("  generation:  %d   protection revision: %d", sc.Generation, sc.ProtectionRevision),
 		fmt.Sprintf("  observed:    %d file(s)", obs),
-		fmt.Sprintf("  quarantine:  %d object(s), %d due for purge", quarantined, dueCount(due)),
+		fmt.Sprintf("  quarantine:  %d object(s), %d due for purge", quarantined, due),
 		fmt.Sprintf("  awaiting:    %d planned, %d held, %d unknown", planned, held, unknown),
 		fmt.Sprintf("  rules:       %d revision(s), grants: %d", len(rules), len(grants)),
 		"  created:     " + time.Unix(0, sc.CreatedAtNS).Format("2006-01-02 15:04:05"),
@@ -174,8 +195,6 @@ func scopeShow(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	return out, nil
 }
-
-func dueCount(items []store.Item) int { return len(items) }
 
 // scopePause changes only the database status of one scope. It still takes the
 // instance lock, because a run reads that status to decide what to touch.

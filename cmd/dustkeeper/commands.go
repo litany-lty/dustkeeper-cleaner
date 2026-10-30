@@ -386,7 +386,14 @@ func cmdStatus(ctx context.Context, a *app, args []string) (output, error) {
 	if err != nil {
 		return output{}, err
 	}
-	lastRun, _ := a.store.MetaGet(ctx, "last_run_ns")
+	// Every number below is a read that either succeeded or stops the command.
+	// A swallowed error becomes a zero on screen, and a zero in this view reads
+	// as "nothing is backed up" - the opposite of what a failing database means.
+	lastRun, err := a.store.MetaGet(ctx, "last_run_ns")
+	if err != nil {
+		return output{}, err
+	}
+	nowNS := a.clock.Wall().UnixNano()
 
 	type scopeStatus struct {
 		ScopeID     string `json:"scope_id"`
@@ -398,16 +405,27 @@ func cmdStatus(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	var rows []scopeStatus
 	for _, sc := range scopes {
-		obs, _ := a.store.CountObservations(ctx, sc.ID)
-		q, _ := a.store.CountItemsByState(ctx, sc.ID, domain.StateQuarantined)
-		due, _ := a.store.ItemsDueForPurge(ctx, sc.ID, a.clock.Wall().UnixNano(), 1)
+		obs, err := a.store.CountObservations(ctx, sc.ID)
+		if err != nil {
+			return output{}, err
+		}
+		q, err := a.store.CountItemsByState(ctx, sc.ID, domain.StateQuarantined)
+		if err != nil {
+			return output{}, err
+		}
+		// Counted, not len(ItemsDueForPurge(..., 1)): the page size is not a
+		// backlog size, and "one" was reported for every backlog of one or more.
+		due, err := a.store.CountDueForPurge(ctx, sc.ID, nowNS)
+		if err != nil {
+			return output{}, err
+		}
 		rows = append(rows, scopeStatus{
 			ScopeID:     string(sc.ID),
 			Kind:        sc.Kind,
 			Status:      sc.Status,
 			Observation: obs,
 			Quarantined: q,
-			Due:         int64(len(due)),
+			Due:         due,
 		})
 	}
 
@@ -545,7 +563,7 @@ func cmdResume(ctx context.Context, a *app, args []string) (output, error) {
 // cmdRun performs one bounded background pass.
 func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 	fs := flagset("run", io.Discard)
-	dryRun := fs.Bool("dry-run", false, "reconcile and report without scanning or applying")
+	dryRun := fs.Bool("dry-run", false, "list pending operations without reconciling, scanning or applying")
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
 	}
