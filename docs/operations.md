@@ -37,7 +37,8 @@ dustkeeper version
 
 第一步用 `SHA256SUMS` 核对二进制字节，第二步核对这份清单说的是哪个 commit、哪个 target：
 清单里的 `commit` 是二进制的内嵌值，不是文档写的值。macOS 上把最后两行的文件名换成
-`dustkeeper-1.0.0-phase1-darwin-arm64`。
+`dustkeeper-1.0.0-phase1-darwin-arm64`；写 `/usr/local/bin` 一般要 `sudo`，你也可以装到自己的
+`~/.local/bin`（记得在 `schedule render` 之前装好，模板记的是那个位置的绝对路径）。
 
 `version` 的输出里带 `commit`，应当与清单里的 `commit` 一致——不一致说明装错了文件。
 
@@ -419,7 +420,7 @@ dustkeeper resume     # 清除标记
 systemctl --user disable --now dustkeeper.timer      # macOS: launchctl bootout gui/"$(id -u)" ...
 dustkeeper pause
 dustkeeper status                                    # pending_operations 必须为 0，且没有 run 在跑
-ps -o pid,command -p "$(cat "$STATE/instance.lock" 2>/dev/null)" 2>/dev/null   # 应当没有输出
+lsof "$STATE/instance.lock"                          # 应当没有输出：有输出说明还有进程持有这把锁
 
 # 2) 数据库用 SQLite 自己的备份，不要 cp 一个正在写的文件
 sqlite3 "$STATE/state.db" ".backup '/backup/state.db'"
