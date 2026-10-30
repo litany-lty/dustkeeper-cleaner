@@ -87,7 +87,7 @@ C01–C08 之后又补了两个收尾提交：`ff3d0f0`（A09 的故障矩阵）
 |---|---|---|---|---|
 | C01 自定义目的地恢复被误拒 | `0ff6fa0`：`checkContractBinding` 按**写合同的动作用**读路径——restore 合同记的是批准的目的地，只校验它是合法相对路径（`fsops.SplitRelative`），不再要求等于 `item.RawRelative`；目的地目录身份仍由 `reconcileRestore` 完成分支与 `contract.DestParentIdentity` 比对 | 回退 `internal/recovery/reconcile.go`：`TestACustomDestinationRestoreThatNeverHappenedIsAborted` 与 `...ThatHappenedIsCompleted` 都停在 `Outcome: held`、`Detail: RESTORE_CONTRACT_UNREADABLE: RECOVERY_REQUIRED: the contract names path "recovered/a.zip", but the item is "a.zip"`——rename 之前中断和之后中断都进终结 hold | 通过：未移动 → aborted（文件留在原处），已移动 → completed（目的地在位、身份一致） | — |
 | C02 held 对象无法从正式入口恢复 | `0ff6fa0`：`quarantine restore` 的前置状态改为 `quarantined \| held`，其余门禁（pending、已捕获证据、目的地占用、身份核对）一条不减；不新增"强制恢复"，也不把 held 改写成 quarantined | 回退 `cmd/dustkeeper/cmd_object.go`：真实 CLI 退出 4，`ITEM_NOT_FOUND`，`object obj_… is held, not quarantined`（`TestQuarantineRestoreTakesAHeldObjectOutOfTheVault`） | 通过：held 对象经正式入口恢复，且 scope 的 hold 随之释放；目的地被占用、对象进行中仍被拒（同文件另两条） | — |
-| C03 暂存库在 SQLite 写入前未验证 | `6f250cc`：`prepareStaging` 在 `sql.Open` 之前——不存在则 `O_CREAT\|O_EXCL\|O_NOFOLLOW\|O_CLOEXEC`、0600（关掉 check→open 的替换窗口）；已存在要求 `S_IFREG`、`Nlink==1`、`Uid==euid`、`mode&0o022==0`；0 字节视为"停在第一页之前"可续；否则 `checkResumableStaging` 读 100 字节头，要求 `SQLite format 3\0` 且 `user_version <= migrations.CurrentVersion`。**2026-10-29 收尾**：版本号不再当作归属证明——`requireOwnStagingSchema` 在写第一个 pragma 之前，把文件连同 `-journal`/`-wal` 复制进私有临时目录，读出 `sqlite_master` 与 `meta`，与本 build 用同一批 migration 重放出来的期望形状逐项比对（对象名、meta 行，并要求 `meta` 之外的每个表都是空的），不匹配就 `RECOVERY_REQUIRED`，原文不动 | 干净旧树 + `/tmp/c03c04` 临时用例：暂存名是软链、指向 `user_version=99` 的 WAL 库 → `CE: the symlink target was modified (journal byte 2 -> 1)`，即旧代码照着写进了别人的文件；回退 `internal/store/store.go` 到 `8857f11`：`TestAForeignDatabaseAtTheStagingNameIsRefused` 报 "a foreign database at the staging name was adopted as this installation"，真实 CLI 那条的 `init` 直接给出 `"status": "ok"`（即 `customer_records` 被收编并发布成 `state.db`），`TestAUsedDatabaseAtTheStagingNameIsNotAdopted` 同样被接受 | 通过：`TestAStagedSymlinkIsRefusedBeforeAnythingIsWritten`（目标字节不变、仍是 symlink）、`TestAStagedHardLinkIsRefused`、`TestAStagedFileThatIsNotADatabaseIsRefused`、`TestAForeignDatabaseAtTheStagingNameIsRefused`（字节与 inode 不变、不生成 `state.db`）、`TestAUsedDatabaseAtTheStagingNameIsNotAdopted`、真实 CLI 的 `TestInitRefusesAForeignDatabaseAtTheStagingName`；正例 `TestAFinishedButUnpublishedStagingIsResumed` 与 `TestAnInterruptedFirstInstallationResumes`（000/001/002）新旧都通过 | — |
+| C03 暂存库在 SQLite 写入前未验证 | `6f250cc`：`prepareStaging` 在 `sql.Open` 之前——不存在则 `O_CREAT\|O_EXCL\|O_NOFOLLOW\|O_CLOEXEC`、0600（关掉 check→open 的替换窗口）；已存在要求 `S_IFREG`、`Nlink==1`、`Uid==euid`、`mode&0o022==0`；0 字节视为"停在第一页之前"可续；否则 `checkResumableStaging` 读 100 字节头，要求 `SQLite format 3\0` 且 `user_version <= migrations.CurrentVersion`。**2026-10-29 收尾**：版本号不再当作归属证明——`requireOwnStagingSchema` 在写第一个 pragma 之前，把文件连同 `-journal`/`-wal` 复制进私有临时目录，读出 `sqlite_master` 与 `meta`，与本 build 用同一批 migration 重放出来的期望形状逐项比对（每个对象的 `type`/`name`/`tbl_name`/`sql` 定义、`meta` 行，以及 `meta` 之外的行数与基准一致——业务表为空，SQLite 自己的簿记表如 `sqlite_sequence` 可能有记录），不匹配就 `RECOVERY_REQUIRED`，原文不动。**2026-10-30 补定义比较**：`e7e779f` 之前只比 `type`/`name`，"同名对象、不同定义"能通过——`ALTER TABLE grants RENAME COLUMN approved_at_ns TO approved_at_legacy` 之后版本、对象名、`meta` 行、行数全不变，而 `migrate()` 看到版本已到位直接返回，真实授权查询报 `no such column: approved_at_ns`。现在 `sqlite_master` 连 `tbl_name` 与 `sql` 一起读（`COALESCE` 把 NULL 折成空串，两侧同一规则），逐对象比较，期望值仍由 migrations 重放得到 | 干净旧树 + `/tmp/c03c04` 临时用例：暂存名是软链、指向 `user_version=99` 的 WAL 库 → `CE: the symlink target was modified (journal byte 2 -> 1)`，即旧代码照着写进了别人的文件；回退 `internal/store/store.go` 到 `8857f11`：`TestAForeignDatabaseAtTheStagingNameIsRefused` 报 "a foreign database at the staging name was adopted as this installation"，真实 CLI 那条的 `init` 直接给出 `"status": "ok"`（即 `customer_records` 被收编并发布成 `state.db`），`TestAUsedDatabaseAtTheStagingNameIsNotAdopted` 同样被接受；再回退到 `4e35267`（保留新用例）：`TestAStagingDatabaseWithADifferentDefinitionIsRefused` 报 "a staging database with a renamed column was adopted as this installation"，CLI 那条的 `init` 又给出 `"status": "ok"` | 通过：`TestAStagedSymlinkIsRefusedBeforeAnythingIsWritten`（目标字节不变、仍是 symlink）、`TestAStagedHardLinkIsRefused`、`TestAStagedFileThatIsNotADatabaseIsRefused`、`TestAForeignDatabaseAtTheStagingNameIsRefused`（字节与 inode 不变、不生成 `state.db`）、`TestAUsedDatabaseAtTheStagingNameIsNotAdopted`、`TestAStagingDatabaseWithADifferentDefinitionIsRefused`（改列名后拒绝，消息同时给出两边的定义窗口）、真实 CLI 的 `TestInitRefusesAForeignDatabaseAtTheStagingName` 与 `TestInitRefusesAStagingDatabaseWhoseDefinitionDiffers`；正例 `TestAFinishedButUnpublishedStagingIsResumed` 与 `TestAnInterruptedFirstInstallationResumes`（000/001/002）新旧都通过 | — |
 | C04 只读入口会把损坏库重建成空库 | `6f250cc`：新增 `store.OpenExisting`——缺失 → `INVALID_ARGUMENT`，零字节 → `RECOVERY_REQUIRED` 并明说"没有创建、没有删除、没有重建"；随后统一走 `openPublished`（`CheckSupportedState` + `requireCurrentSchema` + pragma + chmod）。`app.openStore` 改用 `OpenExisting` 并要求 `instance_id` 存在。`Open` 的创建语义只留给 `init` | 干净旧树：把 `state.db` 截成 0 字节后跑真实 `status` → 旧代码 exit 0、`"status": "ok"`、零 scope 零对象 | 通过：`TestStatusRefusesATruncatedStateDatabase`（非零退出、`RECOVERY_REQUIRED`、消息含 "zero bytes"、size 0 与 inode 不变、无 `.init` 残留、二次运行仍失败）、`TestStatusRefusesADatabaseWithoutAnInstanceIdentity` | — |
 | C05 补偿收尾分两次提交 | `0ff6fa0`：`AbortIntentReleasingHold` / `CompleteRestoreReleasingHold` + `releaseScopeHoldTx`，把 item 终结与该 scope `held → needs_reapproval` 放进同一事务；`releaseScopeHoldTx` 三个条件——只动 `status='held'` 的 scope、只在该 scope 无其它未解决 item（`pending_op_id IS NOT NULL OR state IN ('held','unknown','q_intent','r_intent','p_intent')`）时动、只落到 `needs_reapproval`（绝不直接 active）。**2026-10-29 收尾**：`tryCompensate` 改带真实 error （intent 写不进、abort 写不进、终态事务失败、keeper 依赖没释放），`miscapture` 对真实存储失败透传 `STATE_WRITE_FAILED`/`DB_ERROR` 并置 `stop_run`，结果行的 code/message/state 都按记录里的事实写；“原路径被占用，所以无法补偿”仍是 HELD | 回退 `internal/store/intents.go`、`internal/store/scopes.go`、`internal/execute/quarantine.go`、`internal/execute/restore.go`：补偿后中断 → `the scope is held: the object is back but the scope still refuses 'scope resume'`；正常恢复 held 对象 → `the scope is held after its held object was restored`；再回退 `internal/execute/quarantine.go` 到 `8857f11`（保留新用例）：终态事务被 trigger 弄失败时，结果行是 `Code:HELD Message:"…nothing was overwritten and the captured object can be restored explicitly" Control:stop_scope`——文件其实已经回到原位，而且整轮继续跑进了下一个 scope（`beta` 隔离了 1 个对象），报告里同时出现 `HELD` 和 `STATE_WRITE_FAILED: the scope update was refused` | 通过：补偿由对账收尾、补偿当场收尾、恢复 held 对象三条都会释放 hold；同一 scope 还有别的 held 对象时不释放；`TestACompensationWhoseRecordCannotBeClosedStopsTheRun`（trigger 让终态事务里的 scope 更新失败：结果是 `STATE_WRITE_FAILED` + `stop_run`、item 停 `r_intent`、pending 保留、文件已回原位、同批第二个对象 `PAUSED`，解除故障后对账一轮收尾、第二轮无事可做）与 `TestACompensationStorageFailureStopsTheWholeRound`（整轮：报告 `FailureCode=STATE_WRITE_FAILED`、`Control=stop_run`、排在后面的 scope 零对象、文件未动） | 已完成补偿却死在两次提交之间的**历史**状态仍然存在，但不再需要人工改库：`scope resume --accept-stale-hold` 只在该 scope 已无任何未解决对象时才接受，仍有 held/parked/intent 对象时一律拒绝（见 §1.2 末段与 `cmd/dustkeeper/scope_stale_hold_test.go` 三条）。`TestACompensatedMiscaptureSettlesItemAndScopeTogether` 在旧代码上也能通过（旧码两次写都成功），只作守卫，不作反证 |
 | C06 Q 对账未接绑定、P 对账 prior 检查晚 | `0ff6fa0`：Q 分支改用 `r.operationContract(po)`（与 P 同一条合同读取与绑定检查）；P 分支在 `priorStateOf` 之后立刻判 `!priorKnown → RECOVERY_REQUIRED`，不再只在"对象仍在"分支里判 | 回退 `reconcile.go`：Q 合同绑到别的路径 → `Outcome: aborted` / `the file was never moved`；P 缺 prior 且对象已消失 → `Outcome: completed` / `RECONCILED_ABSENT` | 通过：绑错的 Q 合同不消费（记 `INTENT_CONTRACT_UNREADABLE`），缺 prior 的 P 不产出结论；合同完整的 P 仍记 `RECONCILED_ABSENT` | — |
@@ -130,9 +130,11 @@ C01–C08 收尾时还留着两件，它们不是新缺陷，是上一轮如实�
 `7b951be`（C05）；逐条修改、反例与结果并进 §1.2 的 C03/C05 两行，这里只写结论和边界。
 
 **C03：能续建的条件，是"这是本程序的初始化残留"，不是"版本数字在范围内"。**
-判定放在写第一个 pragma 之前，答案来自文件本身：对象名、meta 行要与本 build 用同一批 migration
-重放出来的形状一致，且 `meta` 之外的每个表都为空。允许的四种状态正好是产品会产生的四种——全新文件、
-0 字节（停在第一页之前）、001/002/003 任一点被打断、以及走完全部迁移但还没 link 的暂存库；
+判定放在写第一个 pragma 之前，答案来自文件本身：每个对象的 `type`/`name`/`tbl_name`/`sql`
+定义、`meta` 行，都要与本 build 用同一批 migration 重放出来的形状一致；`meta` 之外的行数也要
+与基准相同——业务表为空，SQLite 自己的簿记表（`sqlite_sequence`）该有的那一行照样在基准里。
+允许的四种状态正好是产品会产生的四种——全新文件、0 字节（停在第一页之前）、
+001/002/003 任一点被打断、以及走完全部迁移但还没 link 的暂存库；
 其余一律拒绝，原文不动，代码是 `RECOVERY_REQUIRED`（不是 `DURABILITY_FAILED`：字节没坏，
 缺的是"这文件是本程序的"这个证明，该由放文件的人决定怎么处理）。
 
@@ -143,7 +145,8 @@ C01–C08 收尾时还留着两件，它们不是新缺陷，是上一轮如实�
 
 边界说清楚：这条检查证明的是"schema 与内容都是本 build 初始化会产生的样子"，不是密码学意义上的
 认证。一个逐字节复制自本程序暂存库的文件会被接受——它确实就是初始化残留，接受是对的。
-要更强只能改磁盘格式或加签名，那是复核明确排除的范围。
+要证明字节确实出自本程序（而不是别人复制过来的一份）需要签名或换磁盘格式，那不在本期范围；
+本轮补的是比较本身不完整（只看名字不看定义），不是"没有签名"这件事。
 
 **C05：存储错误保持它自己的码和停止范围。**
 补偿的终态事务失败时，调用方原来把它转成一句话、返回 false，外层于是报 HELD。HELD 在控制表里
@@ -162,6 +165,34 @@ COMMIT 阶段的失败走的是 `store.write` 同一个出口（`commit failed: 
 不用回放冒充）；A09 里"数据 fsync/barrier 失败"和"Q/R/P 终态事务内部失败"两个分支（见 A09 行的
 范围说明）。这两件都不影响本期"已批准离线规则驱动的确定性清理器"这个交付口径，
 但也不能算作已验收。
+
+### 1.5 C03 的最后一小口：定义也是 schema 的一部分（2026-10-30，基于 `4e35267`）
+
+复核在 §3.2 指出：上一轮的比较只读 `type`/`name`，证明的是"这些对象在"，不是"这些对象长这样"。
+一个用仓库原样 001–003 建出来的合法 v3 暂存库，只要执行一句
+
+```sql
+ALTER TABLE grants RENAME COLUMN approved_at_ns TO approved_at_legacy;
+```
+
+版本号、对象集合、`meta` 行、非 `meta` 行数就全部保持不变，旧检查因此逐项通过；而 `migrate()`
+看到版本已到位直接返回，缺的列不会被补，真实授权查询报 `no such column: approved_at_ns`。
+这不是"有人伪造了库"，是把一个看起来完全正常的库接受成可续建的初始化残留。
+
+改法（`e7e779f`）：`sqlite_master` 连 `tbl_name` 与 `sql` 一起读，逐对象比较
+`(type, name, tbl_name, sql)`；`COALESCE` 把 NULL 折成空串，副本与重放两侧走同一规则；期望值
+仍然由同一批 migrations 在内存里重放得到，没有第二份表名或列名清单。拒绝消息给出的是两边的
+差异窗口而不是前缀——被改的列在 `CREATE TABLE` 末尾，前缀会把唯一有用的那一段截掉。
+
+反证：回退 `internal/store/store.go` 到 `4e35267`、保留新用例，`TestAStagingDatabaseWithADifferentDefinitionIsRefused`
+报 "a staging database with a renamed column was adopted as this installation"，真实 `init`
+（`TestInitRefusesAStagingDatabaseWhoseDefinitionDiffers`）又给出 `"status": "ok"`，即改名后的库
+被发布成 `state.db`。正例不变：000/001/002 与"完成但未发布"三种续建新旧都通过，加严没有误拒
+合法续建。两条新用例都断言原文件的字节与 inode 不变、不生成 `state.db`。
+
+这项之后，一期没有已知的遗留修补项；C05 按上一轮证据关闭，本轮没有再动 `internal/execute`。
+复核同时明确了二期边界（保留隔离区布局、ManifestV1、Q/R/P 恢复合同，允许有限 schema 升级，
+不提高全局 `BindingVersion`），设计见 `docs/phase2-design.md`。
 
 ## 2. 本轮实跑（2026-10-29，darwin/arm64, APFS）
 

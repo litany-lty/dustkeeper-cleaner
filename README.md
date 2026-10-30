@@ -15,6 +15,10 @@
 > 模型能力仍未验收（A12 的唯一缺口）。**
 > 逐条结论见 [`docs/compliance.md`](docs/compliance.md) 的 FINAL 状态表（A01–A12）。
 > 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
+>
+> 二期的边界与设计已经单独成文：[`docs/phase2-design.md`](docs/phase2-design.md)（JEV 初判 + LLM 复核
+> 约束新隔离、`schema 4` 的有限升级、共用执行器的校验点、失败矩阵与验收语料）。那份文档是设计，
+> 不是已实现能力——真实模型部分明确标为未验证。
 
 ```
 dustkeeper init
@@ -185,6 +189,7 @@ checksum、这份制品实际跑过哪些动作。发布清单来自这些事实
 - [`docs/operations.md`](docs/operations.md)：安装、定时任务、恢复流程、故障处理、备份与卸载。
 - [`docs/architecture.md`](docs/architecture.md)：模块边界、状态机、对账矩阵、跨平台文件操作。
 - [`docs/compliance.md`](docs/compliance.md)：FINAL 状态表（A01–A12）与证据；旧清单已标为历史。
+- [`docs/phase2-design.md`](docs/phase2-design.md)：二期设计（模型复核约束新隔离、schema 4 升级、失败矩阵、验收语料）。
 - [`docs/evidence/`](docs/evidence/)：扫描/资源实测的原始 JSON 与摘要。
 - [`packaging/`](packaging/)：`install.sh` / `uninstall.sh`，在目标机器上渲染并安装定时任务模板。
 
