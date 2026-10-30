@@ -30,7 +30,7 @@ FINAL-1.0 之后按两份独立复核报告修补：D01–D14（基于 `9d9af21`
 | A09 | 故障可收敛 | 通过 | 已有：`TestReconcileRetriesEveryActionUntilTheScopeIsFree`（临时故障连续两轮不终结，解除后完成）、`TestReconcileCompletesACrashedQuarantine`（中断恢复）、`TestCrashDiscoveredMiscaptureRecordsTheActualObject`、`TestWrongCaptureIsPutBackWithProtections`、`TestCompensationCrashReturnsToTheHold`、`TestSlimTwoPurgeRoutesAgree`（同一初始状态下 `purge apply` 与 `plan apply` 逐字段相同）。D02/D03/D06/D07/D08 `27c65e4` 补了"证据成立才收敛"的一半：验证窗口内被改动的源被拒（`CodePlanStale`，不写成 Held）、不可读的 manifest/vault 对象 park 而不是当结论、stat 失败的源不算证据、合同坏/绑错/无 prior 状态一律不猜、补偿成功收敛为 `StateRestored` + scope 需重新确认、目录同步失败的 manifest 被撤回。C01/C05/C06 `0ff6fa0` 继续同一方向：restore 合同里的路径按"批准的目的地"解释（自定义目的地不再被误拒、目的地身份照旧比对）、补偿收尾与 scope 放行同一事务（中断不会留下"对象回来了但 scope 仍拒绝 resume"）、Q 对账也走同一条合同绑定检查且 P 缺 prior 时两种结果都不产出结论。**2026-10-29 补齐**：Q/R/P 各自"系统调用已经成功、终态记录没写成"的矩阵已建。故障点是一个具名钩子 （`internal/execute/hooks.go` 的 `TestHookBeforeComplete`，按动作名决定是否失败，生产路径为 nil），不是通用注入框架；三条用例都从真实执行路径进入——`TestAQuarantineWhoseRecordFailedIsFinishedByReconcile`、`TestARestoreWhoseRecordFailedIsFinishedByReconcile`、`TestAPurgeWhoseRecordFailedIsFinishedByReconcile`——先断言失败后的样子（对象已经在目标位置、item 停在 `q_intent`/`r_intent`/`p_intent`、`pending_op_id` 仍在、结果里是 `STATE_WRITE_FAILED` 而不是成功），再跑两轮对账：第一轮 `Completed=1` 且 `RecordFailures=0`，第二轮 `Examined=0`（重复"完成"同一操作说明第一轮写的结论记录看不见）。恢复成功的 Q 还额外核对它仍进得了清空队列，恢复成功的 R 不再出现在隔离队列里。**这三条在 `dd7c791` 的 `reconcile.go` 上也通过**，所以它们证明的是"现在这种状态可收敛"，不宣称在旧版上复现过错误行为——A09 缺的是证据，不是缺陷。**口径要说准**：钩子位于文件系统动作与其同步**之后**、终态事务**之前**，所以补的是"complete 前窗口"，不是完整的"同步/complete 矩阵"。没有注入过 Q/R/P 的数据 fsync、目录 flush 或 durability barrier 失败（那一路的证据只有 manifest 目录 flush 的 `TestAManifestThatCannotBeFlushedIsWithdrawn`，是协议里的另一个点），Q/R/P 终态事务**内部**的 UPDATE/COMMIT 失败也没有注入——唯一在事务内部注入过失败的是补偿收尾那条 `TestACompensationWhoseRecordCannotBeClosedStopsTheRun`（trigger 让 scope 更新失败，整个事务回滚）。未实测的分支在这里单列，不用这三条测试替它们记账。 |
 | A10 | 扫描完整性诚实 | 通过 | F4 `0f9a371`：`TestSlimIncompleteScanKeepsTheEpochOpen`（去掉 `unverifiedCount > 0` 分支后报 "an entry that could not be inspected completed the epoch"）、`TestSlimVanishedEntryIsNotAFailure`（ENOENT 只记 vanished，目录照常完成）、`TestSlimIncompleteScopeStartsNoAutomaticQuarantine`（去掉 `!scanState.Complete` 分支后报 "collected 2 objects"）、`TestAFailedDirectoryCannotCompleteTheEpochOrRetireItsOwnObservations`。 |
 | A11 | 诊断不修改他人文件、不虚报缺失 | 通过 | F4 `0f9a371`：`internal/diag` 六个拒绝用例（symlink / FIFO / 宽权限 / 硬链 / 目录 / 设备，全部 `ErrNotPrivate` 且原对象字节与 mode 不变）+ `TestAPrivateLogIsCreatedAndStillRotates`；`internal/rescue`：`TestSlimRescueEntryLevelUnverified`、`TestSlimRescueDirectoryLevelUnverified`（回退成 `read` 即报 `object_state="read", want "partial"`）、`TestSlimRescuePartialManifestsDoNotBecomeOrphans`、`TestAnUnreadableObjectsDirectoryDoesNotClaimTheObjectsAreGone`。D12 `e14855c`：日志目录持 FD 并校验（拒 symlink/非目录/group-other 可写/非本人），创建与轮转都相对该 FD（`TestASymlinkedLogDirectoryIsRefusedAndItsTargetUnchanged`、`TestARotatedNameStaysInsideTheVerifiedDirectory`）。D13 `e14855c`：`readManifests` 只有 ENOENT 才算 missing，orphan 判定排除 partial 与 unreadable；零计数 + 目录不可读也 `RECOVERY_REQUIRED`（`TestRecoverInspectDoesNotCallObjectsOrphansWhenManifestsAreUnreadable`、`TestRecoverInspectWithNoEntriesAndAnUnreadableDirectoryStillFails`）。 |
-| A12 | 有限发布证据 | 部分 | 两个目标都有 checksum 与真实执行记录（§3）：都由 CI 的原生 runner 产出并冒烟（`gh run 41022348788`，代码 `e54c9e8`——`fca60b8` 的 `status` 修复与随后文档的 HEAD——两 job 均 success），`darwin-arm64` `sha256=da4ebe56…5c82`、`linux-amd64` `sha256=32304403…a2f8`；`darwin` 那份字节还在本机跑过一次真实闭环（`docs/evidence/deployment-2026-10-30-darwin-arm64.md`：扫描→授权→隔离→恢复→再两轮，排除/保护样本未动、恢复后字节一致，launchd 已尝试但验收未通过，systemd 未执行）。更早的 `41003990196`（`d4dc8dc`）、`40880714185`（`7b9c2a1`）、`40848835280`（`2924938`）、`40845574824`（`3a7da29`）与 `40740165469`（`dd7c791`）同样两 job success，五份输出各自对应各自的 commit。两个平台的 `build`/`vet`/`test`/`race` 分别在本机与 CI 跑过，CI 每个 job 构建前先断言 runner 实际架构等于声明目标。10 万文件扫描完成性成立：wall 54.5 s、峰值 RSS 29.5 MiB ≤ 256 MiB（§2）。D14 `1ffbc43` 把发布门禁收紧到"证据与产物必须对得上"：libc 判定改读真实链接输入、Q/R 冒烟独立断言移动与内容、后段失败清理本轮产物、CI 归档本目标四个文件、宿主断言改用 `GOHOSTOS/GOHOSTARCH`。D14.4 的归档步骤六次 run 都实跑成功：`41022348788` 的 artifact `12962491110`（darwin-arm64）/ `12962321099`（linux-amd64），`41003990196` 的 `12954672344` / `12954219401`，`40880714185` 的 `12900272002`/`12900880692`，`40848835280` 的 `12886825025`/`12886401575`，`40845574824` 的 `12885305469`/`12884847000`，`40740165469` 的 `12838673841`/`12838009604`。**仍差一项**：真实模型的固定语料报告——本机没有获准端点，`test/eval` 保持 skip，不以 skip 当通过。因此这一组记部分。 |
+| A12 | 有限发布证据 | 部分 | 两个目标都有 checksum 与真实执行记录（§3）：都由 CI 的原生 runner 产出并冒烟（`gh run 41022348788`，代码 `e54c9e8`——`fca60b8` 的 `status` 修复与随后文档的 HEAD——两 job 均 success），`darwin-arm64` `sha256=da4ebe56…5c82`、`linux-amd64` `sha256=32304403…a2f8`；`darwin` 那份字节还在本机跑过一次真实闭环（`docs/evidence/deployment-2026-10-30-darwin-arm64.md`：扫描→授权→隔离→恢复→再两轮，排除/保护样本未动、恢复后字节一致，同一制品于当晚再由 `gui/501` 日历自然触发三轮成功，验收任务已卸载；systemd 仍未执行）。更早的 `41003990196`（`d4dc8dc`）、`40880714185`（`7b9c2a1`）、`40848835280`（`2924938`）、`40845574824`（`3a7da29`）与 `40740165469`（`dd7c791`）同样两 job success，五份输出各自对应各自的 commit。两个平台的 `build`/`vet`/`test`/`race` 分别在本机与 CI 跑过，CI 每个 job 构建前先断言 runner 实际架构等于声明目标。10 万文件扫描完成性成立：wall 54.5 s、峰值 RSS 29.5 MiB ≤ 256 MiB（§2）。D14 `1ffbc43` 把发布门禁收紧到"证据与产物必须对得上"：libc 判定改读真实链接输入、Q/R 冒烟独立断言移动与内容、后段失败清理本轮产物、CI 归档本目标四个文件、宿主断言改用 `GOHOSTOS/GOHOSTARCH`。D14.4 的归档步骤六次 run 都实跑成功：`41022348788` 的 artifact `12962491110`（darwin-arm64）/ `12962321099`（linux-amd64），`41003990196` 的 `12954672344` / `12954219401`，`40880714185` 的 `12900272002`/`12900880692`，`40848835280` 的 `12886825025`/`12886401575`，`40845574824` 的 `12885305469`/`12884847000`，`40740165469` 的 `12838673841`/`12838009604`。**仍差一项**：真实模型的固定语料报告——本机没有获准端点，`test/eval` 保持 skip，不以 skip 当通过。因此这一组记部分。 |
 
 结论：12 组里 **11 组通过、1 组部分（A12）、0 组未验收**；A12 的部分是真实模型语料报告缺失——
 本机没有获准端点，`test/eval` 保持 skip，不用回放或手写报告冒充。A09 记的是通过，但通过的范围
@@ -38,9 +38,10 @@ FINAL-1.0 之后按两份独立复核报告修补：D01–D14（基于 `9d9af21`
 两个分支仍未注入，不作为已实测。D14.4 原先的"CI 归档步骤未实跑"已由 `40740165469` 关闭（见 §1.1）。
 这些差别都写在这里，不用"结构齐全"顶替；也没有把未执行的检查算成通过。
 
-**当前交付状态：离线规则清理器已完成代码收口，进入维护；目标机自动调度仍未验收通过。**
-A12 的模型报告缺口仅描述该验收组，不代表整个部署只剩模型评测。模型能力暂缓，不阻断离线版本交付；
-macOS launchd 已尝试但失败，Linux systemd 未执行，部署证据与完成条件见 §3。
+**当前交付状态：离线规则清理器已完成代码收口，进入维护；macOS launchd 的独立测试范围调度验收已通过。**
+固定制品于 2026-10-30 北京时间 19:22、19:23、19:24 由 `gui/501` 日历自然触发，三轮均成功；验收任务已卸载，
+未保留正式清理调度。Linux systemd 尚无目标机，未执行。模型能力仍暂缓，不阻断离线版本交付；
+A12 的模型缺口与各平台部署状态分别记录，部署证据与完成条件见 §3。
 
 ### 1.1 复核报告 D01–D14 的修补（2026-10-29，基于 `9d9af21`）
 
@@ -391,16 +392,23 @@ artifact `12962491110`（`dustkeeper-darwin-arm64`，3 981 691 B）、
 
 | 制品 | checksum | 在哪里、真实执行过什么 | 源码测试能证明的 |
 |---|---|---|---|
-| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=da4ebe56d951c6c226d8c97a61901f02ec28eb4fc0a6a09540849e0dc9555c82`（artifact `12962491110`，3 981 691 B） | CI `macos-latest`（arm64）`./build/build.sh --release` 的冒烟；另在 macOS 26.5.2 / arm64 上用这份字节跑了一次真实闭环：临时目录 5 文件 → scan → rule enable → run → quarantine list → restore → 再两轮，排除/保护样本未动、恢复后字节一致、后续两轮 `quarantined=0`（记录见 `docs/evidence/deployment-2026-10-30-darwin-arm64.md`） | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、`status` 计数与读失败 |
+| `dustkeeper-1.0.0-phase1-darwin-arm64` | `sha256=da4ebe56d951c6c226d8c97a61901f02ec28eb4fc0a6a09540849e0dc9555c82`（artifact `12962491110`，3 981 691 B） | CI `macos-latest`（arm64）`./build/build.sh --release` 的冒烟；另在 macOS 26.5.2 / arm64 上用这份字节跑了一次真实闭环：临时目录 5 文件 → scan → rule enable → run → quarantine list → restore → 再两轮，排除/保护样本未动、恢复后字节一致、后续两轮 `quarantined=0`；同一制品又在独立 scope 中由 `gui/501` 于北京时间 19:22、19:23、19:24 自然触发三轮成功，验收任务已卸载（记录见 `docs/evidence/deployment-2026-10-30-darwin-arm64.md`） | 受控时钟下的到期 P、两条 purge CLI 等价、中断恢复、保护与预算拒绝、扫描完整性、`status` 计数与读失败 |
 | `dustkeeper-1.0.0-phase1-linux-amd64` | `sha256=32304403c706bb140077aae204bdb33529451d420b0611c5aae17a79ca85a2f8`（artifact `12962321099`，4 329 631 B） | CI `ubuntu-latest`（x86_64）容器内同一串动作 + `readelf` 断言 X86-64 / `interp=0` / `needed=0`，冒烟带独立断言（apply 后原路径不存在、restore 后字节一致） | 同一套源码测试在容器内 18 包 ok |
 
-这份候选的部署验收里，**调度那一项没有做成**：本机 `launchctl bootstrap`（`gui/501` 与 `user/501` 都试过）
-返回 `5: Input/output error`，`launchctl submit` 也没有产生作业；没有 Linux 目标机，systemd 同样未做。
-macOS 调度状态是"已尝试但验收未通过，根因未定位"；Linux 是"未执行"，没有拿命令序列或 CI 冒烟顶替。
-到期永久删除也没有在真实时间轴上发生过（保留期 30 天），那一半只有受控时钟的用例。
+这份候选的**macOS 调度验收现已通过**：2026-10-30 重新下载同一 CI artifact 并核对上述完整 SHA-256，
+未重新构建；复用 `/tmp/dk-accept-ci` 的独立 scope、state/config（模型关闭），由 `gui/501` 在北京时间
+19:22、19:23、19:24 自然触发三轮。三轮均 `code=OK` / `exit=0` / `control=continue`，`launchd runs=1/2/3`，
+Q/P 均为 0；五文件的 SHA-256、inode、mtime、size 与配置哈希均保持不变，pending 为 0。验收后 `bootout`
+成功，作业找不到、验收 plist 已移除，未保留正式自动清理任务。完整现场和原始记录位置见
+`docs/evidence/deployment-2026-10-30-darwin-arm64.md` §5。
+
+初次 `launchctl bootstrap` 返回错误 5 的历史记录保留：本次未复现，仍不能反推旧根因，也没有为本次验收修改
+产品代码或系统隐私授权。Linux systemd 尚无目标机，仍未执行。到期永久删除也没有在真实时间轴上发生过（保留期
+30 天），那一半只有受控时钟的用例。
 
 **部署完成条件：**在实际使用的平台，以现有系统定时器成功拉起固定候选制品，记录正确用户、配置路径与运行结果，
-并确认后续两轮仍由调度器正常执行。只补该平台的部署验证，不新增服务或重开代码整改；其它平台保持未验证说明。
+并确认后续两轮仍由调度器正常执行。该条件已在 macOS 的独立五文件 scope 中满足；本次验证不等于已为正式目录
+安装长期自动清理任务，Linux 继续保持未验证说明。
 
 本机另有一份同源构建（`fca60b8`，`sha256=303ad908…d143`），同一串步骤逐项结果相同；checksum 不同是因为
 嵌了不同的 commit 与构建时间，不是两份不同的代码。它不作为交付制品，只作为"换成 CI 字节后结论不变"的对照。
