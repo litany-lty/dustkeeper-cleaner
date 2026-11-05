@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -51,7 +52,8 @@ func main() {
 	if err := runSmoke(*artifact, *work); err != nil {
 		fatalf("%v", err)
 	}
-	fmt.Println("review smoke: keep retained the source; allowed quarantine restored identical bytes")
+	fmt.Println("review smoke: keep retained the source; allowed quarantine restored identical bytes; " +
+		"one mixed batch deleted one file, observed one and left one where it was")
 }
 
 func fatalf(format string, args ...any) {
@@ -86,6 +88,9 @@ func runSmoke(artifact, work string) error {
 	models.allow.Store(true)
 	if err := runPhase(artifact, filepath.Join(work, "allow"), server.URL, caFile, models, true); err != nil {
 		return fmt.Errorf("allow phase: %w", err)
+	}
+	if err := runMixedBatch(artifact, filepath.Join(work, "mixed"), server.URL, caFile, models); err != nil {
+		return fmt.Errorf("mixed batch: %w", err)
 	}
 	return nil
 }
@@ -186,35 +191,36 @@ func (c commandEnv) mustRun(label string, args ...string) (commandResult, error)
 	return result, nil
 }
 
-func runPhase(artifact, dir, serverURL, caFile string, models *fakeModels, allow bool) error {
+// install is one private installation of the artifact: its own tree, state
+// directory, configuration and home. A phase reads and writes nothing outside
+// it, so two phases in one smoke cannot see each other's files or database, and
+// nothing the smoke does is visible to an installation on the same machine.
+type install struct {
+	dir  string
+	tree string
+	cli  commandEnv
+}
+
+func newInstall(artifact, dir, serverURL, caFile string) (install, error) {
 	for _, sub := range []string{"tree", "state", "config", "home"} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
-			return err
+			return install{}, err
 		}
 	}
 	dir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		return err
-	}
-	tree := filepath.Join(dir, "tree")
-	source := filepath.Join(tree, "old.zip")
-	if err := os.WriteFile(source, []byte(smokePayload), 0o600); err != nil {
-		return err
-	}
-	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-	if err := os.Chtimes(source, old, old); err != nil {
-		return err
+		return install{}, err
 	}
 	// No evidence file and no retained copy: the release smoke exercises the
 	// ordinary path, where the program measures the facts itself.
 	credentials := filepath.Join(dir, "credentials.json")
 	if err := writePrivate(credentials, []byte(`{"typesafe_api_key":"`+jevKey+`","minimax_api_key":"`+miniMaxKey+`"}`)); err != nil {
-		return err
+		return install{}, err
 	}
 
 	cli := commandEnv{artifact: artifact, state: filepath.Join(dir, "state"), config: filepath.Join(dir, "config"), home: filepath.Join(dir, "home")}
 	if _, err := cli.mustRun("init", "init", "--json"); err != nil {
-		return err
+		return install{}, err
 	}
 	cfg := config.Default()
 	// The free-space floor is a property of the host, not of the artifact: a build
@@ -232,12 +238,29 @@ func runPhase(artifact, dir, serverURL, caFile string, models *fakeModels, allow
 	}
 	configJSON, err := config.Marshal(cfg)
 	if err != nil {
-		return err
+		return install{}, err
 	}
 	if err := writePrivate(filepath.Join(cli.config, "config.json"), configJSON); err != nil {
+		return install{}, err
+	}
+	return install{dir: dir, tree: filepath.Join(dir, "tree"), cli: cli}, nil
+}
+
+func runPhase(artifact, dir, serverURL, caFile string, models *fakeModels, allow bool) error {
+	inst, err := newInstall(artifact, dir, serverURL, caFile)
+	if err != nil {
 		return err
 	}
-	ruleFile := filepath.Join(dir, "rule.json")
+	cli, tree := inst.cli, inst.tree
+	source := filepath.Join(tree, "old.zip")
+	if err := os.WriteFile(source, []byte(smokePayload), 0o600); err != nil {
+		return err
+	}
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(source, old, old); err != nil {
+		return err
+	}
+	ruleFile := filepath.Join(inst.dir, "rule.json")
 	rule := `{"dsl_version":1,"scope_id":"smoke","action":"quarantine","match":{"min_mtime_age_seconds":86400,"min_size_bytes":0,"max_size_bytes":1073741824,"relative_dir_prefixes":[],"basename_patterns":["*.zip"]},"except":{"relative_dir_prefixes":[],"basename_patterns":[]},"retention_seconds":604800}`
 	if err := writePrivate(ruleFile, []byte(rule)); err != nil {
 		return err
@@ -343,6 +366,208 @@ func runPhase(artifact, dir, serverURL, caFile string, models *fakeModels, allow
 	return nil
 }
 
+// mixedHistory is the one pass the two review phases cannot describe.
+//
+// Each phase above asks a single question of a single file, so nothing in them
+// would notice a build where a deletion and a quarantine were counted as the
+// same thing, where "the reviewers said no" was reported as an observation, or
+// where one decision leaked onto every candidate in the batch. The mixed batch
+// therefore puts three files that must be answered differently into one
+// directory and runs the scheduled path once, the way the machine does:
+//
+//	removable.tmp   a temporary name, and the confirmed policy may delete it
+//	                outright: the reviewers allow it, the file must be gone
+//	observable.zip  an archive the policy only permits isolating: the
+//	                reviewers allow the move, the file must be in the vault,
+//	                restorable, with its bytes
+//	declined.zip    the same archive class, and the reviewers refuse: the file
+//	                must still be exactly where it was
+//	recent.tmp      newer than the rule's age threshold, so it is not a
+//	                candidate at all and must not appear on the page
+//
+// Everything is read back: the tree, the bytes, the vault and the page the user
+// would be shown. The program's own summary is compared against them rather
+// than believed on its own.
+func runMixedBatch(artifact, dir, serverURL, caFile string, models *fakeModels) error {
+	inst, err := newInstall(artifact, dir, serverURL, caFile)
+	if err != nil {
+		return err
+	}
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	fixtures := []struct {
+		name    string
+		payload string
+		old     bool
+	}{
+		{"removable.tmp", "temporary payload\n", true},
+		{"observable.zip", smokePayload, true},
+		{"declined.zip", "declined payload\n", true},
+		{"recent.tmp", "recent payload\n", false},
+	}
+	for _, f := range fixtures {
+		path := filepath.Join(inst.tree, f.name)
+		if err := os.WriteFile(path, []byte(f.payload), 0o600); err != nil {
+			return err
+		}
+		if f.old {
+			if err := os.Chtimes(path, old, old); err != nil {
+				return err
+			}
+		}
+	}
+	// The reviewers refuse exactly one candidate. A single blanket answer would
+	// let a batch look mixed while every file received the same treatment.
+	models.keepPaths = map[string]bool{"declined.zip": true}
+	defer func() { models.keepPaths = nil }()
+
+	if _, err := inst.cli.mustRun("mixed scope add", "scope", "add",
+		"--path", inst.tree, "--kind", "managed_disposable", "--name", "mixed", "--json"); err != nil {
+		return err
+	}
+	if _, err := inst.cli.mustRun("mixed scan", "scan", "--scope", "mixed", "--json"); err != nil {
+		return err
+	}
+
+	// The one-time confirmation, in its two documented calls. Only one category
+	// is released for direct deletion, and that is what makes the first fixture's
+	// outcome a deletion rather than an observation.
+	policyArgs := []string{"cleanup", "setup", "--scopes", "mixed",
+		"--categories", "temporary_name_only", "--observation-days", "7",
+		"--notify", "none", "--json"}
+	policyPreview, err := inst.cli.mustRun("mixed cleanup setup preview", policyArgs...)
+	if err != nil {
+		return err
+	}
+	policyDigest, ok := findString(policyPreview.stdout, "digest")
+	if !ok {
+		return errors.New("cleanup setup returned no digest")
+	}
+	if _, err := inst.cli.mustRun("mixed cleanup setup confirm",
+		append(policyArgs, "--digest", policyDigest)...); err != nil {
+		return err
+	}
+
+	ruleFile := filepath.Join(inst.dir, "mixed-rule.json")
+	rule := `{"dsl_version":1,"scope_id":"mixed","action":"quarantine","match":{"min_mtime_age_seconds":86400,"min_size_bytes":0,"max_size_bytes":1073741824,"relative_dir_prefixes":[],"basename_patterns":["*.tmp","*.zip"]},"except":{"relative_dir_prefixes":[],"basename_patterns":[]},"retention_seconds":604800}`
+	if err := writePrivate(ruleFile, []byte(rule)); err != nil {
+		return err
+	}
+	if _, err := inst.cli.mustRun("mixed rule import", "rule", "import",
+		"--file", ruleFile, "--id", "mixed-rule", "--json"); err != nil {
+		return err
+	}
+	// `rule enable --mode cleanup` is the standing authority for both action
+	// classes: it activates the revision and records the grants the scheduled
+	// path re-checks per item.
+	enableArgs := []string{"rule", "enable", "--id", "mixed-rule", "--revision", "1", "--mode", "cleanup", "--json"}
+	enablePreview, err := inst.cli.mustRun("mixed rule enable preview", enableArgs...)
+	if err != nil {
+		return err
+	}
+	enableDigest, ok := findString(enablePreview.stdout, "enable_digest")
+	if !ok {
+		return errors.New("rule enable returned no enable_digest")
+	}
+	if _, err := inst.cli.mustRun("mixed rule enable",
+		append(enableArgs, "--digest", enableDigest)...); err != nil {
+		return err
+	}
+
+	// The scheduled path, which is the only path that may delete a file without
+	// an observation period, and the one the machine actually runs.
+	runResult, runErr := inst.cli.mustRun("mixed run", "run", "--json")
+	if runErr != nil {
+		return runErr
+	}
+
+	// Witness 1: the tree. Exactly the two files that should still be there, with
+	// the bytes they had. A directory listing is not a substitute for comparing
+	// bytes, and comparing bytes is not a substitute for the listing. The
+	// program's own bookkeeping directory lives beside them in a managed root and
+	// is not one of the user's files, so the listing counts files only.
+	entries, err := os.ReadDir(inst.tree)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	if len(names) != 2 || names[0] != "declined.zip" || names[1] != "recent.tmp" {
+		return fmt.Errorf("after the mixed batch the tree holds %v, want [declined.zip recent.tmp]", names)
+	}
+	for name, want := range map[string]string{"declined.zip": "declined payload\n", "recent.tmp": "recent payload\n"} {
+		body, err := os.ReadFile(filepath.Join(inst.tree, name))
+		if err != nil || string(body) != want {
+			return fmt.Errorf("%s is not the file that was there before the run (err=%v)", name, err)
+		}
+	}
+
+	// Witness 2: the observation area. One object, restorable, and it is the
+	// archive - not the file the reviewers refused, and not a second copy of the
+	// one that was deleted.
+	listed, err := inst.cli.mustRun("mixed quarantine list", "quarantine", "list", "--json")
+	if err != nil {
+		return err
+	}
+	if n := bytes.Count(listed.stdout, []byte(`"item_id"`)); n != 1 {
+		return fmt.Errorf("the observation area holds %d item(s), want exactly 1: %s", n, listed.stdout)
+	}
+	itemID, ok := findString(listed.stdout, "item_id")
+	if !ok {
+		return errors.New("the observation area lists no object")
+	}
+	if restorable, ok := findBool(listed.stdout, "restorable"); !ok || !restorable {
+		return errors.New("the observed object is not listed as restorable")
+	}
+	if _, err := inst.cli.mustRun("mixed quarantine restore",
+		"quarantine", "restore", "--object", itemID, "--json"); err != nil {
+		return err
+	}
+	restored, err := os.ReadFile(filepath.Join(inst.tree, "observable.zip"))
+	if err != nil || string(restored) != smokePayload {
+		return errors.New("the observed file did not come back with the bytes it had")
+	}
+
+	// Witness 3: the page the user is shown. Three outcomes, one each, and no
+	// fourth row for the file the rule never matched.
+	page, err := inst.cli.mustRun("mixed report", "cleanup", "report", "--json")
+	if err != nil {
+		return err
+	}
+	pageJSON, ok := findString(page.stdout, "page")
+	if !ok {
+		return errors.New("the mixed batch left no result page")
+	}
+	for _, want := range []struct {
+		section string
+		total   int
+	}{{"deleted", 1}, {"to_be_deleted", 1}, {"kept", 1}} {
+		got, ok := findSectionTotal([]byte(pageJSON), want.section)
+		if !ok {
+			return fmt.Errorf("the result page has no %q section: %s", want.section, pageJSON)
+		}
+		if got != want.total {
+			return fmt.Errorf("the result page reports %d %q, want %d: %s", got, want.section, want.total, pageJSON)
+		}
+	}
+	if bytes.Contains([]byte(pageJSON), []byte("recent.tmp")) {
+		return fmt.Errorf("a file newer than the rule's age threshold appears on the page: %s", pageJSON)
+	}
+	// And the run's own summary has to agree with the page, because they are
+	// written from different records and an operator reads whichever comes first.
+	if purged, ok := findNumber(runResult.stdout, "purged"); !ok || purged != 1 {
+		return fmt.Errorf("the run reported %d purge(s), want 1: %s", purged, runResult.stdout)
+	}
+	if quarantined, ok := findNumber(runResult.stdout, "quarantined"); !ok || quarantined != 1 {
+		return fmt.Errorf("the run reported %d quarantine(s), want 1: %s", quarantined, runResult.stdout)
+	}
+	return nil
+}
+
 func writePrivate(path string, body []byte) error {
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
@@ -408,9 +633,79 @@ func findStringValue(value any, key string) (string, bool) {
 	return "", false
 }
 
+// findNumber returns the first number stored under key, anywhere in raw.
+func findNumber(raw []byte, key string) (int, bool) {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return 0, false
+	}
+	return findNumberValue(value, key)
+}
+
+func findNumberValue(value any, key string) (int, bool) {
+	switch v := value.(type) {
+	case map[string]any:
+		if n, ok := v[key].(float64); ok {
+			return int(n), true
+		}
+		for _, child := range v {
+			if n, ok := findNumberValue(child, key); ok {
+				return n, true
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if n, ok := findNumberValue(child, key); ok {
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// findSectionTotal returns the total of one named result-page section.
+//
+// The page groups its rows under the section names the product promises, and the
+// count has to come from the section itself: a page that listed three rows under
+// one heading would still contain the three file names the smoke looks for.
+func findSectionTotal(raw []byte, section string) (int, bool) {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return 0, false
+	}
+	return sectionTotal(value, section)
+}
+
+func sectionTotal(value any, section string) (int, bool) {
+	switch v := value.(type) {
+	case map[string]any:
+		if child, ok := v[section].(map[string]any); ok {
+			if total, ok := child["total"].(float64); ok {
+				return int(total), true
+			}
+		}
+		for _, child := range v {
+			if total, ok := sectionTotal(child, section); ok {
+				return total, true
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if total, ok := sectionTotal(child, section); ok {
+				return total, true
+			}
+		}
+	}
+	return 0, false
+}
+
 type fakeModels struct {
 	allow        atomic.Bool
 	miniMaxCalls atomic.Int64
+	// keepPaths names the candidates the reviewers refuse, so one batch can
+	// carry more than one answer. A nil map keeps the older behaviour, where
+	// allow alone decided every candidate.
+	keepPaths map[string]bool
 }
 
 func (m *fakeModels) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -421,7 +716,7 @@ func (m *fakeModels) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
-		if !m.allow.Load() {
+		if !m.allow.Load() || m.refuses(r) {
 			_, _ = w.Write([]byte(`{"model":"jev-1.14.2","answers":{"quarantine_disposition":{"type":"choice","choice":"keep","confidence":0.99,"probabilities":{"allow_review":0.005,"keep":0.99,"insufficient":0.005}}}}`))
 			return
 		}
@@ -436,6 +731,61 @@ func (m *fakeModels) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// refuses reports whether this request is about a candidate the fake reviewers
+// decline. The facts the artifact sends carry the relative path, so the answer
+// can differ per file while the endpoint stays one endpoint.
+func (m *fakeModels) refuses(r *http.Request) bool {
+	if len(m.keepPaths) == 0 || r.Body == nil {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return false
+	}
+	rel, ok := relativePathIn(body)
+	if !ok {
+		return false
+	}
+	return m.keepPaths[rel]
+}
+
+// relativePathIn finds the candidate's relative path in a review request.
+//
+// The measured facts travel as a JSON *string* inside the request envelope (the
+// `state` field for JEV, the user message for MiniMax), so looking for the key
+// in the envelope never matches it: every quote in it is escaped. Each string in
+// the envelope is therefore read as a document of its own.
+func relativePathIn(body []byte) (string, bool) {
+	var envelope any
+	if json.Unmarshal(body, &envelope) != nil {
+		return "", false
+	}
+	return relativePathInValue(envelope)
+}
+
+func relativePathInValue(value any) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		if !strings.Contains(v, `"relative_path"`) {
+			return "", false
+		}
+		return findString([]byte(v), "relative_path")
+	case map[string]any:
+		for _, child := range v {
+			if rel, ok := relativePathInValue(child); ok {
+				return rel, true
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if rel, ok := relativePathInValue(child); ok {
+				return rel, true
+			}
+		}
+	}
+	return "", false
 }
 
 func newTLSServer(handler http.Handler) (*httptest.Server, []byte, error) {

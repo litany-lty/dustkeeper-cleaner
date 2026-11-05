@@ -167,6 +167,17 @@ python3 -m unittest scripts/test_import_review_config.py
 
 假服务证书通过配置中的私有 `trust_ca_file` 加入该命令自己的信任根；TLS 仍验证证书链与主机名，最低 TLS 1.2，没有 `InsecureSkipVerify`，也没有生产跳过审核开关。辅助工具自己的协议/TLS 定向测试与有限本地 smoke 可以先执行；受支持平台的正式 release 构建仍需按项目流程另行授权和运行，不能复用旧制品的成功结论证明新版本。
 
+冒烟的最后一段是**混合批次**：同一个目录里放四个文件，用 `rule enable --mode cleanup` 打开定时路径后跑一次 `run`，要求可删、可观察、应保留各出现一次，且规则不匹配的那个文件完全不出现。
+
+| 文件 | 类别 | 期望 | 依据 |
+| --- | --- | --- | --- |
+| `removable.tmp` | `temporary_name_only`，已在确认策略的直接删除类别中 | 从目录消失 | 结果页 `deleted` 段 1 条，理由 `dual_review_agrees` |
+| `observable.zip` | `archive_unknown_contents`，只允许隔离 | 进入观察区，可列出、可恢复 | 结果页 `to_be_deleted` 段 1 条；`quarantine list` 只有一个对象且 `restorable`，恢复后字节一致 |
+| `declined.zip` | 同类归档，模型拒绝 | 原地不动、字节不变 | 结果页 `kept` 段 1 条，理由 `model_says_keep` |
+| `recent.tmp` | 未满 24 小时年龄门槛 | 不进计划、不上结果页 | 目录里仍在；结果页不含该名字 |
+
+四条结论分别从三处读回：目录列表与字节、观察区清单与恢复结果、结果页三段计数；`run` 自己的 `purged`/`quarantined` 计数必须与结果页一致（三处写法不同，操作员看到哪一处都成立）。发布 manifest 因此多记一行 `mixed_batch_flow=... mixed_batch="deleted=1 observed=1 kept=1"`，让“这份制品做过混合批次”成为制品自己的记录，而不是运行者记忆里的事。
+
 **C. 在独立范围完成新制品验证后再讨论正式切换。**
 
 先处理 A/B，随后保存一致备份、生成候选并核对制品。在隔离测试范围验证新 Q/R/P、缺凭据、模型停服、证据撤销和后台凭据读取。正式启用需要单独部署授权；既有暂停不能自动解除。

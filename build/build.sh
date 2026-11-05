@@ -394,7 +394,7 @@ build_target() {
 		# requires the directory it is handed to be empty, and a log file created
 		# before it starts would be a caller-owned entry it must refuse.
 		if smoke_qr "$out" "$smoke_work" >"$TMPD/smoke.log" 2>&1; then
-			record_fact "target=$TARGET smoke_qr=ok review_tls=yes review_rejection_retained=yes review_evidence_backup=yes flow=\"init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore,quarantine list\" source_gone_after_apply=yes restored_bytes_match=yes"
+			record_fact "target=$TARGET smoke_qr=ok review_tls=yes review_rejection_retained=yes review_evidence_backup=yes flow=\"init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore,quarantine list\" mixed_batch_flow=\"scope add,scan,cleanup setup,rule import,rule enable,run,quarantine list,quarantine restore,cleanup report\" mixed_batch=\"deleted=1 observed=1 kept=1\" source_gone_after_apply=yes restored_bytes_match=yes"
 		else
 			step=$?
 			fail_target "$TARGET failed the quarantine/restore smoke (step $step); see the log"
