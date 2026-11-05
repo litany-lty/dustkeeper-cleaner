@@ -116,6 +116,21 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		return res, errs.Newf(errs.CodeHeld, "the original path is protected: %s", why)
 	}
 
+	// The place this object came from must still be empty. A file at the original
+	// path is the user working there again, and that is the strongest evidence
+	// that the object in the vault is still wanted.
+	//
+	// The pre-flight in ReviewExpiry asks the same question, but it runs before
+	// the review: a manual purge never passes through it at all, and the model
+	// call in between can take a minute. This is the check the purge itself
+	// promised, at the only place where it still costs nothing to refuse.
+	if reused, rerr := e.originalPathReused(sc, it); rerr != nil {
+		return res, rerr
+	} else if reused {
+		return res, errs.New(errs.CodeHeld,
+			"a file exists at the original path again, so that place is in use; the object stays in the observation area")
+	}
+
 	capturedTok, err := decodeTok(*it.CapturedTokenJSON)
 	if err != nil {
 		return res, err
@@ -228,6 +243,15 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 	// an atomicity the syscall does not offer.
 	if err := ConfirmUnchanged(obj, ev); err != nil {
 		return res, err
+	}
+	// Re-asked here, after the read: the original directory can gain a file while
+	// a large object is being hashed, and that is the same use signal as one that
+	// arrived before the review.
+	if reused, rerr := e.originalPathReused(sc, it); rerr != nil {
+		return res, rerr
+	} else if reused {
+		return res, errs.New(errs.CodeHeld,
+			"a file appeared at the original path while this object was being verified; nothing was removed")
 	}
 
 	// Both limits are re-checked at the last possible moment, because both can

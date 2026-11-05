@@ -152,6 +152,13 @@ func (l *ActionLedger) RemainingBytes() int64 {
 type Budget struct {
 	Run     *RunLedger
 	Actions *ActionLedger
+	// Shared is an optional allowance that spans every action class.
+	//
+	// The class ledgers answer "how many quarantines may this run do"; the
+	// shared one answers "how many file actions may this run take at all". A
+	// confirmed policy states the second kind of limit, and without it two
+	// classes could each spend the whole of it.
+	Shared *ActionLedger
 
 	// Capped says whether this phase has its own allowance. When it is false the
 	// shared ledgers are the only limit, which is the right shape for a small
@@ -161,6 +168,15 @@ type Budget struct {
 	MaxBytes int64
 	Files    int
 	Bytes    int64
+}
+
+// WithShared attaches the run-wide allowance that spans action classes.
+func (b *Budget) WithShared(shared *ActionLedger) *Budget {
+	if b == nil {
+		return nil
+	}
+	b.Shared = shared
+	return b
 }
 
 // NewBudget builds a self-contained budget. It is used by tests and by the CLI
@@ -242,6 +258,9 @@ func (b *Budget) CanReserve(size int64) bool {
 			return false
 		}
 	}
+	if !b.Shared.CanReserve(size) {
+		return false
+	}
 	return b.Actions.CanReserve(size)
 }
 
@@ -252,6 +271,7 @@ func (b *Budget) AddAction(size int64) {
 	}
 	b.Files++
 	b.Bytes += size
+	b.Shared.Add(size)
 	b.Actions.Add(size)
 }
 
@@ -261,6 +281,9 @@ func (b *Budget) RemainingFiles() int {
 		return 0
 	}
 	limit := b.Actions.RemainingFiles()
+	if r := b.Shared.RemainingFiles(); b.Shared != nil && r < limit {
+		limit = r
+	}
 	if b.Capped {
 		if r := b.MaxFiles - b.Files; r < limit {
 			limit = r
@@ -278,6 +301,11 @@ func (b *Budget) RemainingBytes() int64 {
 		return 0
 	}
 	limit := b.Actions.RemainingBytes()
+	if b.Shared != nil {
+		if r := b.Shared.RemainingBytes(); r < limit {
+			limit = r
+		}
+	}
 	if b.Capped {
 		if r := b.MaxBytes - b.Bytes; r < limit {
 			limit = r
@@ -297,7 +325,7 @@ func (b *Budget) SplitFor(numerator, denominator int64) *Budget {
 		return nil
 	}
 	if denominator <= 0 || numerator <= 0 || numerator >= denominator {
-		return NewPhaseBudget(b.Run, b.Actions, b.RemainingFiles(), b.RemainingBytes())
+		return NewPhaseBudget(b.Run, b.Actions, b.RemainingFiles(), b.RemainingBytes()).WithShared(b.Shared)
 	}
 	shareFiles := int(int64(b.RemainingFiles()) * numerator / denominator)
 	shareBytes := b.RemainingBytes() * numerator / denominator
@@ -307,5 +335,5 @@ func (b *Budget) SplitFor(numerator, denominator int64) *Budget {
 	if shareBytes < 0 {
 		shareBytes = 0
 	}
-	return NewPhaseBudget(b.Run, b.Actions, shareFiles, shareBytes)
+	return NewPhaseBudget(b.Run, b.Actions, shareFiles, shareBytes).WithShared(b.Shared)
 }

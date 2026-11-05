@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"dustkeeper/internal/assess"
 	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/config"
 	"dustkeeper/internal/domain"
@@ -24,6 +25,7 @@ import (
 	"dustkeeper/internal/execute"
 	"dustkeeper/internal/fsops"
 	"dustkeeper/internal/notify"
+	"dustkeeper/internal/outcome"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/policy"
 	"dustkeeper/internal/recovery"
@@ -120,8 +122,49 @@ func legacyReview(fn func(context.Context, string, store.Scope, store.Item) (rev
 	}
 }
 
-// fakeIntentApproval supplies explicit review fields to crash/recovery fixtures
-// that intentionally begin an intent without executing a file action.
+// factGatedReview answers "allow" to the question it was asked, but only when the
+// measured facts allow an action at all.
+//
+// The production review client does exactly this: it asks the models, then puts
+// their verdict and the executor's measurements through outcome.Decide. A fixture
+// that returns a disposition directly bypasses that mapping, which is fine for
+// tests about the filesystem and wrong for a test about what an incomplete fact
+// does to the decision - such a test would pass whatever the executor measured.
+func factGatedReview(verdict string) execute.ReviewFunc {
+	return func(_ context.Context, r review.Request) (review.Outcome, error) {
+		disposition, reason := outcome.Decide(outcome.Inputs{
+			Action:        r.Action,
+			Verdict:       verdict,
+			FactsComplete: r.FactsComplete,
+			Movable:       r.Movable,
+			Authorized:    r.Authorized,
+		})
+		rejected := disposition == domain.DispositionKeep
+		return review.Outcome{
+			Disposition: disposition,
+			Reason:      reason,
+			Approval: &fakeApproval{
+				itemID: r.ItemID, action: r.Action, reject: rejectIf(rejected),
+			},
+			Decision: review.Decision{
+				Verdict:  verdict,
+				Reason:   reason,
+				JEVModel: "jev-fixture", LLMModel: "minimax-fixture",
+			},
+		}, nil
+	}
+}
+
+// rejectIf turns "this review refused" into the error an approval carries when it
+// may not be used.
+func rejectIf(rejected bool) error {
+	if !rejected {
+		return nil
+	}
+	return errs.New(errs.CodeReviewRequired, "the review refused this action")
+}
+
+// fakeIntentApproval supplies explicit review fields to crash/recovery fixtures// that intentionally begin an intent without executing a file action.
 func fakeIntentApproval(itemID domain.ItemID, action string) (review.Approval, string) {
 	const hash = "sha256:integration-intent-fixture"
 	return &fakeApproval{itemID: string(itemID), action: action, verifiedHash: hash}, hash
@@ -205,6 +248,13 @@ func newEnv(t *testing.T) *env {
 		Clock:  clock,
 		Config: executeConfig(cfg),
 		Gate:   scope.PauseGate{StateDir: paths.StateDir},
+		// Nothing inside a test tree is held open. Saying so explicitly keeps the
+		// decision independent of whether this host has lsof and of what else the
+		// machine happens to be running; the probe itself is covered by its own
+		// test, and a test that wants an open file injects one.
+		OpenFiles: func(context.Context, string) (assess.OpenObservation, error) {
+			return assess.OpenObservation{Coverage: "visible_processes_only", Paths: map[string]bool{}}, nil
+		},
 		Review: legacyReview(fakeLifecycleReview),
 		// The fake clock never moves backwards, so the run-wide assertion is the
 		// same one production supplies; a test that wants a refused clock sets

@@ -119,6 +119,34 @@ func (s *Store) EventsForItem(ctx context.Context, itemID domain.ItemID) ([]Even
 	return out, errs.Wrap(errs.CodeDBError, rows.Err())
 }
 
+// KeepEventsSince returns the keep decisions recorded at or after sinceNS.
+//
+// It exists so that "this file was already answered" can be asked without
+// loading the whole audit log: keep decisions are the only events that suppress
+// a new review, and they are read by time, newest first, because the newest one
+// is the one whose retry interval is still running.
+func (s *Store) KeepEventsSince(ctx context.Context, sinceNS int64, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.read(ctx, "SELECT "+eventColumns+
+		" FROM events WHERE action='keep' AND occurred_at_ns >= ? ORDER BY occurred_at_ns DESC LIMIT ?",
+		sinceNS, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			return nil, errs.Wrap(errs.CodeDBError, err)
+		}
+		out = append(out, ev)
+	}
+	return out, errs.Wrap(errs.CodeDBError, rows.Err())
+}
+
 // PendingOp is an operation whose intent committed but whose outcome is not
 // recorded. Reconciliation works from this list.
 type PendingOp struct {

@@ -479,14 +479,13 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, sc *execute.ScopeCtx, 
 				contract.PriorState, domain.StatePlanned))
 	}
 
-	// A direct deletion never uses the vault. An object under the item's name
-	// means this operation did something other than what it recorded, and neither
-	// branch below may describe that.
-	if _, vaultFound, verr := statVault(sc, it.ObjectName); verr != nil {
+	// A direct deletion captures the object into the vault before unlinking it,
+	// so "an object with this name exists there" is no longer proof that
+	// something other than what was recorded happened: it is what an operation
+	// interrupted between the capture and the unlink leaves behind.
+	vaultID, vaultFound, verr := statVault(sc, it.ObjectName)
+	if verr != nil {
 		return r.recordFailure(ctx, po, out, "VAULT_STAT_FAILED", verr)
-	} else if vaultFound {
-		return r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
-			"a direct deletion records no vault step, yet an object with this name exists there; nothing was changed")
 	}
 
 	srcID, srcFound, serr := statEntry(sc, it.RawRelative)
@@ -495,8 +494,49 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, sc *execute.ScopeCtx, 
 	}
 
 	switch {
+	case vaultFound && vaultID.Equal(contract.ExpectedIdent):
+		// The object left its path and is sitting in the vault. Nothing is
+		// unlinked here: a recovery pass may not perform a deletion the run did
+		// not get to, on authority granted to a moment that has passed. The
+		// object keeps its evidence so it can be restored, and the item stays
+		// held until a person decides.
+		unchanged, cerr := r.contractContentMatches(ctx, sc, po, contract)
+		if cerr != nil {
+			return r.recordFailure(ctx, po, out, "CAPTURE_VERIFY_FAILED", cerr)
+		}
+		if !unchanged {
+			return r.holdUnfixable(ctx, po, out, "CAPTURED_CONTENT_CHANGED",
+				"the object in the vault is not the content the deletion was approved for; it was left exactly where it is")
+		}
+		if cerr := r.captureEvidence(ctx, sc, po); cerr != nil {
+			return r.recordFailure(ctx, po, out, "CAPTURE_EVIDENCE_UNREADABLE", cerr)
+		}
+		if err := r.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld); err != nil {
+			out.RecordError = "the scope could not be marked held: " + err.Error()
+		}
+		out.Outcome = "held"
+		out.Detail = "the file was captured into the vault but the deletion did not finish; it can be restored from there"
+		return out
+
+	case vaultFound:
+		return r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
+			"an object with this name exists in the vault and is not the object this operation captured; nothing was changed")
+
 	case srcFound && srcID.Equal(contract.ExpectedIdent):
-		// Nothing was removed, and the file is still the one the plan approved.
+		// The path still holds an object with the planned identity. Identity is
+		// not proof that nothing changed: the same inode can be rewritten in
+		// place, and on a filesystem that reuses inode numbers it can even be a
+		// different file. The bytes the intent was approved for are the only
+		// thing that settles it.
+		unchanged, cerr := r.contractContentMatches(ctx, sc, po, contract)
+		if cerr != nil {
+			return r.recordFailure(ctx, po, out, "SOURCE_VERIFY_FAILED", cerr)
+		}
+		if !unchanged {
+			return r.holdUnfixable(ctx, po, out, "SOURCE_CHANGED_AFTER_INTENT",
+				"the path holds an object whose content is not the content this deletion was approved for; nothing was changed")
+		}
+		// Nothing was removed and the file is still the one the plan approved.
 		// The attempt is closed and the item returns to its plan. Replaying the
 		// removal here would be a deletion performed by the recovery pass, on
 		// authority that was granted to a different moment.
@@ -552,6 +592,66 @@ func (r *Reconciler) completeReconciledDelete(ctx context.Context, po store.Pend
 	out.Outcome = "completed"
 	out.Detail = "the path was already empty; recorded as RECONCILED_ABSENT, not as a verified unlink"
 	return out
+}
+
+// contractContentMatches proves that the object now under this operation still
+// carries the bytes the intent was approved for.
+//
+// Identity is not that proof. A file can be rewritten in place without its
+// inode changing, and a filesystem that reuses inode numbers can hand a new file
+// an identity that compares equal to a deleted one. What the record holds beside
+// the identity is the content digest and the change token, and a reconciliation
+// that says "unchanged" without reading them is describing the inode rather than
+// the file.
+//
+// The vault wins when both exist: a captured object is the one this operation
+// is about.
+func (r *Reconciler) contractContentMatches(ctx context.Context, sc *execute.ScopeCtx,
+	po store.PendingOp, contract plan.OperationContractV1) (bool, error) {
+
+	want, err := contract.ContentDigest()
+	if err != nil {
+		return false, err
+	}
+
+	var f *fsops.File
+	if objParent, perr := sc.Objects.ParentOf(po.Item.ObjectName); perr == nil {
+		captured, oerr := fsops.OpenRegularAt(objParent, sc.RootDev)
+		objParent.Close()
+		if oerr == nil {
+			f = captured
+		}
+	}
+	if f == nil {
+		parent, perr := sc.Root.OpenParent(po.Item.RawRelative)
+		if perr != nil {
+			return false, perr
+		}
+		defer parent.Close()
+		src, oerr := fsops.OpenRegularAt(parent, sc.RootDev)
+		if oerr != nil {
+			return false, oerr
+		}
+		f = src
+	}
+	defer f.Close()
+
+	if !f.Identity.Equal(contract.ExpectedIdent) {
+		return false, nil
+	}
+	ev, err := execute.ReadStable(f, r.Exec.VerifyOpt(f.Token.Size))
+	if err != nil {
+		return false, err
+	}
+	if ev.Content != want {
+		return false, nil
+	}
+	// Size and modification time are the token fields a rename leaves alone, so
+	// they are comparable for a captured object as well.
+	if ev.Token.Size != contract.ExpectedToken.Size || ev.Token.MTimeNS != contract.ExpectedToken.MTimeNS {
+		return false, nil
+	}
+	return true, nil
 }
 
 // captureEvidence records the object that actually moved, together with the

@@ -20,17 +20,27 @@ import (
 // original path rather than moving it into the vault.
 const PurposeDirectDelete = "direct_delete"
 
-// deleteDirect removes one file at its original path.
+// deleteDirect destroys one reviewed file.
 //
-// This is the only place in the product where a byte is destroyed without a
-// copy existing first, so the order is stricter than the move's:
+// The shape is deliberately the same as the reversible move, with one extra
+// step at the end:
 //
 //	re-check authority -> verify identity -> stable read -> intent commit ->
-//	verify unchanged -> unlink -> flush directory -> commit
+//	capture into the vault -> verify the captured object -> unlink it ->
+//	flush -> commit
 //
-// Every step before the unlink can refuse and leave the file exactly where it
-// was. The steps after it cannot be undone, so a failure there is recorded as
-// parked (still explainable, still unfinished) rather than as a verdict.
+// The capture is not ceremony. `unlink` has no "only if the path still names
+// inode X" form, so deleting by the original name always leaves a window in
+// which the reviewed file has been renamed away and an unreviewed file has
+// taken its place: the last check before the unlink cannot close that window,
+// it only narrows it. Renaming first empties the path, and what is deleted
+// afterwards is a name inside the private vault that the program created for
+// this operation. A file that appears at the original path during the window is
+// therefore never the thing that gets unlinked.
+//
+// If the capture itself takes the wrong object, the existing compensation path
+// puts it back and the scope is held: the reviewed file is still wherever it
+// went, and the replacement is exactly as it was.
 func (e *Executor) deleteDirect(ctx context.Context, sc *ScopeCtx, p store.Plan, it store.Item,
 	binding plan.ItemBindingV1, budget *domain.Budget, outcome review.Outcome) (domain.OperationResult, error) {
 
@@ -111,11 +121,13 @@ func (e *Executor) deleteDirect(ctx context.Context, sc *ScopeCtx, p store.Plan,
 		return skipped(res, "file has more than one hard link"), nil
 	}
 
-	// One read, not two: the file will not exist afterwards, so there is no
-	// second verification to reserve budget for.
-	if budget != nil && budget.RemainingRead() < src.Token.Size {
+	// Two reads: one before the capture, one after it. The second is what proves
+	// the object the program captured is the object the review approved, and a
+	// deletion that cannot prove that is exactly the defect this branch exists to
+	// prevent.
+	if budget != nil && budget.RemainingRead() < src.Token.Size*2 {
 		return res, errs.New(errs.CodeBudgetExhausted,
-			"not enough read budget left to verify this file before deleting it")
+			"not enough read budget left to verify this file before and after capturing it")
 	}
 	if budget != nil && !budget.CanReserve(src.Token.Size) {
 		return res, errs.New(errs.CodeBudgetExhausted,
@@ -142,6 +154,7 @@ func (e *Executor) deleteDirect(ctx context.Context, sc *ScopeCtx, p store.Plan,
 			"%q changed before it could be accepted (%s); nothing was deleted", it.RawRelative, why)
 	}
 	preHash := preEv.Content
+	metaHash := preEv.Metadata
 
 	opID := domain.OperationID(domain.NewID("op"))
 	contract := plan.OperationContractV1{
@@ -158,7 +171,7 @@ func (e *Executor) deleteDirect(ctx context.Context, sc *ScopeCtx, p store.Plan,
 		ExpectedIdent:   preID,
 		ExpectedToken:   preTok,
 		ContentHash:     strPtr(string(preHash)),
-		MetadataHash:    strPtr(string(preEv.Metadata)),
+		MetadataHash:    strPtr(string(metaHash)),
 		Binding:         binding,
 		MaxFiles:        e.Config.MaxFiles,
 		MaxLogicalBytes: e.Config.MaxBytes,
@@ -211,9 +224,9 @@ func (e *Executor) deleteDirect(ctx context.Context, sc *ScopeCtx, p store.Plan,
 		return res, err
 	}
 
-	// The last moment at which the file can still be proven to be the one the
-	// review and the plan described. unlink has no "only if still inode X", so
-	// this narrows the window without closing it.
+	// The last moment at which the path can still be shown to hold the reviewed
+	// file. After this the file leaves the path, so anything that appears there
+	// is a different object and this operation has no name for it.
 	finalID, _, err := parent.StatAtNoFollow()
 	if err != nil {
 		return res, e.hold(ctx, intent, "SOURCE_UNREADABLE", err)
@@ -221,33 +234,67 @@ func (e *Executor) deleteDirect(ctx context.Context, sc *ScopeCtx, p store.Plan,
 	if !finalID.Equal(preID) {
 		return res, e.hold(ctx, intent, "SOURCE_REPLACED", nil)
 	}
-	// The descriptor is still open, so the bytes cannot have been freed by a
-	// concurrent writer; identity plus the open handle is the strongest
-	// statement available at this point.
-	if ok, why := sameStableObject(src.Identity, src.Token, preID, preTok); !ok {
-		return res, e.hold(ctx, intent, "SOURCE_REPLACED", errs.Newf(errs.CodePlanStale, "%s", why))
-	}
-	runPreUnlinkHook()
+	runPreRenameHook()
 
-	if err := fsops.UnlinkAt(parent, parent.Name()); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			// The name is gone but this operation did not observe the removal.
-			// Saying "deleted" would claim credit for someone else's unlink, and
-			// saying "nothing happened" would be false. Parked is the honest
-			// state: the path holds nothing and reconciliation confirms it.
-			return res, e.park(ctx, intent, "SOURCE_VANISHED_BEFORE_UNLINK", nil)
+	if err := fsops.RenameNoReplace(parent, parent.Name(), sc.Objects, it.ObjectName); err != nil {
+		if errors.Is(err, fsops.ErrExists) {
+			return res, e.hold(ctx, intent, "VAULT_NAME_COLLISION", err)
 		}
-		// The file is untouched, so this attempt can be closed without a removal.
-		if abortErr := e.Store.AbortIntent(ctx, intent, domain.StateAborted,
-			`{"reason":"unlink failed","detail":`+quoteJSON(err.Error())+`}`); abortErr != nil {
+		if abortErr := e.Store.AbortIntent(ctx, intent, domain.StatePlanned,
+			`{"reason":"capture failed","detail":`+quoteJSON(err.Error())+`}`); abortErr != nil {
 			return res, abortErr
 		}
-		return res, errs.Newf(errs.CodeIOError, "the file was not deleted: %v", err)
+		return res, errs.Newf(errs.CodeIOError, "the file was not captured, so nothing was deleted: %v", err)
 	}
 
-	// The entry is gone from the namespace; now make that durable. A directory
-	// flush that fails leaves a deletion that a crash could undo, which is
+	objParent, err := sc.Objects.ParentOf(it.ObjectName)
+	if err != nil {
+		return res, e.park(ctx, intent, "CAPTURE_UNREADABLE", err)
+	}
+	defer objParent.Close()
+	obj, err := fsops.OpenRegularAt(objParent, sc.RootDev)
+	if err != nil {
+		return res, e.park(ctx, intent, "CAPTURE_NOT_REGULAR", err)
+	}
+	defer obj.Close()
+
+	// What was captured, not what was meant to be captured. A file that replaced
+	// the reviewed one between the last check and the rename is now in the
+	// vault, and the only acceptable outcome is to put it back.
+	if !obj.Identity.Equal(preID) {
+		return e.miscapture(ctx, sc, it, intent, obj)
+	}
+
+	opt2 := e.VerifyOpt(obj.Token.Size)
+	opt2.Budget = budget
+	postEv, err := ReadStable(obj, opt2)
+	if err != nil {
+		return res, e.park(ctx, intent, "CAPTURE_VERIFY_FAILED", err)
+	}
+	if postEv.Content != preHash {
+		// The bytes in the vault are not the bytes the review saw. Nothing is
+		// deleted: the object stays in the vault with its evidence, which is a
+		// state a person can resolve.
+		return res, e.park(ctx, intent, "CONTENT_CHANGED_AFTER_CAPTURE", nil)
+	}
+	if err := approval.Verify(string(postEv.Content)); err != nil {
+		return res, e.park(ctx, intent, "APPROVAL_LOST_AFTER_CAPTURE", err)
+	}
+
+	runPreUnlinkHook()
+	if err := fsops.UnlinkAt(sc.Objects, it.ObjectName); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return res, e.park(ctx, intent, "CAPTURE_VANISHED_BEFORE_UNLINK", nil)
+		}
+		return res, e.park(ctx, intent, "UNLINK_FAILED", err)
+	}
+
+	// The entry is gone from the vault namespace; now make that durable. A
+	// directory flush that fails leaves a deletion a crash could undo, which is
 	// recorded as parked rather than as a completed deletion.
+	if err := fsops.DurableDir(sc.Objects); err != nil {
+		return res, e.park(ctx, intent, "DURABILITY_FAILED", err)
+	}
 	if err := fsops.DurableDir(parent); err != nil {
 		return res, e.park(ctx, intent, "DURABILITY_FAILED", err)
 	}
@@ -261,13 +308,14 @@ func (e *Executor) deleteDirect(ctx context.Context, sc *ScopeCtx, p store.Plan,
 		return res, errs.Newf(errs.CodeStateWriteFailed,
 			"the file is deleted but its record could not be closed: %v; the operation stays pending for `recover reconcile`", err)
 	}
-	resultJSON := `{"source":"observed","path_removed":true,"content_hash":` + quoteJSON(string(preHash)) +
-		`,"size_bytes":` + jsonInt(src.Token.Size) + `,"reason":` + quoteJSON(outcome.Reason) + `}`
+	resultJSON := `{"source":"observed","path_removed":true,"captured_then_unlinked":true,"content_hash":` +
+		quoteJSON(string(postEv.Content)) + `,"size_bytes":` + jsonInt(postEv.Token.Size) +
+		`,"reason":` + quoteJSON(outcome.Reason) + `}`
 	if err := e.Store.CompletePurge(ctx, intent, resultJSON); err != nil {
 		return res, err
 	}
 	if budget != nil {
-		budget.AddAction(src.Token.Size)
+		budget.AddAction(postEv.Token.Size)
 	}
 
 	res.State = domain.StatePurged

@@ -25,6 +25,13 @@ const DefaultLimit = 200
 
 // Entry is one line of one section.
 type Entry struct {
+	// ItemID is the object identifier the restore command takes.
+	//
+	// It is not the operation: `quarantine restore --object` resolves an item,
+	// and an operation is the record of one attempt on it. The page used to
+	// print the operation id there, so the recovery command it offered could
+	// never work - and a test that only compared the string kept it that way.
+	ItemID string `json:"item_id,omitempty"`
 	// Path is the original relative path, as the user knew it.
 	Path string `json:"path"`
 	// SizeBytes is the logical size the operation recorded, not a measurement of
@@ -213,6 +220,7 @@ func sectionOf(ev store.Event) (sectionKind, bool) {
 // entryOf builds one line, and reports whether the record still supports it.
 func entryOf(section sectionKind, item store.Item, ev store.Event) (Entry, bool) {
 	entry := Entry{
+		ItemID:    string(item.ID),
 		Path:      string(item.RawRelative),
 		ScopeID:   string(item.ScopeID),
 		SizeBytes: sizeOf(item),

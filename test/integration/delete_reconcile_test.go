@@ -52,6 +52,39 @@ func TestInterruptedDirectDeletionIsReconciledThreeWays(t *testing.T) {
 		}
 	})
 
+	t.Run("the same file was rewritten in place: it is held, not called unchanged", func(t *testing.T) {
+		e, _, p, it := pendingDelete(t)
+		beginDeleteIntent(t, e, p, it)
+		path := e.treePath("scratch", "discard.zip")
+		// The inode is the one the intent recorded: writing through the existing
+		// entry truncates it in place, so nothing about the identity changes.
+		if err := os.WriteFile(path, []byte("rewritten after the intent was committed"), 0o644); err != nil {
+			t.Fatalf("rewrite: %v", err)
+		}
+
+		rep, err := e.rec.Run(context.Background())
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		if rep.Held != 1 || rep.Aborted != 0 {
+			t.Fatalf("expected a hold and no abort, got %+v", rep)
+		}
+		got, err := e.st.GetItem(context.Background(), it.ID)
+		if err != nil {
+			t.Fatalf("get item: %v", err)
+		}
+		if got.State != domain.StateHeld {
+			t.Fatalf("state=%s, want the item held", got.State)
+		}
+		if got.HoldCode == nil || *got.HoldCode != "SOURCE_CHANGED_AFTER_INTENT" {
+			t.Fatalf("hold code = %v, want SOURCE_CHANGED_AFTER_INTENT", got.HoldCode)
+		}
+		// Nothing was removed: the file at the path is the rewritten one.
+		if !e.exists("scratch", "discard.zip") {
+			t.Fatal("reconciliation removed the file it had just refused to call unchanged")
+		}
+	})
+
 	t.Run("the path is empty: the record is closed as reconciled absent", func(t *testing.T) {
 		e, _, p, it := pendingDelete(t)
 		beginDeleteIntent(t, e, p, it)
@@ -118,8 +151,18 @@ func TestInterruptedDirectDeletionIsReconciledThreeWays(t *testing.T) {
 		if got.State != domain.StateHeld || got.PendingOpID != nil {
 			t.Fatalf("state=%s pending=%v, want a settled hold", got.State, got.PendingOpID)
 		}
-		if got.HoldCode == nil || *got.HoldCode != "SOURCE_REPLACED" {
-			t.Fatalf("hold code = %v, want SOURCE_REPLACED", got.HoldCode)
+		// Which hold code fires depends on the filesystem, and the difference is
+		// not a difference in outcome: if the new file was given the old file's
+		// inode number, identity still matches and the content comparison is what
+		// refuses; if it was given a new number, the identity is what refuses.
+		// Both mean "this is not the reviewed object, and nothing was removed".
+		if got.HoldCode == nil {
+			t.Fatal("the item was held without a code")
+		}
+		switch *got.HoldCode {
+		case "SOURCE_REPLACED", "SOURCE_CHANGED_AFTER_INTENT":
+		default:
+			t.Fatalf("hold code = %v, want SOURCE_REPLACED or SOURCE_CHANGED_AFTER_INTENT", *got.HoldCode)
 		}
 	})
 }
@@ -185,13 +228,21 @@ func pendingDelete(t *testing.T) (*env, store.Scope, store.Plan, store.Item) {
 //
 // The contract is built from the item rather than from the review, because that is
 // what the executor does: the item records the identity the plan approved, and the
-// contract records what was about to happen to it.
+// contract records what was about to happen to it - the identity, the token and
+// the content hash of the bytes that were reviewed. A contract without a real
+// content hash would be one reconciliation is right to distrust, so the fixture
+// reads the file exactly as the executor does.
 func beginDeleteIntent(t *testing.T, e *env, p store.Plan, it store.Item) domain.OperationID {
 	t.Helper()
 	ctx := context.Background()
 	opID := domain.OperationID(domain.NewID("op"))
-	approval, hash := fakeIntentApproval(it.ID, domain.ActionDelete)
-	contentHash := hash
+	approval, _ := fakeIntentApproval(it.ID, domain.ActionDelete)
+	tok, err := decodeToken(t, it.PreTokenJSON)
+	if err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	hash := hashFile(t, e.treePath("scratch", string(it.RawRelative)))
+	contentHash := string(hash)
 	planID := p.ID
 	planIDStr := string(planID)
 	body, err := json.Marshal(plan.OperationContractV1{
@@ -205,6 +256,7 @@ func beginDeleteIntent(t *testing.T, e *env, p store.Plan, it store.Item) domain
 		RawRelativeB64:  plan.B64(it.RawRelative),
 		ObjectName:      it.ObjectName,
 		ExpectedIdent:   decodeIdentity(t, it.PreIdentityJSON),
+		ExpectedToken:   tok,
 		ContentHash:     &contentHash,
 	})
 	if err != nil {
@@ -218,7 +270,7 @@ func beginDeleteIntent(t *testing.T, e *env, p store.Plan, it store.Item) domain
 		PriorState:        domain.StatePlanned,
 		NextState:         domain.StatePIntent,
 		Review:            approval,
-		ReviewContentHash: hash,
+		ReviewContentHash: contentHash,
 		ContractJSON:      string(body),
 		OccurredAtNS:      e.clock.Wall().UnixNano(),
 	}); err != nil {

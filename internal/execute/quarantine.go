@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"golang.org/x/sys/unix"
 
@@ -26,6 +27,10 @@ type Executor struct {
 	Config ConfigView
 	Gate   scope.PauseGate
 	Guard  *policy.Guard
+	// OpenFiles answers "which files under this tree does a visible process hold
+	// open". A nil field uses the production probe; a test supplies its own
+	// deterministic answer through the same seam.
+	OpenFiles OpenFilesFunc
 	// QuarantineTrust asserts that the wall clock may be used to bound a new
 	// quarantine. It is mandatory, for the same reason PurgeOptions.Trust is: a
 	// nil function is "nobody checked", and a boolean would let a call site write
@@ -93,16 +98,27 @@ func (e *Executor) validateItem(sc *ScopeCtx, p store.Plan, it store.Item, b pla
 // this function, and a separate "delete" entry point would let a caller choose
 // the destructive branch without ever passing the review.
 func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, it store.Item, budget *domain.Budget) (domain.OperationResult, error) {
-	return e.process(ctx, sc, p, it, budget)
+	// One budget for both classes is the shape a single command has: the command
+	// is the whole run, and "may this run do one more thing" is the same
+	// question whichever thing it is.
+	return e.process(ctx, sc, p, it, budget, budget)
 }
 
 // process measures, asks, and dispatches.
 //
 // Everything here happens before any byte moves and is cheap: one protection
-// walk, one keeper query, one token comparison. The expensive stable read and
-// the irreversible steps live in the two branches below, because which branch
-// runs is exactly what the review decides.
-func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it store.Item, budget *domain.Budget) (domain.OperationResult, error) {
+// walk, one keeper query, one token comparison, one process listing. The
+// expensive stable read and the irreversible steps live in the two branches
+// below, because which branch runs is exactly what the review decides.
+//
+// qBudget and pBudget are the allowances the two classes may spend. They are
+// separate because the two actions are not interchangeable: a reversible move
+// and a permanent deletion are approved under different ceilings, and letting a
+// deletion spend the move allowance is how "at most ten moves" became "ten
+// deletions".
+func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it store.Item,
+	qBudget, pBudget *domain.Budget) (domain.OperationResult, error) {
+
 	res := domain.OperationResult{Item: it.ID, State: it.State}
 
 	binding, err := PlanBindingOf(it)
@@ -166,9 +182,6 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 		res.Evidence = domain.EvidenceNotStarted
 		return res, nil
 	}
-	if budget != nil && (budget.TimeUp(e.Clock) || !budget.CanReserve(preTok.Size) || budget.RemainingRead() < preTok.Size*2) {
-		return res, errs.New(errs.CodeBudgetExhausted, "action budget unavailable before review")
-	}
 
 	// What this item is, and what it is allowed to become. Both are measured
 	// here so that the question put to the reviewers is the question this item
@@ -179,8 +192,44 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 	if err != nil {
 		return res, err
 	}
+	// The confirmed directory list bounds the whole automatic path, not only the
+	// destructive one. Narrowing the managed directories and finding that a
+	// scope excluded from the confirmation was still moved is the same defect as
+	// acting without authority: the user said which directories this program may
+	// work in.
+	if pol.Confirmed() && !pol.Covers(string(sc.Scope.ID)) {
+		return skipped(res, "this scope is not inside the confirmed cleanup scope; nothing was moved or deleted"), nil
+	}
 	action, authorized, why := e.authorityFor(ctx, sc, it, binding, pol, category)
 
+	// Asking costs a model call, so the allowance for the action this item is
+	// being asked about is checked first. The branches re-check their own budget
+	// immediately before they act; this one exists so a spent run does not pay
+	// for an answer it cannot use.
+	spend := qBudget
+	if action == domain.DispositionDelete {
+		spend = pBudget
+	}
+	if spend != nil && (spend.TimeUp(e.Clock) || !spend.CanReserve(preTok.Size) || spend.RemainingRead() < preTok.Size*2) {
+		return res, errs.New(errs.CodeBudgetExhausted, "action budget unavailable before review")
+	}
+
+	// A decision that was already made about this exact version of this file is
+	// not asked again before its retry interval ends. Asking is a paid call, and
+	// the answer cannot have changed: the bytes and the rule binding are the
+	// same ones the earlier decision was about.
+	if kept, err := e.keptRecently(ctx, sc, it, preID, preTok, pol); err != nil {
+		return res, err
+	} else if kept {
+		res.Code = string(errs.CodeKept)
+		res.Message = fmt.Sprintf(
+			"kept by an earlier decision; the same file will be reviewed again after %d day(s)", pol.KeepRetryDays)
+		res.Control = domain.ControlContinue
+		res.Evidence = domain.EvidenceNotStarted
+		return res, nil
+	}
+
+	facts := e.measureFacts(ctx, sc, it, preID, preTok)
 	req := review.Request{
 		Action:        action,
 		ScopeID:       string(sc.Scope.ID),
@@ -190,11 +239,14 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 		SizeBytes:     preTok.Size,
 		AgeDays:       ageDays(preTok, e.Clock.Wall()),
 		Identity:      preID,
-		Checks:        measuredChecks(preTok),
+		Checks:        facts.Checks,
 		Policy:        review.PolicyFacts{DirectDeleteCategories: pol.DirectDeleteCategories, ObservationDays: pol.ObservationDays},
-		FactsComplete: preTok.Size >= 0 && preID.Inode != 0,
-		Movable:       true,
+		FactsComplete: facts.Complete,
+		Movable:       facts.Movable,
 		Authorized:    authorized,
+	}
+	if facts.Why != "" {
+		res.Message = facts.Why
 	}
 
 	outcome, err := e.reviewItem(ctx, req)
@@ -203,16 +255,22 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 	}
 	switch outcome.Disposition {
 	case domain.DispositionKeep:
-		return e.keepItem(ctx, sc, p, it, outcome)
+		kept, err := e.keepItem(ctx, sc, p, it, outcome)
+		if kept.Message == "" && facts.Why != "" {
+			// The record says the model kept it; the operator also needs to know
+			// that a fact was missing, because that is the part they can fix.
+			kept.Message = facts.Why
+		}
+		return kept, err
 	case domain.DispositionDelete:
-		return e.deleteDirect(ctx, sc, p, it, binding, budget, outcome)
+		return e.deleteDirect(ctx, sc, p, it, binding, pBudget, outcome)
 	}
 	if why != "" {
 		// The reviewers allowed something; record which authority was absent so
 		// "why was this only moved" is answerable without re-deriving it.
 		outcome.Decision.MissingEvidence = append(outcome.Decision.MissingEvidence, "direct delete: "+why)
 	}
-	return e.quarantineOnly(ctx, sc, p, it, budget, outcome)
+	return e.quarantineOnly(ctx, sc, p, it, qBudget, outcome)
 }
 
 // authorityFor decides which question to ask. It returns the action, whether

@@ -73,7 +73,19 @@ func (e *Executor) ReviewExpiry(ctx context.Context, sc *ScopeCtx, it store.Item
 	// 3. The vault object must still be the object that was moved. A capture whose
 	// identity no longer matches cannot be described, and a description is what a
 	// permanent deletion has to be able to give.
+	//
+	// Identity is compared together with the token recorded at the move. The two
+	// are not redundant: on a filesystem that reuses inode numbers, remove-then-
+	// create can hand the new file the old file's number, and the pre-flight
+	// would then pass an object the deep verification later refuses - a run that
+	// reports "held, and the scope stopped" for something it could have described
+	// as skipped. Size and modification time are the token fields a rename leaves
+	// alone, so they compare exactly for a captured object.
 	captured, err := decodeID(*it.CapturedIdentityJSON)
+	if err != nil {
+		return "", err
+	}
+	capturedTok, err := decodeTok(*it.CapturedTokenJSON)
 	if err != nil {
 		return "", err
 	}
@@ -93,7 +105,8 @@ func (e *Executor) ReviewExpiry(ctx context.Context, sc *ScopeCtx, it store.Item
 		return "", errs.Wrap(errs.CodeAccessDenied, err)
 	}
 	defer obj.Close()
-	if !obj.Identity.Equal(captured) {
+	if !obj.Identity.Equal(captured) ||
+		obj.Token.Size != capturedTok.Size || obj.Token.MTimeNS != capturedTok.MTimeNS {
 		return "object_changed: the vault object is not the object that was moved", nil
 	}
 	if obj.Token.Size < 0 {

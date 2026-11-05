@@ -101,9 +101,16 @@ func (j *HTTPJudge) Calls() int { return int(j.calls.Load()) }
 
 // DebugSession owns its limits and counters; changing debug wait times or
 // requesting a second opinion must not alter the caller's ordinary judge.
+//
+// The calibrated gate is copied, not re-derived. A debug run that measured the
+// provider against 0.7/0.8 while the production judge applies 0.9/0.9 answers a
+// different question from the one the user configured, and the difference is
+// invisible in the output.
 func (j *HTTPJudge) DebugSession(maxCalls int, timeout time.Duration) (*HTTPJudge, error) {
 	miniMaxClient, jevClient := *j.client, *j.jevClient
-	copy := &HTTPJudge{MaxCalls: maxCalls, ReviewBoth: true, jev: j.jev, minimax: j.minimax, client: &miniMaxClient, jevClient: &jevClient}
+	copy := &HTTPJudge{MaxCalls: maxCalls, ReviewBoth: true, jev: j.jev, minimax: j.minimax,
+		client: &miniMaxClient, jevClient: &jevClient,
+		minConfidence: j.minConfidence, minAllowProbability: j.minAllowProbability}
 	if err := copy.SetMiniMaxTimeout(timeout); err != nil {
 		return nil, err
 	}

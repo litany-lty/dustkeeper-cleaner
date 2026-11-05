@@ -62,7 +62,7 @@ func TestB22GrantReadFailureStopsAutomaticPurge(t *testing.T) {
 	cfg.Runtime.MaxAutoPurgeBytes = 1 << 20
 	runner := Runner{Store: st, Clock: clock, Config: cfg}
 	got := runner.purgeDue(ctx, &execute.ScopeCtx{Scope: sc},
-		domain.NewRunLedger(60, 1<<20, 0), domain.NewActionLedger(2, 1<<20), nil)
+		domain.NewRunLedger(60, 1<<20, 0), domain.NewActionLedger(2, 1<<20), nil, nil)
 	if got.Err == nil || errs.CodeOf(got.Err) != errs.CodeDBError ||
 		got.Control != domain.ControlStopRun || got.Refused != 0 {
 		t.Fatalf("grant read failure was treated as ordinary refusal: %+v", got)

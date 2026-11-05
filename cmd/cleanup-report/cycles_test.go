@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -38,7 +39,15 @@ func TestCycle23UnknownUseHasNoInventedTimestampOrSource(t *testing.T) {
 	if _, ok := f["last_used_source"]; ok {
 		t.Fatal("failed probe claims observed source")
 	}
-	if f["last_used_status"] != "unknown" || f["process_visibility"] != "not_requested" {
+	// The status has to say "we do not know", but the word for it depends on the
+	// platform: Spotlight exists on macOS, so a probe was asked for and came back
+	// unknown; elsewhere there is nothing to ask, and the report says the question
+	// was never put. Both are honest; "observed" and a timestamp are not.
+	wantStatus := "not_requested"
+	if runtime.GOOS == "darwin" {
+		wantStatus = "unknown"
+	}
+	if f["last_used_status"] != wantStatus || f["process_visibility"] != "not_requested" {
 		t.Fatalf("missing unknown provenance: %+v", f)
 	}
 }

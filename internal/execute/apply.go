@@ -68,8 +68,25 @@ func strongerControl(a, b string) string {
 }
 
 // ApplyQuarantinePlan executes an approved quarantine plan.
+//
+// One budget covers both action classes here: a caller with a single allowance
+// (a command that is the whole run) has one question to ask, and this entry
+// point keeps that shape.
 func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID domain.PlanID,
 	approval domain.Digest, budget *domain.Budget) (ApplyResult, error) {
+
+	return e.ApplyQuarantinePlanWithBudgets(ctx, sc, planID, approval, budget, budget)
+}
+
+// ApplyQuarantinePlanWithBudgets executes a plan whose items may end in either
+// of the two actions, with the allowance each one is allowed to spend.
+//
+// The two ledgers are not interchangeable. A reversible move was approved under
+// the quarantine ceiling; a permanent deletion is only ever approved under the
+// purge ceiling. Running a deletion out of the move allowance let a plan that
+// was allowed to move ten files delete ten of them instead.
+func (e *Executor) ApplyQuarantinePlanWithBudgets(ctx context.Context, sc *ScopeCtx, planID domain.PlanID,
+	approval domain.Digest, qBudget, pBudget *domain.Budget) (ApplyResult, error) {
 
 	out := ApplyResult{Plan: planID, Code: string(errs.CodeOK), Control: domain.ControlContinue}
 
@@ -137,7 +154,7 @@ func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID
 			out.Control = strongerControl(out.Control, domain.ControlStopRun)
 			break
 		}
-		res, execErr := e.Quarantine(ctx, sc, p, it, budget)
+		res, execErr := e.process(ctx, sc, p, it, qBudget, pBudget)
 		if execErr != nil {
 			out.Failed++
 			// The per-item record has to name the reason. Without this the caller

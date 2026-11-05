@@ -106,7 +106,7 @@ func TestRenderCarriesEveryFieldTheProductPromises(t *testing.T) {
 		Observed: Section{Entries: []Entry{{
 			Path: "下载/安装包.dmg", SizeBytes: 8192, AtNS: 1_700_000_000_000_000_000,
 			PurgeAfterNS: &purgeAfter, Reason: "safe_to_observe", ReasonText: "可安全移动，进入观察区",
-			Operation: "op_1",
+			ItemID: "obj_1", Operation: "op_1",
 		}}, Total: 1},
 		Kept: Section{Entries: []Entry{{
 			Path: "财务/账单.pdf", SizeBytes: 512, AtNS: 1_700_000_000_000_000_000,
@@ -119,7 +119,9 @@ func TestRenderCarriesEveryFieldTheProductPromises(t *testing.T) {
 	for _, want := range []string{
 		"## 已删除（1）", "构建/缓存.tmp", "4.0 KiB", "双模型同意永久删除",
 		"## 待删除（1）", "下载/安装包.dmg", "最早清空时间", "可安全移动，进入观察区",
-		"quarantine restore --object op_1",
+		// The restore command takes an item id. The operation id is a record of
+		// one attempt and resolves to nothing, so the page must not offer it.
+		"quarantine restore --object obj_1",
 		"## 保留（1）", "财务/账单.pdf", "模型服务不可用，本轮未处理", "模型服务失败",
 	} {
 		if !strings.Contains(md, want) {

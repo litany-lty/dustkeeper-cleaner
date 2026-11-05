@@ -765,13 +765,19 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 	// A run that handled files but could not leave a page behind is partial, not
 	// successful: the user was told to look at a place, and looking there would
 	// show the previous run.
-	if pageNote != "" && out.Code == "" {
+	//
+	// The test is against CodeOK, not against the empty string: ok() fills the
+	// code in, so "the code is empty" never matched a normal run, and a page
+	// that could not be written still left the JSON envelope and the exit status
+	// saying "fine". A more severe code already on the envelope is kept - being
+	// unable to write the page does not make a stopped run less stopped.
+	if pageNote != "" && out.Code == errs.CodeOK {
 		out.Code = errs.CodePartial
 		out.Status = string(errs.StatusPartial)
 		out.Message = "the run finished but its result page could not be written: " + pageNote
 		out.Next = append(out.Next, "dustkeeper cleanup report")
 	}
-	if pagePaths.Markdown != "" && out.Code == "" {
+	if pagePaths.Markdown != "" && out.Code == errs.CodeOK {
 		out.Next = append(out.Next, "dustkeeper cleanup report")
 	}
 	return out, nil

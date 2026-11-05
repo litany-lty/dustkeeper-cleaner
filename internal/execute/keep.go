@@ -2,7 +2,10 @@ package execute
 
 import (
 	"context"
+	"encoding/json"
+	"time"
 
+	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/outcome"
@@ -34,7 +37,19 @@ func (e *Executor) recordKeep(ctx context.Context, sc *ScopeCtx, it store.Item, 
 		`,"reason":` + quoteJSON(reviewed.Reason) +
 		`,"reason_text":` + quoteJSON(outcome.ReasonText(reviewed.Reason)) +
 		`,"verdict":` + quoteJSON(reviewed.Decision.Verdict) +
-		`,"model_error":` + quoteJSON(reviewed.Decision.ModelError) + `}`
+		`,"model_error":` + quoteJSON(reviewed.Decision.ModelError) +
+		// The version this decision was about. Without it a later run can only
+		// ask "was this path kept", which would also silence a different file
+		// that has since been created at the same place.
+		`,"identity":` + quoteJSON(it.PreIdentityJSON) +
+		`,"token":` + quoteJSON(it.PreTokenJSON) + `}`
+	ruleDigest := ""
+	if binding, berr := PlanBindingOf(it); berr == nil && binding.RuleDigest != nil {
+		ruleDigest = *binding.RuleDigest
+	}
+	contractJSON := `{"scope_id":` + quoteJSON(string(sc.Scope.ID)) +
+		`,"raw_relative_b64":` + quoteJSON(plan.B64(it.RawRelative)) +
+		`,"rule_digest":` + quoteJSON(ruleDigest) + `}`
 	if err := e.Store.AppendEvent(ctx, store.Event{
 		EventID:         domain.NewID("ev"),
 		ItemID:          &it.ID,
@@ -42,7 +57,7 @@ func (e *Executor) recordKeep(ctx context.Context, sc *ScopeCtx, it store.Item, 
 		Action:          "keep",
 		Phase:           domain.PhaseInfo,
 		OccurredAtNS:    e.Clock.Wall().UnixNano(),
-		ContractJSON:    `{"scope_id":` + quoteJSON(string(sc.Scope.ID)) + `,"raw_relative_b64":` + quoteJSON(plan.B64(it.RawRelative)) + `}`,
+		ContractJSON:    contractJSON,
 		ResultJSON:      &payload,
 	}); err != nil {
 		return res, err
@@ -63,4 +78,87 @@ func (e *Executor) recordKeep(ctx context.Context, sc *ScopeCtx, it store.Item, 
 	res.Code = string(errs.CodeKept)
 	res.Message = outcome.ReasonText(reviewed.Reason)
 	return res, nil
+}
+
+// keptRecently reports whether this exact version of this path already received
+// a keep decision that is still inside its retry interval.
+//
+// The interval is a spending rule, not a safety rule: a kept file cannot be
+// moved or deleted by this program either way, so asking the models again the
+// next minute buys nothing and costs a call. It is deliberately narrower than
+// "this path was kept once":
+//
+//   - the file must be the same object with the same content token, so editing
+//     or replacing it makes it eligible again;
+//   - the rule binding is part of the comparison, so a revised rule is asked
+//     about even when the file did not change;
+//   - a keep that records a failed review is not a decision about the file and
+//     does not suppress anything, because the next run should try again.
+func (e *Executor) keptRecently(ctx context.Context, sc *ScopeCtx, it store.Item,
+	preID domain.FileIdentity, preTok domain.ChangeToken, pol cleanup.Policy) (bool, error) {
+
+	if pol.KeepRetryDays <= 0 {
+		return false, nil
+	}
+	since := e.Clock.Wall().Add(-time.Duration(pol.KeepRetryDays) * 24 * time.Hour).UnixNano()
+	events, err := e.Store.KeepEventsSince(ctx, since, 500)
+	if err != nil {
+		return false, err
+	}
+	binding, err := PlanBindingOf(it)
+	if err != nil {
+		return false, err
+	}
+	for _, ev := range events {
+		var contract struct {
+			ScopeID     string `json:"scope_id"`
+			RawRelative string `json:"raw_relative_b64"`
+			RuleDigest  string `json:"rule_digest"`
+		}
+		if ev.ContractJSON != "" {
+			if err := json.Unmarshal([]byte(ev.ContractJSON), &contract); err != nil {
+				continue
+			}
+		}
+		if contract.ScopeID != "" && contract.ScopeID != string(sc.Scope.ID) {
+			continue
+		}
+		raw, derr := plan.UnB64(contract.RawRelative)
+		if derr != nil || string(raw) != string(it.RawRelative) {
+			continue
+		}
+		if contract.RuleDigest != "" && binding.RuleDigest != nil && contract.RuleDigest != *binding.RuleDigest {
+			continue
+		}
+		if ev.ResultJSON == nil {
+			continue
+		}
+		var payload struct {
+			Identity   string `json:"identity"`
+			Token      string `json:"token"`
+			Reason     string `json:"reason"`
+			ModelError string `json:"model_error"`
+		}
+		if err := json.Unmarshal([]byte(*ev.ResultJSON), &payload); err != nil {
+			continue
+		}
+		if payload.ModelError != "" || payload.Reason == outcome.ReasonReviewUnavailable {
+			// Nothing was decided about this file, so there is nothing to
+			// remember. A retry is the whole point of the next run.
+			continue
+		}
+		if payload.Identity == "" || payload.Token == "" {
+			continue
+		}
+		var keptID domain.FileIdentity
+		var keptTok domain.ChangeToken
+		if json.Unmarshal([]byte(payload.Identity), &keptID) != nil ||
+			json.Unmarshal([]byte(payload.Token), &keptTok) != nil {
+			continue
+		}
+		if ok, _ := sameStableObject(preID, preTok, keptID, keptTok); ok {
+			return true, nil
+		}
+	}
+	return false, nil
 }

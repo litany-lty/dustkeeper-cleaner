@@ -2,9 +2,12 @@ package review
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"dustkeeper/internal/domain"
 )
@@ -24,9 +27,19 @@ func thresholdFixture(t *testing.T) *HTTPJudge {
 		_, _ = w.Write([]byte(observedAllowAnswer))
 	}))
 	t.Cleanup(jev.Close)
-	minimax := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	minimax := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg-fixture","type":"message","role":"assistant","model":"MiniMax-M2.1","content":[{"type":"text","text":"{\"decision\":\"allow\",\"reason_code\":\"disposable\"}"}],"stop_reason":"end_turn"}`))
+		decision := `{"decision":"allow","reason_code":"disposable"}`
+		// A diagnostic session asks for the evidence behind the decision, so the
+		// fixture answers that question when it is the one being asked.
+		var request struct {
+			System string `json:"system"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		if strings.Contains(request.System, "For debug only") {
+			decision = `{"decision":"allow","reason_code":"disposable","explanation":"Synthetic evidence fixture.","missing_evidence":[]}`
+		}
+		_, _ = w.Write([]byte(`{"id":"msg-fixture","type":"message","role":"assistant","model":"MiniMax-M2.1","content":[{"type":"text","text":"` + strings.ReplaceAll(decision, `"`, `\"`) + `"}],"stop_reason":"end_turn"}`))
 	}))
 	t.Cleanup(minimax.Close)
 
@@ -76,6 +89,41 @@ func TestACalibratedGateUsesTheConfiguredValues(t *testing.T) {
 	}
 	if decision.JEV == nil || decision.JEV.MinConfidence != 0.70 || decision.JEV.MinAllowProbability != 0.80 {
 		t.Fatalf("the diagnostic does not record the gate it used: %+v", decision.JEV)
+	}
+}
+
+// TestADebugSessionKeepsTheCalibratedGate is R10.
+//
+// A diagnostic run exists to answer "what would this endpoint say", and the
+// answer only means something against the gate the product actually applies. A
+// session that quietly fell back to .9/.9 measured a different question from the
+// one the user configured, and nothing in its output said so.
+func TestADebugSessionKeepsTheCalibratedGate(t *testing.T) {
+	judge := thresholdFixture(t)
+	if err := judge.SetThresholds(0.70, 0.80); err != nil {
+		t.Fatalf("SetThresholds: %v", err)
+	}
+	session, err := judge.DebugSession(4, 10*time.Second)
+	if err != nil {
+		t.Fatalf("DebugSession: %v", err)
+	}
+	if conf, allow := session.Thresholds(); conf != 0.70 || allow != 0.80 {
+		t.Fatalf("the debug session applies %v/%v, want the configured .70/.80", conf, allow)
+	}
+	decision, err := session.Review(context.Background(), Facts{Category: "temporary_name_only", Action: "delete", ScopeID: "scope-1", RelativePath: "build-cache/old.tmp", ContentSHA256: "abc", SizeBytes: 12})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if decision.Verdict != domain.VerdictAllow {
+		t.Fatalf("verdict = %q: the session did not use the calibrated gate", decision.Verdict)
+	}
+	if decision.JEV == nil || decision.JEV.MinConfidence != 0.70 || decision.JEV.MinAllowProbability != 0.80 {
+		t.Fatalf("the diagnostic does not record the gate the session used: %+v", decision.JEV)
+	}
+	// The ordinary judge is unchanged: a diagnostic run may not recalibrate the
+	// installation it was run against.
+	if conf, allow := judge.Thresholds(); conf != 0.70 || allow != 0.80 {
+		t.Fatalf("the parent judge was modified: %v/%v", conf, allow)
 	}
 }
 

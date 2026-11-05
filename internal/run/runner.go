@@ -64,6 +64,11 @@ type ScopeRun struct {
 	QuarantinedBytes  int64  `json:"quarantined_logical_bytes"`
 	Purged            int    `json:"purged"`
 	PurgedBytes       int64  `json:"purged_logical_bytes"`
+	// EarliestPurgeNS is when the first object moved by this run may be cleared.
+	// It is read from the objects themselves, not from the policy: a rule that
+	// promised thirty days and a policy that observes fourteen produce one
+	// date, and the message has to state that date.
+	EarliestPurgeNS *int64 `json:"earliest_purge_ns,omitempty"`
 	DueNotAuthorised  int    `json:"due_but_not_authorised"`
 	// ExpirySkipped names the due objects the expiry review refused, with the
 	// reason each one was refused. It is a list rather than a count because "three
@@ -160,9 +165,26 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	}
 	ordered := r.rotate(scopes)
 
+	// The confirmed policy is read once, for two reasons. Its directory list
+	// bounds which scopes may be acted on at all, and its per-run ceiling is a
+	// limit that spans both action classes: "at most five files this run" is not
+	// "five moves plus five deletions".
+	pol, err := cleanup.Load(ctx, r.Store)
+	if err != nil {
+		return rep, err
+	}
+
 	runLedger := domain.NewRunLedger(cfg.RunSoftSeconds, cfg.RunReadBudgetBytes, cfg.ReadRateBytesPerSecond)
 	qLedger := domain.NewActionLedger(cfg.MaxAutoQuarantineFiles, cfg.MaxAutoQuarantineBytes)
 	pLedger := domain.NewActionLedger(cfg.MaxAutoPurgeFiles, cfg.MaxAutoPurgeBytes)
+	// An unconfirmed policy carries no ceiling, and it also authorises nothing:
+	// the destructive branch is closed, and the remaining work is bounded by the
+	// two class ledgers. A confirmed policy with a zero ceiling closes both
+	// classes, which is what a user who set zero asked for.
+	var shared *domain.ActionLedger
+	if pol.Confirmed() {
+		shared = domain.NewActionLedger(pol.MaxFilesPerRun, pol.MaxBytesPerRun)
+	}
 
 	if bookkeepingBroken {
 		// Every schedulable scope is named, not silently omitted: a scheduler that
@@ -209,7 +231,7 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 			continue
 		}
 
-		result, runErr := r.runScope(ctx, sc, runLedger, qLedger, pLedger, guard, verdict)
+		result, runErr := r.runScope(ctx, sc, pol, runLedger, qLedger, pLedger, shared, guard, verdict)
 		if runErr != nil {
 			result.Message = runErr.Error()
 			result.FailureCode = errs.CodeOf(runErr)
@@ -267,10 +289,22 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	return rep, nil
 }
 
-func (r *Runner) runScope(ctx context.Context, sc store.Scope, runLedger *domain.RunLedger,
-	qLedger, pLedger *domain.ActionLedger, guard *clocktrust.Guard, verdict clocktrust.Verdict) (ScopeRun, error) {
+func (r *Runner) runScope(ctx context.Context, sc store.Scope, pol cleanup.Policy, runLedger *domain.RunLedger,
+	qLedger, pLedger, shared *domain.ActionLedger, guard *clocktrust.Guard, verdict clocktrust.Verdict) (ScopeRun, error) {
 
 	sr := ScopeRun{Scope: sc.ID, Control: domain.ControlContinue}
+
+	// The confirmed directory list is the outermost bound. A scope a user removed
+	// from it may still have rules, grants and isolated objects from an earlier
+	// confirmation, and none of that is authority for a new move or deletion: the
+	// user said which directories this program works in now. Reading, restoring
+	// and reconciling those objects stay available through the other commands.
+	if pol.Confirmed() && !pol.Covers(string(sc.ID)) {
+		sr.Skipped = "this scope is not inside the confirmed cleanup scope; no new action was taken"
+		sr.PurgeSkipped = sr.Skipped
+		sr.QuarantineSkipped = sr.Skipped
+		return sr, nil
+	}
 
 	sctx, err := execute.OpenScopeCtx(ctx, r.Registrar, sc.ID)
 	if err != nil {
@@ -309,7 +343,7 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, runLedger *domain
 		sr.PurgeSkipped = blocked
 		sr.QuarantineSkipped = blocked
 	} else {
-		purge := r.purgeDue(ctx, sctx, runLedger, pLedger, guard)
+		purge := r.purgeDue(ctx, sctx, runLedger, pLedger, shared, guard)
 		sr.Purged, sr.PurgedBytes, sr.DueNotAuthorised = purge.Purged, purge.Bytes, purge.Refused
 		sr.ExpirySkipped = purge.Skipped
 		if purge.Note != "" {
@@ -365,10 +399,13 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, runLedger *domain
 		return sr, nil
 	}
 
-	q, qb, control, err := r.quarantineGrants(ctx, sctx, guardSet, runLedger, qLedger)
-	sr.Quarantined, sr.QuarantinedBytes = q, qb
-	sr.Control = strongerControl(sr.Control, control)
-	return sr, err
+	q := r.quarantineGrants(ctx, sctx, guardSet, runLedger, qLedger, pLedger, shared)
+	sr.Quarantined, sr.QuarantinedBytes = q.Moved, q.MovedBytes
+	sr.Purged += q.Purged
+	sr.PurgedBytes += q.PurgedBytes
+	sr.EarliestPurgeNS = q.EarliestPurgeNS
+	sr.Control = strongerControl(sr.Control, q.Control)
+	return sr, q.Err
 }
 
 // purgeOutcome is what one scope's clearing phase produced.
@@ -399,7 +436,7 @@ type purgeOutcome struct {
 // allowance. That review is what makes "this object was due and was left alone"
 // an answer with a reason rather than a silent subtraction from the budget.
 func (r *Runner) purgeDue(ctx context.Context, sc *execute.ScopeCtx, runLedger *domain.RunLedger,
-	ledger *domain.ActionLedger, guard *clocktrust.Guard) purgeOutcome {
+	ledger, shared *domain.ActionLedger, guard *clocktrust.Guard) purgeOutcome {
 
 	cfg := r.Config.Runtime
 	if cfg.MaxAutoPurgeFiles <= 0 || cfg.MaxAutoPurgeBytes <= 0 {
@@ -488,9 +525,10 @@ collect:
 				used.files++
 				used.bytes += size
 			}
-			if !ledger.CanReserve(size) {
-				// The run's purge allowance is spent. Stop looking: the ledger
-				// cannot grow again in this run.
+			if !ledger.CanReserve(size) || !shared.CanReserve(size) {
+				// The run's purge allowance, or the ceiling the confirmed policy
+				// put over every action, is spent. Stop looking: neither ledger
+				// can grow again in this run.
 				break collect
 			}
 			totalBytes += size
@@ -524,7 +562,7 @@ collect:
 
 	// The purge phase may spend at most what is left in the shared purge ledger,
 	// and its reads land in the same run ledger as everything else.
-	phase := domain.NewPhaseBudget(runLedger, ledger, ledger.RemainingFiles(), ledger.RemainingBytes())
+	phase := domain.NewPhaseBudget(runLedger, ledger, ledger.RemainingFiles(), ledger.RemainingBytes()).WithShared(shared)
 	res, err := r.Exec.ApplyPurgePlan(ctx, sc, p.ID, p.Digest, phase, guard.Assert)
 	if err != nil {
 		return purgeOutcome{Purged: res.Completed, Refused: refused, Skipped: skipped,
@@ -563,7 +601,7 @@ func (r *Runner) tellUser(ctx context.Context, sr *ScopeRun) {
 	if sr == nil || (sr.Quarantined == 0 && sr.Purged == 0) {
 		return
 	}
-	body := summaryMessage(sr.Purged, sr.Quarantined, r.observationDays(ctx))
+	body := summaryMessage(sr.Purged, sr.Quarantined, r.daysUntil(sr.EarliestPurgeNS))
 	res := r.deliver(ctx, body)
 	sr.Notification = &res
 	// The outcome is written down whichever way it went. A record that only exists
@@ -622,15 +660,24 @@ func (r *Runner) deliver(ctx context.Context, body string) notify.Result {
 	return r.Notify.Send(ctx, "Dustkeeper", body)
 }
 
-// observationDays is how long a newly isolated object is observed, for the
-// message text. A policy that cannot be read yields zero, which the message
-// omits rather than guessing at.
-func (r *Runner) observationDays(ctx context.Context) int {
-	pol, err := cleanup.Load(ctx, r.Store)
-	if err != nil {
+// daysUntil is how many days separate now from the earliest moment an object
+// moved by this run may be cleared.
+//
+// It is computed from the objects themselves. The policy's observation period is
+// the floor a new object gets, not the date any particular object carries: a
+// rule that promised thirty days produces a thirty day date under a fourteen day
+// policy, and telling the user "at least 14 days" would understate a window this
+// program must honour.
+func (r *Runner) daysUntil(ns *int64) int {
+	if ns == nil {
 		return 0
 	}
-	return pol.ObservationDays
+	const day = int64(24 * 60 * 60 * 1e9)
+	left := *ns - r.Clock.Wall().UnixNano()
+	if left <= 0 {
+		return 0
+	}
+	return int((left + day - 1) / day)
 }
 
 // summaryMessage is the sentence R26 asks for: what was deleted, what was moved
@@ -868,31 +915,57 @@ func CurrentEpoch(ctx context.Context, st *store.Store, id domain.ScopeID) (int6
 	return st.StartScanEpoch(ctx, id)
 }
 
+// quarantineOutcome is what one scope's quarantine phase produced.
+//
+// Moved and Purged are separate because they are different promises: one file
+// can be given back, the other cannot. Summing them into one counter is how the
+// user was told a deleted file was waiting in the observation area to be
+// restored.
+type quarantineOutcome struct {
+	Moved           int
+	MovedBytes      int64
+	Purged          int
+	PurgedBytes     int64
+	EarliestPurgeNS *int64
+	Control         string
+	Err             error
+}
+
+func (o quarantineOutcome) bytesMoved() int64 { return o.MovedBytes + o.PurgedBytes }
+
 // quarantineGrants applies every active rule that holds an auto-quarantine
 // grant, one plan per rule.
+//
+// A plan may end in either action: a category the user approved for direct
+// deletion is destroyed when both reviewers agree, and everything else is
+// moved. Both are counted from the result the executor returned for that item -
+// its state, not the plan's intention.
 func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, guard *policy.Guard,
-	runLedger *domain.RunLedger, ledger *domain.ActionLedger) (int, int64, string, error) {
+	runLedger *domain.RunLedger, qLedger, pLedger, shared *domain.ActionLedger) quarantineOutcome {
+
+	out := quarantineOutcome{Control: domain.ControlContinue}
 
 	allRules, err := r.Store.ListRules(ctx, sc.Scope.ID)
 	if err != nil {
-		return 0, 0, domain.ControlStopScope, err
+		out.Control = domain.ControlStopScope
+		out.Err = err
+		return out
 	}
 	planner := plan.Planner{Store: r.Store, Clock: r.Clock}
 
-	total, bytes := 0, int64(0)
-	control := domain.ControlContinue
-
 	for _, rule := range allRules {
 		if ctx.Err() != nil {
-			return total, bytes, domain.ControlStopRun, nil
+			out.Control = domain.ControlStopRun
+			return out
 		}
-		if control == domain.ControlStopScope || control == domain.ControlStopRun {
-			return total, bytes, control, nil
+		if out.Control == domain.ControlStopScope || out.Control == domain.ControlStopRun {
+			return out
 		}
 		// Planning and applying one rule is a new business action. Past the soft
 		// deadline it does not start, and the rules after it do not either.
 		if runLedger.TimeUp(r.Clock.Mono()) {
-			return total, bytes, strongerControl(control, domain.ControlStopScope), nil
+			out.Control = strongerControl(out.Control, domain.ControlStopScope)
+			return out
 		}
 		if rule.Status != domain.RuleActive {
 			continue
@@ -908,20 +981,28 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 			if errs.CodeOf(qerr) == errs.CodeGrantRequired {
 				continue
 			}
-			return total, bytes, domain.ControlStopScope, qerr
+			out.Control = domain.ControlStopScope
+			out.Err = qerr
+			return out
 		}
 		if err := plan.CheckAutomaticGrant(qg, sc.Scope, rule, domain.CapAutoQuarantine); err != nil {
-			return total, bytes, domain.ControlStopScope, err
+			out.Control = domain.ControlStopScope
+			out.Err = err
+			return out
 		}
 		pg, pgErr := r.Store.ActiveGrant(ctx, sc.Scope.ID, rule.ID, rule.Revision, domain.CapAutoPurge)
 		if pgErr != nil && errs.CodeOf(pgErr) != errs.CodeGrantRequired {
-			return total, bytes, domain.ControlStopScope, pgErr
+			out.Control = domain.ControlStopScope
+			out.Err = pgErr
+			return out
 		}
 
-		// The rule's own grant and the run's shared ledger both apply. Taking
-		// only the grant let two rules each spend the configured maximum.
-		maxFiles := minInt(ledger.RemainingFiles(), minInt(grantFiles(qg), r.Config.Runtime.MaxAutoQuarantineFiles))
-		maxBytes := minI64(ledger.RemainingBytes(), minI64(grantBytes(qg), r.Config.Runtime.MaxAutoQuarantineBytes))
+		// The rule's own grant, the run's class ledger and the confirmed policy's
+		// per-run ceiling all apply. Taking only the grant let two rules each
+		// spend the configured maximum; ignoring the ceiling let a run spend more
+		// than the user confirmed.
+		maxFiles := minInt(qLedger.RemainingFiles(), minInt(grantFiles(qg), r.Config.Runtime.MaxAutoQuarantineFiles))
+		maxBytes := minI64(qLedger.RemainingBytes(), minI64(grantBytes(qg), r.Config.Runtime.MaxAutoQuarantineBytes))
 		if maxFiles <= 0 || maxBytes <= 0 {
 			continue
 		}
@@ -953,32 +1034,60 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 			if errs.CodeOf(err) == errs.CodeNoCandidates {
 				continue
 			}
-			return total, bytes, domain.ControlStopScope, err
+			out.Control = domain.ControlStopScope
+			out.Err = err
+			return out
 		}
 
-		phase := domain.NewPhaseBudget(runLedger, ledger, maxFiles, maxBytes)
-		applied, err := r.Exec.ApplyQuarantinePlan(ctx, sc, res.Plan.ID, res.Plan.Digest, phase)
-		total += applied.Completed
-		control = strongerControl(control, applied.Control)
-		for _, out := range applied.Results {
-			if out.Code != string(errs.CodeOK) {
+		// The plan is executed with both allowances attached: an item that turns
+		// out to be a permanent deletion spends the purge ledger and the policy
+		// ceiling, and one that turns out to be a move spends the quarantine
+		// ledger. Neither can borrow the other's.
+		phase := domain.NewPhaseBudget(runLedger, qLedger, maxFiles, maxBytes).WithShared(shared)
+		purgePhase := domain.NewPhaseBudget(runLedger, pLedger,
+			pLedger.RemainingFiles(), pLedger.RemainingBytes()).WithShared(shared)
+		applied, err := r.Exec.ApplyQuarantinePlanWithBudgets(ctx, sc, res.Plan.ID, res.Plan.Digest, phase, purgePhase)
+		out.Control = strongerControl(out.Control, applied.Control)
+		for _, result := range applied.Results {
+			if result.Code != string(errs.CodeOK) {
 				continue
 			}
+			size := int64(0)
 			for _, it := range res.Items {
-				if it.ID == out.Item {
-					bytes += itemSize(it)
+				if it.ID == result.Item {
+					size = itemSize(it)
 					break
+				}
+			}
+			if result.State == domain.StatePurged {
+				out.Purged++
+				out.PurgedBytes += size
+				continue
+			}
+			out.Moved++
+			out.MovedBytes += size
+			// The earliest clear date comes from the object that was actually
+			// moved. A rule's thirty days and a policy's fourteen produce one
+			// bound, and this is the one the user was promised.
+			if it, gerr := r.Store.GetItem(ctx, result.Item); gerr == nil && it.PurgeNotBeforeNS != nil {
+				if out.EarliestPurgeNS == nil || *it.PurgeNotBeforeNS < *out.EarliestPurgeNS {
+					v := *it.PurgeNotBeforeNS
+					out.EarliestPurgeNS = &v
 				}
 			}
 		}
 		if err != nil {
-			return total, bytes, strongerControl(control, ControlOfError(err)), err
+			out.Control = strongerControl(out.Control, ControlOfError(err))
+			out.Err = err
+			return out
 		}
 		if stopErr := batchStop(applied); stopErr != nil {
-			return total, bytes, strongerControl(control, applied.Control), stopErr
+			out.Control = strongerControl(out.Control, applied.Control)
+			out.Err = stopErr
+			return out
 		}
 	}
-	return total, bytes, control, nil
+	return out
 }
 
 // BuildGuard resolves protection identities with the kernel. The work is done in

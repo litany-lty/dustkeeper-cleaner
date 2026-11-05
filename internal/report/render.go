@@ -137,7 +137,7 @@ func Render(page Page) string {
 			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | `dustkeeper quarantine restore --object %s` |\n",
 				mdCode(e.Path), humanBytes(e.SizeBytes),
 				time.Unix(0, e.AtNS).Format("2006-01-02 15:04:05"), earliest,
-				mdCell(reasonOf(e)), operationOf(e))
+				mdCell(reasonOf(e)), objectOf(e))
 		}
 		writeMore(&b, page.Observed)
 		b.WriteString("\n想留下某个文件，用上面的 `restore` 把它放回原处；它随后会被记为受保护，不会再被这个规则选中。\n\n")
@@ -179,9 +179,12 @@ func reasonOf(e Entry) string {
 	return e.Reason
 }
 
-func operationOf(e Entry) string {
-	if e.Operation != "" {
-		return e.Operation
+// objectOf is the argument the restore command needs. An entry without one is
+// labelled rather than filled with the operation id: a command that cannot work
+// is worse than a column that says it is unknown.
+func objectOf(e Entry) string {
+	if e.ItemID != "" {
+		return e.ItemID
 	}
 	return "unknown"
 }

@@ -106,7 +106,22 @@ func TestANonZeroInodeFlagDoesNotBlockThePurge(t *testing.T) {
 		t.Fatalf("the rename lost the flags: %#x", flags)
 	}
 
-	e.clock.Advance(8 * 24 * time.Hour)
+	// The clock is moved to the object's own deadline rather than to a round
+	// number: the rule promised seven days, but a newly isolated object is held
+	// for the longer of that and the policy's floor, and shortening the product's
+	// window to make this fixture convenient would test a promise nobody made.
+	item, err := e.st.GetItem(context.Background(), res.Items[0].ID)
+	if err != nil {
+		t.Fatalf("get item: %v", err)
+	}
+	if item.PurgeNotBeforeNS == nil {
+		t.Fatal("the quarantined object records no deadline")
+	}
+	// The clock is measured against the fake one, never the real one: the fixture
+	// runs at a fixed date, so time.Until would be a duration that has nothing to
+	// do with the object.
+	left := time.Duration(*item.PurgeNotBeforeNS - e.clock.Wall().UnixNano())
+	e.clock.Advance(left + time.Minute)
 	due, err := e.st.ItemsDueForPurge(context.Background(), sc.ID, e.clock.Wall().UnixNano(), 10)
 	if err != nil {
 		t.Fatalf("due: %v", err)
@@ -114,7 +129,7 @@ func TestANonZeroInodeFlagDoesNotBlockThePurge(t *testing.T) {
 	if len(due) != 1 {
 		t.Fatalf("expected one due item, got %d", len(due))
 	}
-	item := due[0]
+	item = due[0]
 
 	if item.MetadataHash == nil {
 		t.Fatal("the quarantined object carries no metadata digest")

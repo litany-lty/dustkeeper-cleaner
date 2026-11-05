@@ -78,7 +78,11 @@ func TestQuarantineIsAnnouncedAndRecorded(t *testing.T) {
 	if len(messages) != 1 {
 		t.Fatalf("expected one message, got %v", messages)
 	}
-	if !strings.Contains(messages[0], "1 个文件进入待删除区") || !strings.Contains(messages[0], "14 天") {
+	// The number in the message is the object's own retention, not the policy's
+	// display default: the rule above binds 30 days, while the confirmed policy
+	// says 14. A message that quoted 14 would tell the user the file clears a
+	// fortnight before it does.
+	if !strings.Contains(messages[0], "1 个文件进入待删除区") || !strings.Contains(messages[0], "30 天") {
 		t.Fatalf("the message does not say what happened or when it clears: %q", messages[0])
 	}
 	if len(rep.Scopes) != 1 || rep.Scopes[0].Notification == nil || !rep.Scopes[0].Notification.Delivered {
