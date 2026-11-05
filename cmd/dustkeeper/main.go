@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 
+	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/config"
 	"dustkeeper/internal/diag"
 	"dustkeeper/internal/domain"
@@ -71,9 +72,23 @@ type app struct {
 var testSender notify.Sender
 
 // notifySender is the channel this invocation delivers through.
+//
+// The confirmed policy is consulted before the default channel is chosen,
+// because "no notifications" is a decision about the channel and not only about
+// the reminder in front of a clearing. Running osascript anyway would either
+// show a notification the user refused, or fail on a host that has no GUI
+// session and report a delivery failure the user asked not to have. A policy
+// that asked for the system notification still gets it; a policy that cannot be
+// read is not treated as "off", because silence would then hide the breakage
+// rather than the choice.
 func (a *app) notifySender() notify.Sender {
 	if a.sender != nil {
 		return a.sender
+	}
+	if a.store != nil {
+		if pol, err := cleanup.Load(context.Background(), a.store); err == nil && pol.Notify == cleanup.NotifyNone {
+			return notify.None{}
+		}
 	}
 	if testSender != nil {
 		return testSender

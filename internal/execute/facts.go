@@ -34,11 +34,18 @@ type OpenFilesFunc func(ctx context.Context, root string) (assess.OpenObservatio
 
 // openFilesTTL is how long one probe answer is reused.
 //
-// The probe is a snapshot of the process table, not a live subscription, and it
-// costs about a second. A run of fifty candidates used to mean fifty snapshots;
-// one per minute says the same thing about the tree without that cost, and a
-// file opened inside the window is still protected by the identity and content
-// checks that run at the moment of the action.
+// The probe is a snapshot of the process table at one instant, not a live
+// subscription, and it costs about a second. A run of fifty candidates used to
+// mean fifty snapshots; one per minute says the same thing about the tree
+// without that cost.
+//
+// The window is a plain limitation and is stated as one: a file that a process
+// opens after the snapshot is not in it. The identity, size and content checks
+// at the moment of the action catch a file that is *changed*, and they do not
+// catch a file that was merely opened for reading - opening does not alter any
+// of the three. So the answer this cache carries is "no visible process held
+// anything in this tree open at the moment of the snapshot", and it should not
+// be read as a guarantee about the minute that follows.
 const openFilesTTL = 60 * time.Second
 
 type openFilesEntry struct {

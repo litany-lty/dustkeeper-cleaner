@@ -76,6 +76,63 @@ func TestOneTreeProbeSeparatesAFinishedRunFromABrokenOne(t *testing.T) {
 	}
 }
 
+// TestAProcessListingThatDidNotFinishIsNotAnEmptyAnswer pins the other half of
+// the same statement: a failed run said nothing, and nothing is not "unused".
+//
+// An *exec.ExitError is not proof that the command ran. It is also what a
+// crashed helper, a refused permission and a tool that could not look at all
+// return, and treating those as "the listing is complete and the file was not
+// in it" turns a failure into the positive fact a move is authorised on.
+func TestAProcessListingThatDidNotFinishIsNotAnEmptyAnswer(t *testing.T) {
+	root := "/scoped"
+	listed := []byte("p42\x00f3\x00n/scoped/a.zip\x00")
+
+	obs := ProbeOpenUnder(context.Background(), root,
+		func(context.Context, string, ...string) ([]byte, error) {
+			return nil, &exec.ExitError{ProcessState: exitedWith(2)}
+		})
+	if obs.Coverage == "visible_processes_only" {
+		t.Fatalf("a failed listing became a complete empty answer: %+v", obs)
+	}
+
+	// What the broken run did see is still knowledge: the file was listed open,
+	// and a later failure does not unsee it.
+	obs = ProbeOpenUnder(context.Background(), root,
+		func(context.Context, string, ...string) ([]byte, error) {
+			return listed, &exec.ExitError{ProcessState: exitedWith(2)}
+		})
+	if obs.Coverage != "partial_visible_processes" || !obs.Paths[root+"/a.zip"] {
+		t.Fatalf("a match seen before the failure was dropped: %+v", obs)
+	}
+
+	// The positive case, unchanged: a run that finished with nothing to list is
+	// a complete answer, and the fact built on it stays available.
+	obs = ProbeOpenUnder(context.Background(), root,
+		func(context.Context, string, ...string) ([]byte, error) {
+			return nil, &exec.ExitError{ProcessState: exitedWith(1)}
+		})
+	if obs.Coverage != "visible_processes_only" || len(obs.Paths) != 0 {
+		t.Fatalf("an empty finished listing stopped being trusted: %+v", obs)
+	}
+}
+
+// TestAProbeKilledByItsOwnDeadlineIsNotAnAnswer uses the real command runner and
+// a real deadline, not a hand-made error value: the shape of "the process was
+// killed" is the thing under test, and only the operating system produces it.
+func TestAProbeKilledByItsOwnDeadlineIsNotAnAnswer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	obs := ProbeOpenUnder(ctx, t.TempDir(), func(c context.Context, _ string, _ ...string) ([]byte, error) {
+		return RunBoundedCommand(c, "/bin/sleep", "1")
+	})
+	if ctx.Err() == nil {
+		t.Fatal("fixture did not reach its deadline")
+	}
+	if obs.Coverage == "visible_processes_only" {
+		t.Fatalf("a killed listing became a complete empty answer: %+v ctx=%v", obs, ctx.Err())
+	}
+}
+
 // exitedWith builds a process state that exited with the given status.
 func exitedWith(code int) *os.ProcessState {
 	cmd := exec.Command("sh", "-c", "exit "+strconv.Itoa(code))

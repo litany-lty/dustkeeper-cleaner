@@ -422,7 +422,8 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 		// end the operation when the object merely could not be opened for a
 		// moment; a read that failed is not a verdict, so that case parks and the
 		// next pass records the evidence.
-		if cerr := r.captureEvidence(ctx, sc, po); cerr != nil {
+		if cerr := r.captureEvidence(ctx, sc, po, "UNEXPECTED_VAULT_OBJECT",
+			"the vault holds an object that is not the planned one; its evidence was recorded so it can be restored"); cerr != nil {
 			return r.recordFailure(ctx, po, out, "CAPTURE_EVIDENCE_UNREADABLE", cerr)
 		}
 		out.Detail = "the vault holds an object that is not the planned one; its evidence was recorded so it can be restored"
@@ -505,10 +506,30 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, sc *execute.ScopeCtx, 
 			return r.recordFailure(ctx, po, out, "CAPTURE_VERIFY_FAILED", cerr)
 		}
 		if !unchanged {
-			return r.holdUnfixable(ctx, po, out, "CAPTURED_CONTENT_CHANGED",
-				"the object in the vault is not the content the deletion was approved for; it was left exactly where it is")
+			// The bytes in the vault are not the bytes the review agreed to, so
+			// the deletion stops here. The object is still real, and the product
+			// still has to be able to give it back: the hold records the identity
+			// and the token of the object that is actually in the vault, taken
+			// from that object and not from the plan's expectation.
+			//
+			// Without that pair, Restore refuses with "no recorded post-move
+			// identity" while the file sits in the vault, and the next
+			// reconcile has no pending row left to process: a dead end with the
+			// bytes still on disk. If the evidence cannot be written, nothing is
+			// closed - the pending row stays and the next pass tries again.
+			const why = "the object in the vault is not the content the deletion was approved for; it was left exactly where it is"
+			if cerr := r.captureEvidence(ctx, sc, po, "CAPTURED_CONTENT_CHANGED", why); cerr != nil {
+				return r.recordFailure(ctx, po, out, "CAPTURE_EVIDENCE_UNREADABLE", cerr)
+			}
+			if err := r.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld); err != nil {
+				out.RecordError = "the scope could not be marked held: " + err.Error()
+			}
+			out.Outcome = "held"
+			out.Detail = why + "; the captured object can be restored from there"
+			return out
 		}
-		if cerr := r.captureEvidence(ctx, sc, po); cerr != nil {
+		if cerr := r.captureEvidence(ctx, sc, po, "UNEXPECTED_VAULT_OBJECT",
+			"the file was captured into the vault but the deletion did not finish; it can be restored from there"); cerr != nil {
 			return r.recordFailure(ctx, po, out, "CAPTURE_EVIDENCE_UNREADABLE", cerr)
 		}
 		if err := r.Store.SetScopeStatus(ctx, sc.Scope.ID, domain.ScopeHeld); err != nil {
@@ -519,8 +540,17 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, sc *execute.ScopeCtx, 
 		return out
 
 	case vaultFound:
-		return r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
-			"an object with this name exists in the vault and is not the object this operation captured; nothing was changed")
+		// A different object occupies the vault name. It is not the object the
+		// plan expected, but it is an object the product put there, so the hold
+		// records what is actually on disk: a file nobody can name is a file
+		// nobody can restore.
+		const why = "an object with this name exists in the vault and is not the object this operation captured; nothing was changed"
+		if cerr := r.captureEvidence(ctx, sc, po, "UNEXPECTED_VAULT_OBJECT", why); cerr != nil {
+			return r.recordFailure(ctx, po, out, "CAPTURE_EVIDENCE_UNREADABLE", cerr)
+		}
+		out.Outcome = "held"
+		out.Detail = why + "; the object in the vault can be restored from there"
+		return out
 
 	case srcFound && srcID.Equal(contract.ExpectedIdent):
 		// The path still holds an object with the planned identity. Identity is
@@ -551,14 +581,21 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, sc *execute.ScopeCtx, 
 	case !srcFound:
 		// The path holds nothing. That is consistent with a completed unlink, but
 		// it is equally consistent with somebody else having removed the file, so
-		// the completion records only what can be observed. The source directory
-		// is flushed first: the entry disappeared, and that disappearance has to
-		// be on disk before the removal is written down as done.
+		// the completion records only what can be observed.
+		//
+		// Two directories changed and both have to be on disk before the removal
+		// is written down as done. The source parent lost its entry; the vault's
+		// objects directory lost the captured copy. The deletion really happens
+		// in the objects directory, and an anchor flush is not a flush of that
+		// directory: skipping it records a removal a crash could undo.
+		if err := fsops.DurableDir(sc.Objects); err != nil {
+			return r.recordFailure(ctx, po, out, "SYNC_FAILED", err)
+		}
 		parent, perr := sc.Root.OpenParent(it.RawRelative)
 		if perr != nil {
 			if errors.Is(perr, unix.ENOENT) {
-				// The directory is gone as well, so there is nothing left to
-				// flush. The removal is still explainable.
+				// The source directory is gone as well, so its side has nothing
+				// left to flush. The removal is still explainable.
 				return r.completeReconciledDelete(ctx, po, out)
 			}
 			return r.recordFailure(ctx, po, out, "SOURCE_PARENT_UNAVAILABLE", perr)
@@ -663,7 +700,7 @@ func (r *Reconciler) contractContentMatches(ctx context.Context, sc *execute.Sco
 // error with its own category, so the caller can park a temporary one instead of
 // ending an operation whose evidence simply could not be read yet.
 func (r *Reconciler) captureEvidence(ctx context.Context, sc *execute.ScopeCtx,
-	po store.PendingOp) error {
+	po store.PendingOp, code, detail string) error {
 
 	it := po.Item
 	objParent, err := sc.Objects.ParentOf(it.ObjectName)
@@ -681,9 +718,9 @@ func (r *Reconciler) captureEvidence(ctx context.Context, sc *execute.ScopeCtx,
 
 	idJSON, _ := json.Marshal(obj.Identity)
 	tokJSON, _ := json.Marshal(obj.Token)
-	payload := `{"source":"reconciled","result":"vault object is not the planned object","captured_identity":` +
+	payload := `{"source":"reconciled","result":` + quoteJSON(detail) + `,"captured_identity":` +
 		quoteJSON(string(idJSON)) + `,"captured_token":` + quoteJSON(string(tokJSON)) + `}`
-	if err := r.Store.HoldIntentWithCapture(ctx, intentOf(po), "UNEXPECTED_VAULT_OBJECT",
+	if err := r.Store.HoldIntentWithCapture(ctx, intentOf(po), code,
 		payload, string(idJSON), string(tokJSON)); err != nil {
 		return errs.Wrapf(errs.CodeStateWriteFailed, err,
 			"the evidence of the object that moved could not be recorded for %s", it.ID)

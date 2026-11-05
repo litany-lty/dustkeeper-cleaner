@@ -579,12 +579,19 @@ func cmdResume(ctx context.Context, a *app, args []string) (output, error) {
 }
 
 // notifiedOf renders one scope's delivery outcome for the operational log.
+//
+// "Chose not to try" and "tried and failed" are different answers to the same
+// question, and an operator who has to fix one of them needs to know which. A
+// user who confirmed a policy of no notifications is not a fault to investigate.
 func notifiedOf(s run.ScopeRun) string {
 	if s.Notification == nil {
 		return "not_applicable"
 	}
 	if s.Notification.Delivered {
 		return "delivered"
+	}
+	if !s.Notification.Attempted {
+		return "not_attempted: " + s.Notification.Detail
 	}
 	return "failed: " + s.Notification.Detail
 }
@@ -734,8 +741,13 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 				res.Human = append(res.Human, "      left alone: "+why)
 			}
 			if s.Notification != nil && !s.Notification.Delivered {
-				res.Human = append(res.Human,
-					"      the user was not told: "+s.Notification.Detail)
+				if s.Notification.Attempted {
+					res.Human = append(res.Human,
+						"      the user was not told: "+s.Notification.Detail)
+				} else {
+					res.Human = append(res.Human,
+						"      notifications are off: "+s.Notification.Detail)
+				}
 			}
 		}
 		return res, nil

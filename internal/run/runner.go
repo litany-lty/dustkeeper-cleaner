@@ -185,6 +185,9 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	if pol.Confirmed() {
 		shared = domain.NewActionLedger(pol.MaxFilesPerRun, pol.MaxBytesPerRun)
 	}
+	// One record of what each approval has already spent, shared by every phase
+	// of this run.
+	grants := newGrantAllowance()
 
 	if bookkeepingBroken {
 		// Every schedulable scope is named, not silently omitted: a scheduler that
@@ -231,7 +234,7 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 			continue
 		}
 
-		result, runErr := r.runScope(ctx, sc, pol, runLedger, qLedger, pLedger, shared, guard, verdict)
+		result, runErr := r.runScope(ctx, sc, pol, runLedger, qLedger, pLedger, shared, grants, guard, verdict)
 		if runErr != nil {
 			result.Message = runErr.Error()
 			result.FailureCode = errs.CodeOf(runErr)
@@ -290,7 +293,8 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 }
 
 func (r *Runner) runScope(ctx context.Context, sc store.Scope, pol cleanup.Policy, runLedger *domain.RunLedger,
-	qLedger, pLedger, shared *domain.ActionLedger, guard *clocktrust.Guard, verdict clocktrust.Verdict) (ScopeRun, error) {
+	qLedger, pLedger, shared *domain.ActionLedger, grants *grantAllowance,
+	guard *clocktrust.Guard, verdict clocktrust.Verdict) (ScopeRun, error) {
 
 	sr := ScopeRun{Scope: sc.ID, Control: domain.ControlContinue}
 
@@ -343,7 +347,7 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, pol cleanup.Polic
 		sr.PurgeSkipped = blocked
 		sr.QuarantineSkipped = blocked
 	} else {
-		purge := r.purgeDue(ctx, sctx, runLedger, pLedger, shared, guard)
+		purge := r.purgeDue(ctx, sctx, runLedger, pLedger, shared, grants, guard)
 		sr.Purged, sr.PurgedBytes, sr.DueNotAuthorised = purge.Purged, purge.Bytes, purge.Refused
 		sr.ExpirySkipped = purge.Skipped
 		if purge.Note != "" {
@@ -399,7 +403,7 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, pol cleanup.Polic
 		return sr, nil
 	}
 
-	q := r.quarantineGrants(ctx, sctx, guardSet, runLedger, qLedger, pLedger, shared)
+	q := r.quarantineGrants(ctx, sctx, guardSet, runLedger, qLedger, pLedger, shared, grants)
 	sr.Quarantined, sr.QuarantinedBytes = q.Moved, q.MovedBytes
 	sr.Purged += q.Purged
 	sr.PurgedBytes += q.PurgedBytes
@@ -436,7 +440,7 @@ type purgeOutcome struct {
 // allowance. That review is what makes "this object was due and was left alone"
 // an answer with a reason rather than a silent subtraction from the budget.
 func (r *Runner) purgeDue(ctx context.Context, sc *execute.ScopeCtx, runLedger *domain.RunLedger,
-	ledger, shared *domain.ActionLedger, guard *clocktrust.Guard) purgeOutcome {
+	ledger, shared *domain.ActionLedger, grants *grantAllowance, guard *clocktrust.Guard) purgeOutcome {
 
 	cfg := r.Config.Runtime
 	if cfg.MaxAutoPurgeFiles <= 0 || cfg.MaxAutoPurgeBytes <= 0 {
@@ -462,8 +466,14 @@ func (r *Runner) purgeDue(ctx context.Context, sc *execute.ScopeCtx, runLedger *
 	// approval. Both apply, and the smaller one wins. Spending ten because the
 	// configuration allows ten, when the user approved one for this grant, is how
 	// "the approved maximum" turned into a number nobody enforced.
+	//
+	// The claim is charged to the approval's own ledger, not to a counter that
+	// lives in this function. The direct deletion path spends the same approval
+	// later in the same run, and two separate counters would each see "one file
+	// left" and each spend it. A claim that does not become an action is given
+	// back below.
 	quotas := map[domain.GrantID]grantQuota{}
-	spent := map[domain.GrantID]*grantSpend{}
+	claimed := map[domain.ItemID]*domain.ActionLedger{}
 
 collect:
 	for len(authorised) < cfg.MaxAutoPurgeFiles {
@@ -509,27 +519,26 @@ collect:
 				refused++
 				continue
 			}
-			if gid := grantIDOf(it); gid != "" {
-				used := spent[gid]
-				if used == nil {
-					used = &grantSpend{}
-					spent[gid] = used
-				}
-				if used.files+1 > quota.files || used.bytes+size > quota.bytes {
-					// This grant has spent what it approved. Another object under
-					// the same grant waits for the next run, when a new plan is
-					// approved against the same ceiling.
-					refused++
-					continue
-				}
-				used.files++
-				used.bytes += size
-			}
+			// The run-wide ledgers are asked first, because the answer "spent"
+			// ends the collection: a claim taken for an object that never joins
+			// the plan would be authority nobody spends and nobody gets back.
 			if !ledger.CanReserve(size) || !shared.CanReserve(size) {
 				// The run's purge allowance, or the ceiling the confirmed policy
 				// put over every action, is spent. Stop looking: neither ledger
 				// can grow again in this run.
 				break collect
+			}
+			if gid := grantIDOf(it); gid != "" {
+				gl := grants.ledger(gid, quota.files, quota.bytes)
+				if !gl.CanReserve(size) {
+					// This approval has spent what it approved. Another object
+					// under the same grant waits for the next run, when a new
+					// plan is approved against the same ceiling.
+					refused++
+					continue
+				}
+				gl.Add(size)
+				claimed[it.ID] = gl
 			}
 			totalBytes += size
 			authorised = append(authorised, it)
@@ -564,23 +573,34 @@ collect:
 	// and its reads land in the same run ledger as everything else.
 	phase := domain.NewPhaseBudget(runLedger, ledger, ledger.RemainingFiles(), ledger.RemainingBytes()).WithShared(shared)
 	res, err := r.Exec.ApplyPurgePlan(ctx, sc, p.ID, p.Digest, phase, guard.Assert)
+
+	// A claim on an approval only becomes spending when the object actually
+	// left. Everything the plan did not clear hands its claim back: a batch that
+	// stopped at its fourth item, or an object that vanished between the plan and
+	// the purge, must not consume authority the user granted for a file that is
+	// still sitting there.
+	cleared := make(map[domain.ItemID]bool, len(res.Results))
+	for _, out := range res.Results {
+		if out.Code == string(errs.CodeOK) {
+			cleared[out.Item] = true
+		}
+	}
+	var bytes int64
+	for _, it := range authorised {
+		if !cleared[it.ID] {
+			if gl := claimed[it.ID]; gl != nil {
+				gl.Release(itemSize(it))
+			}
+			continue
+		}
+		bytes += itemSize(it)
+	}
+
 	if err != nil {
 		return purgeOutcome{Purged: res.Completed, Refused: refused, Skipped: skipped,
 			Control: ControlOfError(err), Err: err}
 	}
 
-	var bytes int64
-	for _, out := range res.Results {
-		if out.Code != string(errs.CodeOK) {
-			continue
-		}
-		for _, it := range authorised {
-			if it.ID == out.Item {
-				bytes += itemSize(it)
-				break
-			}
-		}
-	}
 	if stopErr := batchStop(res); stopErr != nil {
 		return purgeOutcome{Purged: res.Completed, Bytes: bytes, Refused: refused, Skipped: skipped,
 			Control: strongerControl(res.Control, ControlOfError(stopErr)), Err: stopErr}
@@ -610,7 +630,12 @@ func (r *Runner) tellUser(ctx context.Context, sr *ScopeRun) {
 	if err := notify.Record(ctx, r.Store, r.Clock.Wall().UnixNano(), body, res); err != nil {
 		sr.Message = joinNote(sr.Message, "the notification outcome could not be recorded: "+err.Error())
 	}
-	if !res.Delivered {
+	// A delivery that was attempted and failed is a fault and is reported as one.
+	// A channel the user turned off was not a failed delivery: it is the choice
+	// they confirmed, and writing "the user was not told" into every run report
+	// would turn that choice into a permanent warning nobody can clear. The
+	// record still carries the channel, so the page can say which one it was.
+	if !res.Delivered && res.Attempted {
 		sr.Message = joinNote(sr.Message, "the user was not told: "+res.Detail)
 	}
 }
@@ -749,10 +774,34 @@ type grantQuota struct {
 	bytes int64
 }
 
-// grantSpend is what this run has already spent under one approval.
-type grantSpend struct {
-	files int
-	bytes int64
+// grantAllowance is one ledger per approval, for the length of one run.
+//
+// A grant is the answer to "how many of these may this rule touch", and that
+// number belongs to the approval rather than to a phase. The expiry clearance
+// and the direct deletion both spend the same purge grant; keeping the count in
+// each phase let them each read "one file left" and each spend it, so an
+// approval for one file produced three deletions.
+type grantAllowance struct {
+	ledgers map[domain.GrantID]*domain.ActionLedger
+}
+
+func newGrantAllowance() *grantAllowance {
+	return &grantAllowance{ledgers: map[domain.GrantID]*domain.ActionLedger{}}
+}
+
+// ledger returns the ledger for one approval, creating it from the ceiling the
+// approval carries the first time it is seen. A nil allowance, or an item with
+// no grant behind it, answers nil: no approval means no ledger to charge.
+func (a *grantAllowance) ledger(id domain.GrantID, maxFiles int, maxBytes int64) *domain.ActionLedger {
+	if a == nil || id == "" {
+		return nil
+	}
+	if l := a.ledgers[id]; l != nil {
+		return l
+	}
+	l := domain.NewActionLedger(maxFiles, maxBytes)
+	a.ledgers[id] = l
+	return l
 }
 
 // grantIDOf returns the grant an item was authorised by, or "" when it has none.
@@ -941,7 +990,8 @@ func (o quarantineOutcome) bytesMoved() int64 { return o.MovedBytes + o.PurgedBy
 // moved. Both are counted from the result the executor returned for that item -
 // its state, not the plan's intention.
 func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, guard *policy.Guard,
-	runLedger *domain.RunLedger, qLedger, pLedger, shared *domain.ActionLedger) quarantineOutcome {
+	runLedger *domain.RunLedger, qLedger, pLedger, shared *domain.ActionLedger,
+	grants *grantAllowance) quarantineOutcome {
 
 	out := quarantineOutcome{Control: domain.ControlContinue}
 
@@ -1044,8 +1094,19 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 		// ceiling, and one that turns out to be a move spends the quarantine
 		// ledger. Neither can borrow the other's.
 		phase := domain.NewPhaseBudget(runLedger, qLedger, maxFiles, maxBytes).WithShared(shared)
+		// A direct deletion is spending this rule's purge approval, and that
+		// approval may already have been partly spent by the expiry clearance a
+		// few lines above. The phase therefore carries the approval's own ledger:
+		// the smaller of "what the run may still purge" and "what this approval
+		// has left" is the only honest ceiling.
+		var pgLedger *domain.ActionLedger
+		if pgErr == nil && pg.ID != "" {
+			pgLedger = grants.ledger(pg.ID, grantFiles(pg), grantBytes(pg))
+		}
 		purgePhase := domain.NewPhaseBudget(runLedger, pLedger,
-			pLedger.RemainingFiles(), pLedger.RemainingBytes()).WithShared(shared)
+			minInt(pLedger.RemainingFiles(), pgLedger.RemainingFiles()),
+			minI64(pLedger.RemainingBytes(), pgLedger.RemainingBytes())).
+			WithShared(shared).WithGrant(pgLedger)
 		applied, err := r.Exec.ApplyQuarantinePlanWithBudgets(ctx, sc, res.Plan.ID, res.Plan.Digest, phase, purgePhase)
 		out.Control = strongerControl(out.Control, applied.Control)
 		for _, result := range applied.Results {

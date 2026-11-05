@@ -126,6 +126,25 @@ func (l *ActionLedger) Add(size int64) {
 	l.Bytes += size
 }
 
+// Release returns a reservation that did not become an action.
+//
+// A ceiling has to be claimed before the work is done - otherwise three
+// candidates would each be told "one left" and all three would proceed - so the
+// claim is made at planning time and given back when the plan turns out not to
+// have spent it. Nothing here can go below zero: a release without a matching
+// Add is a bug, not a way to grant authority.
+func (l *ActionLedger) Release(size int64) {
+	if l == nil || l.Files <= 0 {
+		return
+	}
+	l.Files--
+	if l.Bytes >= size {
+		l.Bytes -= size
+	} else {
+		l.Bytes = 0
+	}
+}
+
 // RemainingFiles returns how many more actions the run may still perform.
 func (l *ActionLedger) RemainingFiles() int {
 	if l == nil {
@@ -159,6 +178,14 @@ type Budget struct {
 	// confirmed policy states the second kind of limit, and without it two
 	// classes could each spend the whole of it.
 	Shared *ActionLedger
+	// Grant is the single approval this action belongs to, when the caller knows
+	// which one it is.
+	//
+	// A grant is the user's answer to "how many of these may this rule touch".
+	// That number belongs to the approval, not to a phase: the expiry clearance
+	// and the direct deletion both spend the same purge grant, and with one
+	// ledger per phase each of them read "one file left" and spent it.
+	Grant *ActionLedger
 
 	// Capped says whether this phase has its own allowance. When it is false the
 	// shared ledgers are the only limit, which is the right shape for a small
@@ -176,6 +203,15 @@ func (b *Budget) WithShared(shared *ActionLedger) *Budget {
 		return nil
 	}
 	b.Shared = shared
+	return b
+}
+
+// WithGrant attaches the one approval this phase's actions are charged to.
+func (b *Budget) WithGrant(grant *ActionLedger) *Budget {
+	if b == nil {
+		return nil
+	}
+	b.Grant = grant
 	return b
 }
 
@@ -261,6 +297,9 @@ func (b *Budget) CanReserve(size int64) bool {
 	if !b.Shared.CanReserve(size) {
 		return false
 	}
+	if !b.Grant.CanReserve(size) {
+		return false
+	}
 	return b.Actions.CanReserve(size)
 }
 
@@ -272,6 +311,7 @@ func (b *Budget) AddAction(size int64) {
 	b.Files++
 	b.Bytes += size
 	b.Shared.Add(size)
+	b.Grant.Add(size)
 	b.Actions.Add(size)
 }
 
@@ -283,6 +323,11 @@ func (b *Budget) RemainingFiles() int {
 	limit := b.Actions.RemainingFiles()
 	if r := b.Shared.RemainingFiles(); b.Shared != nil && r < limit {
 		limit = r
+	}
+	if b.Grant != nil {
+		if r := b.Grant.RemainingFiles(); r < limit {
+			limit = r
+		}
 	}
 	if b.Capped {
 		if r := b.MaxFiles - b.Files; r < limit {
@@ -306,6 +351,11 @@ func (b *Budget) RemainingBytes() int64 {
 			limit = r
 		}
 	}
+	if b.Grant != nil {
+		if r := b.Grant.RemainingBytes(); r < limit {
+			limit = r
+		}
+	}
 	if b.Capped {
 		if r := b.MaxBytes - b.Bytes; r < limit {
 			limit = r
@@ -325,7 +375,8 @@ func (b *Budget) SplitFor(numerator, denominator int64) *Budget {
 		return nil
 	}
 	if denominator <= 0 || numerator <= 0 || numerator >= denominator {
-		return NewPhaseBudget(b.Run, b.Actions, b.RemainingFiles(), b.RemainingBytes()).WithShared(b.Shared)
+		return NewPhaseBudget(b.Run, b.Actions, b.RemainingFiles(), b.RemainingBytes()).
+			WithShared(b.Shared).WithGrant(b.Grant)
 	}
 	shareFiles := int(int64(b.RemainingFiles()) * numerator / denominator)
 	shareBytes := b.RemainingBytes() * numerator / denominator
@@ -335,5 +386,6 @@ func (b *Budget) SplitFor(numerator, denominator int64) *Budget {
 	if shareBytes < 0 {
 		shareBytes = 0
 	}
-	return NewPhaseBudget(b.Run, b.Actions, shareFiles, shareBytes).WithShared(b.Shared)
+	return NewPhaseBudget(b.Run, b.Actions, shareFiles, shareBytes).
+		WithShared(b.Shared).WithGrant(b.Grant)
 }

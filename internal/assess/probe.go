@@ -68,15 +68,17 @@ func ProbeOpenFiles(ctx context.Context, root string, run CommandRunner) OpenObs
 //	partial_visible_processes  the run broke off after listing some files
 //	unknown                 nothing usable was learned
 //
-// The exit status is deliberately not part of that decision. lsof's own
-// documentation makes 0 mean "files were listed" and 1 mean "none were", but
-// the macOS build in use returns 1 even when it lists files, so treating 1 as
-// "nothing is open" would answer "not in use" for a file that was just printed,
-// and treating it as a failure would answer "unknown" for every tree - which,
-// since the program itself holds the vault directory open, would be every tree
-// it ever asks about. What separates a finished run from a broken one is the
-// error's kind, not its number: a process that ran and exited produced an
-// answer, while a timeout, a truncated read or a missing binary did not.
+// Coverage is decided by whether the listing actually ran to the end. A command
+// that was canceled, killed by a signal, cut off by the output limit or never
+// started produced no answer, and its silence is not "nothing is open": the
+// facts built on that silence would authorise a move on evidence nobody
+// collected. lsof's own documented statuses are 0 (files were listed) and 1
+// (none matched); the macOS build in use returns 1 even when it lists files, so
+// both count as finished. Every other status is a broken run.
+//
+// Anything a broken run did print is kept as a partial answer: seeing that a
+// file is open is positive knowledge, and it must survive the failure that came
+// after it.
 func ProbeOpenUnder(ctx context.Context, root string, run CommandRunner) OpenObservation {
 	out := OpenObservation{Paths: map[string]bool{}, Coverage: "unknown"}
 	if run == nil {
@@ -98,7 +100,7 @@ func ProbeOpenUnder(ctx context.Context, root string, run CommandRunner) OpenObs
 	}
 	out.VisibleMatches = len(out.Paths)
 	switch {
-	case err == nil, exited(err):
+	case c.Err() == nil && listingCompleted(err):
 		out.Coverage = "visible_processes_only"
 	case len(out.Paths) > 0:
 		out.Coverage = "partial_visible_processes"
@@ -106,11 +108,35 @@ func ProbeOpenUnder(ctx context.Context, root string, run CommandRunner) OpenObs
 	return out
 }
 
-// exited reports whether err is a process exit status, which means the command
-// ran to completion and its output is the whole of what it had to say.
-func exited(err error) bool {
+// listingCompleted reports whether the listing command ran to the end, which is
+// the only thing that makes its output the whole of what it had to say.
+//
+// Being an *exec.ExitError is not that question. The type also covers a command
+// killed by a signal, a helper that failed at its own work, and a status the
+// tool uses for "I could not look" - none of which said anything about which
+// files are open. lsof documents 0 as "files listed" and 1 as "none matched",
+// and the macOS build returns 1 while listing files, so those two are accepted
+// and nothing else is.
+func listingCompleted(err error) bool {
+	if err == nil {
+		return true
+	}
 	var ee *exec.ExitError
-	return errors.As(err, &ee)
+	if !errors.As(err, &ee) {
+		// A truncated read (the bounded writer refused more output), a missing
+		// binary, or a canceled context: no answer was produced.
+		return false
+	}
+	if !ee.Exited() {
+		// Terminated by a signal - the timeout we imposed, or somebody else's
+		// kill. The listing stopped where it stopped.
+		return false
+	}
+	switch ee.ExitCode() {
+	case 0, 1:
+		return true
+	}
+	return false
 }
 
 // processListingCandidates is where the process listing lives on the systems
