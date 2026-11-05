@@ -13,17 +13,21 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/config"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
 	"dustkeeper/internal/fsops"
+	"dustkeeper/internal/notify"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/policy"
 	"dustkeeper/internal/recovery"
+	"dustkeeper/internal/review"
 	"dustkeeper/internal/rules"
 	"dustkeeper/internal/run"
 	"dustkeeper/internal/scope"
@@ -45,19 +49,98 @@ func trustFails(context.Context) error {
 	return errs.New(errs.CodeClockUntrusted, "clock is not trusted in this test")
 }
 
+// fakeApproval keeps the pre-review lifecycle integration tests focused on
+// filesystem and state-machine behavior. It is explicit test authority, not
+// evidence that either production model reviewed a candidate.
+type fakeApproval struct {
+	itemID       string
+	action       string
+	verifiedHash string
+	reject       error
+}
+
+func (a *fakeApproval) Verify(hash string) error {
+	if a.reject != nil {
+		return a.reject
+	}
+	if hash == "" {
+		return errs.New(errs.CodeReviewRequired, "fake approval received an empty content hash")
+	}
+	a.verifiedHash = hash
+	return nil
+}
+
+func (a *fakeApproval) CheckIntent(itemID, action string, _ int64) error {
+	if a.reject != nil {
+		return a.reject
+	}
+	if itemID != a.itemID || action != a.action {
+		return errs.New(errs.CodeReviewRequired, "fake approval does not bind this item and action")
+	}
+	if a.verifiedHash == "" {
+		return errs.New(errs.CodeReviewRequired, "fake approval was exercised without verifying content first")
+	}
+	return nil
+}
+
+// Disposition reports the action this fixture authorises.
+func (a *fakeApproval) Disposition() string { return a.action }
+
+func (a *fakeApproval) AuditJSON() string {
+	return `{"source":"integration-lifecycle-fixture"}`
+}
+
+func fakeLifecycleReview(_ context.Context, action string, _ store.Scope, it store.Item) (review.Approval, error) {
+	return &fakeApproval{itemID: string(it.ID), action: action}, nil
+}
+
+// legacyReview adapts the per-item fixtures these integration tests were
+// written against to the executor's request-based entry point.
+//
+// The fixtures only ever look at the action, the scope id and the item, all of
+// which the measured request carries, so the adapter reconstructs exactly those
+// three. The disposition is derived from the action the fixture authorised -
+// "purge" is the irreversible branch - because that is what the executor
+// branches on.
+func legacyReview(fn func(context.Context, string, store.Scope, store.Item) (review.Approval, error)) execute.ReviewFunc {
+	return func(ctx context.Context, r review.Request) (review.Outcome, error) {
+		ap, err := fn(ctx, r.Action, store.Scope{ID: domain.ScopeID(r.ScopeID)},
+			store.Item{ID: domain.ItemID(r.ItemID), RawRelative: []byte(r.RelativePath)})
+		if err != nil {
+			return review.Outcome{}, err
+		}
+		if ap == nil {
+			return review.Outcome{Disposition: domain.DispositionKeep, Reason: "fixture kept the item"}, nil
+		}
+		disp := domain.DispositionQuarantine
+		if r.Action == domain.ActionPurge || r.Action == domain.DispositionDelete {
+			disp = domain.DispositionDelete
+		}
+		return review.Outcome{Approval: ap, Disposition: disp, Reason: "integration fixture"}, nil
+	}
+}
+
+// fakeIntentApproval supplies explicit review fields to crash/recovery fixtures
+// that intentionally begin an intent without executing a file action.
+func fakeIntentApproval(itemID domain.ItemID, action string) (review.Approval, string) {
+	const hash = "sha256:integration-intent-fixture"
+	return &fakeApproval{itemID: string(itemID), action: action, verifiedHash: hash}, hash
+}
+
 // env is one isolated installation: state directory, database, clock, scopes.
 type env struct {
-	t     *testing.T
-	base  string
-	paths config.Paths
-	cfg   config.Config
-	clock *domain.FakeClock
-	st    *store.Store
-	reg   *scope.Registrar
-	exec  *execute.Executor
-	plan  *plan.Planner
-	rec   *recovery.Reconciler
-	run   *run.Runner
+	t      *testing.T
+	base   string
+	paths  config.Paths
+	cfg    config.Config
+	clock  *domain.FakeClock
+	st     *store.Store
+	reg    *scope.Registrar
+	exec   *execute.Executor
+	plan   *plan.Planner
+	rec    *recovery.Reconciler
+	run    *run.Runner
+	sender *recordingSender
 	// ctxs are the scope contexts this environment has opened, so a test can
 	// release the in-tree lock without waiting for the end of the run.
 	ctxs []*execute.ScopeCtx
@@ -66,6 +149,15 @@ type env struct {
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	base := t.TempDir()
+	home := os.Getenv("DUSTKEEPER_TEST_HOME")
+	if home == "" {
+		home = filepath.Join(base, "home")
+		if err := os.Mkdir(home, 0o700); err != nil {
+			t.Fatalf("mkdir test home: %v", err)
+		}
+		t.Setenv("DUSTKEEPER_TEST_HOME", home)
+	}
+	t.Setenv("HOME", home)
 	paths := config.Paths{
 		ConfigDir:    filepath.Join(base, "config"),
 		StateDir:     filepath.Join(base, "state"),
@@ -84,6 +176,12 @@ func newEnv(t *testing.T) *env {
 	}
 
 	cfg := config.Default()
+	// The disk floor is a property of the machine, not of the behaviour under
+	// test: on a full CI volume every quarantine would stop with DISK_PRESSURE
+	// and no other assertion would ever be reached. Tests that are about the
+	// floor set it themselves; everything else runs with it off.
+	cfg.Runtime.MinFreeBytes = 0
+	cfg.Runtime.MinFreePercent = 0
 	clock := domain.NewFakeClock(fixedNow)
 
 	st, err := store.Open(paths.DBFile)
@@ -107,27 +205,30 @@ func newEnv(t *testing.T) *env {
 		Clock:  clock,
 		Config: executeConfig(cfg),
 		Gate:   scope.PauseGate{StateDir: paths.StateDir},
+		Review: legacyReview(fakeLifecycleReview),
 		// The fake clock never moves backwards, so the run-wide assertion is the
 		// same one production supplies; a test that wants a refused clock sets
 		// its own function instead of relying on "nobody checked".
 		QuarantineTrust: trustOK,
 	}
 	e := &env{
-		t:     t,
-		base:  base,
-		paths: paths,
-		cfg:   cfg,
-		clock: clock,
-		st:    st,
-		reg:   reg,
-		exec:  exec,
-		plan:  &plan.Planner{Store: st, Clock: clock},
+		t:      t,
+		base:   base,
+		paths:  paths,
+		cfg:    cfg,
+		clock:  clock,
+		st:     st,
+		reg:    reg,
+		exec:   exec,
+		plan:   &plan.Planner{Store: st, Clock: clock},
+		sender: &recordingSender{},
 		rec: &recovery.Reconciler{
 			Store: st, Clock: clock, Registrar: reg, Exec: exec,
 		},
 	}
 	e.run = &run.Runner{
 		Store: st, Clock: clock, Config: cfg, Registrar: reg, Exec: exec, Reconciler: e.rec,
+		Notify: e.sender,
 	}
 	return e
 }
@@ -203,6 +304,70 @@ func (e *env) guard(sctx *execute.ScopeCtx) *policy.Guard {
 		e.t.Fatalf("guard: %v", err)
 	}
 	return g
+}
+
+// confirmPolicy writes the one-time cleanup confirmation with a chosen
+// observation period.
+//
+// A newly isolated object is held for the longer of what the rule promised and
+// what the cleanup policy promises. Tests that are about the retention mechanism
+// rather than about the fourteen-day default say so here; everything else runs
+// with no policy row and therefore gets the product default.
+func (e *env) confirmPolicy(observationDays int, scopeIDs ...domain.ScopeID) {
+	e.t.Helper()
+	pol := cleanup.Default()
+	pol.ObservationDays = observationDays
+	for _, id := range scopeIDs {
+		pol.Scopes = append(pol.Scopes, string(id))
+	}
+	e.savePolicy(pol)
+}
+
+// savePolicy writes a fully formed confirmation, for tests that need more than
+// the observation period decided.
+//
+// It deliberately does not set Notify: the default is the product's one real
+// channel, and a test that needs the channel to fail says so on the sender
+// instead. A policy that silently turned notifications off would make the
+// reminder gate untestable and untested.
+func (e *env) savePolicy(pol cleanup.Policy) {
+	e.t.Helper()
+	if pol.ConfirmedAtNS == 0 {
+		pol.ConfirmedAtNS = e.clock.Wall().UnixNano()
+	}
+	if err := cleanup.Save(context.Background(), e.st, pol); err != nil {
+		e.t.Fatalf("save cleanup policy: %v", err)
+	}
+}
+
+// recordingSender stands in for the system notification channel.
+//
+// A real notification is neither reliable nor observable from a test: it needs a
+// GUI session, and there is no way to ask the notification centre what it showed.
+// The seam is the channel, not the gate, so the gate stays the production one.
+type recordingSender struct {
+	mu   sync.Mutex
+	sent []string
+	// fail makes every delivery fail, which is the state an unattended machine
+	// is in.
+	fail error
+}
+
+func (s *recordingSender) Send(_ context.Context, _ string, body string) notify.Result {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail != nil {
+		return notify.Result{Channel: notify.ChannelMacOS, Attempted: true,
+			Delivered: false, Detail: s.fail.Error()}
+	}
+	s.sent = append(s.sent, body)
+	return notify.Result{Channel: notify.ChannelMacOS, Attempted: true, Delivered: true}
+}
+
+func (s *recordingSender) messages() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.sent...)
 }
 
 // stableEvidence reproduces the evidence the executor records before a move, so a

@@ -406,15 +406,18 @@ func TestSlimLegacyActionsAreBlocked(t *testing.T) {
 		sc, p, it := e.legacyDuplicate(t, false)
 
 		opID := domain.OperationID(domain.NewID("op"))
+		reviewApproval, reviewHash := fakeIntentApproval(it.ID, "quarantine")
 		if err := e.st.BeginIntent(ctx, store.Intent{
-			OpID:         opID,
-			ItemID:       it.ID,
-			PlanID:       &p.ID,
-			Action:       "quarantine",
-			PriorState:   domain.StatePlanned,
-			NextState:    domain.StateQIntent,
-			ContractJSON: `{"binding_version":1,"purpose":"normal"}`,
-			OccurredAtNS: e.clock.Wall().UnixNano(),
+			OpID:              opID,
+			ItemID:            it.ID,
+			PlanID:            &p.ID,
+			Action:            "quarantine",
+			Review:            reviewApproval,
+			ReviewContentHash: reviewHash,
+			PriorState:        domain.StatePlanned,
+			NextState:         domain.StateQIntent,
+			ContractJSON:      `{"binding_version":1,"purpose":"normal"}`,
+			OccurredAtNS:      e.clock.Wall().UnixNano(),
 		}); err != nil {
 			t.Fatalf("begin: %v", err)
 		}

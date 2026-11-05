@@ -436,11 +436,12 @@ func TestReconcileCompletesACrashedQuarantine(t *testing.T) {
 	}
 
 	opID := domain.OperationID(domain.NewID("op"))
+	reviewApproval, reviewHash := fakeIntentApproval(it.ID, "quarantine")
 	if err := e.st.BeginIntent(context.Background(), store.Intent{
 		OpID: opID, ItemID: it.ID, PlanID: &res.Plan.ID,
 		Action: "quarantine", PriorState: domain.StatePlanned,
-		NextState:    domain.StateQIntent,
-		ContractJSON: string(contract),
+		Review: reviewApproval, ReviewContentHash: reviewHash,
+		NextState: domain.StateQIntent, ContractJSON: string(contract),
 		OccurredAtNS: e.clock.Wall().UnixNano(),
 	}); err != nil {
 		t.Fatalf("begin intent: %v", err)

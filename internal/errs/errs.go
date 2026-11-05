@@ -47,6 +47,7 @@ const (
 	CodeUnsupportedSnapshot = Code("UNSUPPORTED_SNAPSHOT")
 
 	// 6: needs reconciliation, conflict or safety hold.
+	CodeReviewRequired            = Code("REVIEW_REQUIRED")
 	CodeRecoveryRequired          = Code("RECOVERY_REQUIRED")
 	CodeRestoreConflict           = Code("RESTORE_CONFLICT")
 	CodeHeld                      = Code("HELD")
@@ -81,6 +82,10 @@ const (
 	// Non-blocking informational outcomes.
 	CodeNoCandidates     = Code("NO_CANDIDATES")
 	CodeSkippedProtected = Code("SKIPPED_PROTECTED")
+	// CodeKept is a stated refusal, not a failure: the three-outcome product
+	// reports "kept" with a reason instead of an error, because nothing went
+	// wrong and the file is exactly where it was.
+	CodeKept = Code("KEPT")
 	CodeDeepScanRequired = Code("DEEP_SCAN_REQUIRED")
 	CodeBudgetExhausted  = Code("BUDGET_EXHAUSTED")
 )
@@ -98,7 +103,8 @@ const (
 )
 
 var exitCodes = map[Code]int{
-	CodeOK: 0,
+	CodeOK:             0,
+	CodeReviewRequired: 6,
 
 	CodeInvalidArgument: 2,
 	CodeUnknownField:    2,
@@ -153,6 +159,7 @@ var exitCodes = map[Code]int{
 
 	CodeNoCandidates:     0,
 	CodeSkippedProtected: 0,
+	CodeKept:             0,
 	CodeDeepScanRequired: 0,
 	CodeBudgetExhausted:  0,
 }
@@ -167,9 +174,11 @@ var retryable = map[Code]bool{
 }
 
 var statuses = map[Code]Status{
+	CodeReviewRequired:   StatusBlocked,
 	CodeOK:               StatusOK,
 	CodeNoCandidates:     StatusOK,
 	CodeSkippedProtected: StatusOK,
+	CodeKept:             StatusOK,
 	CodeDeepScanRequired: StatusOK,
 	CodeBudgetExhausted:  StatusOK,
 

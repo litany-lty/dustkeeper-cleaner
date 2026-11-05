@@ -12,8 +12,10 @@ import (
 	"sync"
 	"testing"
 
+	"dustkeeper/internal/config"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
+	"dustkeeper/internal/notify"
 	"dustkeeper/internal/scope"
 )
 
@@ -55,12 +57,67 @@ func cliClock(t *testing.T, clk domain.Clock, args ...string) result {
 	return r
 }
 
+// cliSender stands in for the system notification channel in the command line
+// tests.
+//
+// A real notification needs a GUI session and cannot be observed, so a suite that
+// used the real one would pass on a developer's laptop and fail in a scheduled
+// context - which is exactly the context this program runs in. The channel is the
+// seam; the gate in front of the clearing stays the production one.
+type cliSender struct {
+	fail bool
+	sent []string
+}
+
+func (s *cliSender) Send(_ context.Context, _ string, body string) notify.Result {
+	if s.fail {
+		return notify.Result{Channel: notify.ChannelMacOS, Attempted: true,
+			Delivered: false, Detail: "cli test channel is failing"}
+	}
+	s.sent = append(s.sent, body)
+	return notify.Result{Channel: notify.ChannelMacOS, Attempted: true, Delivered: true}
+}
+
 // newHome points the process at a private state directory for one test.
 func newHome(t *testing.T) string {
 	t.Helper()
 	base := t.TempDir()
+	home := os.Getenv("DUSTKEEPER_TEST_HOME")
+	if home == "" {
+		home = filepath.Join(base, "home")
+		if err := os.Mkdir(home, 0o700); err != nil {
+			t.Fatalf("mkdir test home: %v", err)
+		}
+		t.Setenv("DUSTKEEPER_TEST_HOME", home)
+	}
+	t.Setenv("HOME", home)
 	t.Setenv("DUSTKEEPER_STATE_DIR", filepath.Join(base, "state"))
 	t.Setenv("DUSTKEEPER_CONFIG_DIR", filepath.Join(base, "config"))
+
+	// One delivering channel for every command in this test, reset afterwards so
+	// a test that installs a failing one cannot affect its neighbours.
+	testSender = &cliSender{}
+	t.Cleanup(func() { testSender = nil })
+
+	// The free-space floor is a property of the host, not of the behaviour under
+	// test: on a nearly full machine every quarantine would stop with
+	// DISK_PRESSURE before any other assertion was reached. The test instance
+	// runs with the lowest floor the configuration permits, and the tests that
+	// are about the floor set it themselves.
+	cfgDir := filepath.Join(base, "config")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatalf("mkdir config: %v", err)
+	}
+	cfg := config.Default()
+	cfg.Runtime.MinFreePercent = 1
+	cfg.Runtime.MinFreeBytes = 0
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 	return base
 }
 

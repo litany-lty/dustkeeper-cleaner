@@ -44,7 +44,7 @@ func HashFile(f *fsops.File, opt VerifyOptions) (domain.Digest, int64, error) {
 			total += int64(n)
 			if opt.Budget != nil {
 				opt.Budget.AddRead(int64(n))
-				if opt.Budget.ReadUp() {
+				if opt.Budget.ReadExceeded() {
 					return "", total, errs.New(errs.CodeBudgetExhausted,
 						"the read budget was spent before the file could be verified")
 				}
@@ -87,6 +87,26 @@ func CompareFiles(a, b *fsops.File, opt VerifyOptions) (bool, error) {
 	for {
 		na, erra := a.Read(buf)
 		nb, errb := b.Read(bufB)
+		readBytes := int64(na + nb)
+		total += readBytes
+		if opt.Budget != nil {
+			opt.Budget.AddRead(readBytes)
+		}
+		endA := errors.Is(erra, io.EOF)
+		endB := errors.Is(errb, io.EOF)
+		if erra != nil && !endA {
+			return false, errs.Wrap(errs.CodeIOError, erra)
+		}
+		if errb != nil && !endB {
+			return false, errs.Wrap(errs.CodeIOError, errb)
+		}
+		if readBytes > 0 {
+			if opt.Budget != nil && opt.Budget.ReadExceeded() {
+				return false, errs.New(errs.CodeBudgetExhausted,
+					"the read budget was spent before the comparison finished")
+			}
+			sleepUntilRate(total, started, opt.RatePerSec)
+		}
 		if na != nb {
 			return false, nil
 		}
@@ -96,27 +116,10 @@ func CompareFiles(a, b *fsops.File, opt VerifyOptions) (bool, error) {
 					return false, nil
 				}
 			}
-			total += int64(na) * 2
-			if opt.Budget != nil {
-				opt.Budget.AddRead(int64(na) * 2)
-				if opt.Budget.ReadUp() {
-					return false, errs.New(errs.CodeBudgetExhausted,
-						"the read budget was spent before the comparison finished")
-				}
-			}
-			sleepUntilRate(total, started, opt.RatePerSec)
 			runDuringCompareHook()
 		}
-		endA := errors.Is(erra, io.EOF)
-		endB := errors.Is(errb, io.EOF)
 		if endA && endB {
 			return true, nil
-		}
-		if erra != nil && !endA {
-			return false, errs.Wrap(errs.CodeIOError, erra)
-		}
-		if errb != nil && !endB {
-			return false, errs.Wrap(errs.CodeIOError, errb)
 		}
 		if endA != endB {
 			return false, nil

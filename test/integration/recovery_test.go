@@ -123,9 +123,11 @@ func (e *env) stageCrashedQuarantineAt(t *testing.T, rel string, adjust func(*cr
 	if err != nil {
 		t.Fatalf("contract: %v", err)
 	}
+	reviewApproval, reviewHash := fakeIntentApproval(it.ID, "quarantine")
 	if err := e.st.BeginIntent(context.Background(), store.Intent{
 		OpID: domain.OperationID(domain.NewID("op")), ItemID: it.ID, PlanID: &res.Plan.ID,
 		Action: "quarantine", PriorState: domain.StatePlanned, NextState: domain.StateQIntent,
+		Review: reviewApproval, ReviewContentHash: reviewHash,
 		ContractJSON: string(body), OccurredAtNS: e.clock.Wall().UnixNano(),
 	}); err != nil {
 		t.Fatalf("begin intent: %v", err)

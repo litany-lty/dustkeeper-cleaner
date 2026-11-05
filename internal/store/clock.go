@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
@@ -32,7 +33,11 @@ func (s *Store) ClockLatch(ctx context.Context) (int64, string, error) {
 	}
 	var at int64
 	if atStr != "" {
-		at = parseMetaInt(atStr)
+		var parseErr error
+		at, parseErr = strconv.ParseInt(atStr, 10, 64)
+		if parseErr != nil || at <= 0 {
+			return 0, "", errs.New(errs.CodeClockUntrusted, "the stored clock latch is invalid; clock trust cannot be established")
+		}
 	}
 	return at, reason, nil
 }
@@ -83,7 +88,7 @@ func (s *Store) ClearClockLatchAndExtend(ctx context.Context, ackNS, latchNS int
 	extended := 0
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
-SELECT item_id, bound_retention_seconds, purge_not_before_ns
+SELECT item_id, bound_retention_seconds, quarantined_at_ns, purge_not_before_ns
 FROM items
 WHERE state='quarantined'
   AND purge_not_before_ns IS NOT NULL
@@ -92,19 +97,20 @@ WHERE state='quarantined'
 			return errs.Wrap(errs.CodeDBError, err)
 		}
 		type candidate struct {
-			id       string
-			retained int64
-			current  int64
+			id            string
+			retained      int64
+			quarantinedAt int64
+			current       int64
 		}
 		var list []candidate
 		for rows.Next() {
 			var id string
-			var retained, current int64
-			if err := rows.Scan(&id, &retained, &current); err != nil {
+			var retained, quarantinedAt, current int64
+			if err := rows.Scan(&id, &retained, &quarantinedAt, &current); err != nil {
 				rows.Close()
 				return errs.Wrap(errs.CodeDBError, err)
 			}
-			list = append(list, candidate{id: id, retained: retained, current: current})
+			list = append(list, candidate{id: id, retained: retained, quarantinedAt: quarantinedAt, current: current})
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -113,6 +119,9 @@ WHERE state='quarantined'
 		rows.Close()
 
 		for _, c := range list {
+			if c.current > ackNS && (latchNS <= 0 || c.quarantinedAt < latchNS) {
+				continue
+			}
 			next, ok := domain.AddSecondsNS(ackNS, c.retained)
 			if !ok {
 				return errs.Newf(errs.CodeHeld,
@@ -152,7 +161,12 @@ WHERE state='quarantined'
 				"ON CONFLICT(key) DO UPDATE SET value=excluded.value", itoa64(ackNS)); err != nil {
 			return errs.Wrap(errs.CodeStateWriteFailed, err)
 		}
-		if latchNS > 0 {
+		baseline, err := metaGetTx(ctx, tx, "last_trusted_run_ns")
+		if err != nil {
+			return err
+		}
+		baseNS, parseErr := strconv.ParseInt(baseline, 10, 64)
+		if latchNS > 0 || (baseline != "" && (parseErr != nil || baseNS <= 0)) {
 			if _, err := tx.ExecContext(ctx,
 				"INSERT INTO meta(key,value) VALUES('last_trusted_run_ns',?) "+
 					"ON CONFLICT(key) DO UPDATE SET value=excluded.value", itoa64(ackNS)); err != nil {
@@ -177,26 +191,6 @@ func metaGetTx(ctx context.Context, tx *sql.Tx, key string) (string, error) {
 		return "", errs.Wrap(errs.CodeDBError, err)
 	}
 	return v, nil
-}
-
-func parseMetaInt(s string) int64 {
-	var v int64
-	neg := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if i == 0 && c == '-' {
-			neg = true
-			continue
-		}
-		if c < '0' || c > '9' {
-			return 0
-		}
-		v = v*10 + int64(c-'0')
-	}
-	if neg {
-		return -v
-	}
-	return v
 }
 
 func itoa64(v int64) string {

@@ -231,6 +231,9 @@ func ruleShow(ctx context.Context, a *app, args []string) (output, error) {
 	if *id == "" {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--id is required")
 	}
+	if *rev < 0 {
+		return output{}, errs.New(errs.CodeInvalidArgument, "--revision must be zero (active) or positive")
+	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
 	}
@@ -327,6 +330,9 @@ func rulePreview(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	if *id == "" {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--id is required")
+	}
+	if *rev < 0 {
+		return output{}, errs.New(errs.CodeInvalidArgument, "--revision must be zero (active) or positive")
 	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
@@ -465,12 +471,18 @@ func ruleActivate(ctx context.Context, a *app, args []string) (output, error) {
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
 	}
-	if *id == "" || *rev == 0 || *digest == "" {
+	if *id == "" || *rev <= 0 || *digest == "" {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--id, --revision and --digest are required")
 	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
 	}
+
+	unlock, err := lockInstance(a.paths.StateDir)
+	if err != nil {
+		return output{}, err
+	}
+	defer unlock()
 
 	r, err := a.store.GetRule(ctx, domain.RuleID(*id), *rev)
 	if err != nil {
@@ -529,7 +541,10 @@ func ruleAuthorize(ctx context.Context, a *app, args []string) (output, error) {
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
 	}
-	if *id == "" || *rev == 0 {
+	if *maxFiles < 0 || *maxBytes < 0 {
+		return output{}, errs.New(errs.CodeInvalidArgument, "--max-files and --max-bytes must be zero (use configuration) or positive")
+	}
+	if *id == "" || *rev <= 0 {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--id and --revision are required")
 	}
 	if *autoQ == *autoP {
@@ -538,6 +553,14 @@ func ruleAuthorize(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
+	}
+
+	if *digest != "" {
+		unlock, err := lockInstance(a.paths.StateDir)
+		if err != nil {
+			return output{}, err
+		}
+		defer unlock()
 	}
 
 	r, err := a.store.GetRule(ctx, domain.RuleID(*id), *rev)
@@ -552,6 +575,10 @@ func ruleAuthorize(ctx context.Context, a *app, args []string) (output, error) {
 	if err != nil {
 		return output{}, err
 	}
+	if sc.Kind != domain.KindManagedDisposable {
+		return output{}, errs.Newf(errs.CodeGrantRequired,
+			"scope %s is %s; unattended capabilities require managed_disposable", sc.ID, sc.Kind)
+	}
 	parsed, err := rules.Parse([]byte(r.DSLJSON), map[string]bool{string(sc.ID): true})
 	if err != nil {
 		return output{}, err
@@ -561,11 +588,6 @@ func ruleAuthorize(ctx context.Context, a *app, args []string) (output, error) {
 	if *autoP {
 		capability = domain.CapAutoPurge
 	}
-	if capability == domain.CapAutoPurge && sc.Kind != domain.KindManagedDisposable {
-		return output{}, errs.Newf(errs.CodeGrantRequired,
-			"scope %s is %s; unattended permanent deletion requires managed_disposable", sc.ID, sc.Kind)
-	}
-
 	// The ceiling belongs to the action being approved. Reading the quarantine
 	// default for a purge approval would hand permanent deletion a number that
 	// was set for moving files into the vault.
@@ -691,7 +713,7 @@ func ruleRevoke(ctx context.Context, a *app, args []string) (output, error) {
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
 	}
-	if *id == "" || *rev == 0 {
+	if *id == "" || *rev <= 0 {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--id and --revision are required")
 	}
 	if *autoQ == *autoP {
@@ -701,6 +723,12 @@ func ruleRevoke(ctx context.Context, a *app, args []string) (output, error) {
 	if err := a.openStore(); err != nil {
 		return output{}, err
 	}
+
+	unlock, err := lockInstance(a.paths.StateDir)
+	if err != nil {
+		return output{}, err
+	}
+	defer unlock()
 	r, err := a.store.GetRule(ctx, domain.RuleID(*id), *rev)
 	if err != nil {
 		return output{}, err
@@ -734,11 +762,19 @@ func ruleDisable(ctx context.Context, a *app, args []string) (output, error) {
 	if *id == "" {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--id is required")
 	}
+	if *rev < 0 {
+		return output{}, errs.New(errs.CodeInvalidArgument, "--revision must be zero (active) or positive")
+	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
 	}
+
+	unlock, err := lockInstance(a.paths.StateDir)
+	if err != nil {
+		return output{}, err
+	}
+	defer unlock()
 	var r store.Rule
-	var err error
 	if *rev == 0 {
 		r, err = a.store.ActiveRule(ctx, domain.RuleID(*id))
 	} else {

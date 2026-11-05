@@ -217,6 +217,7 @@ func TestReconcileRetriesEveryActionUntilTheScopeIsFree(t *testing.T) {
 		e.clock.Advance(40 * 24 * time.Hour)
 
 		opID := domain.OperationID(domain.NewID("op"))
+		reviewApproval, reviewHash := fakeIntentApproval(it.ID, "purge")
 		body, _ := json.Marshal(plan.OperationContractV1{
 			BindingVersion: plan.BindingVersion,
 			ItemID:         string(it.ID),
@@ -231,6 +232,7 @@ func TestReconcileRetriesEveryActionUntilTheScopeIsFree(t *testing.T) {
 		if err := e.st.BeginIntent(ctx, store.Intent{
 			OpID: opID, ItemID: it.ID, Action: "purge",
 			PriorState: domain.StateQuarantined, NextState: domain.StatePIntent,
+			Review: reviewApproval, ReviewContentHash: reviewHash,
 			ContractJSON: string(body), OccurredAtNS: e.clock.Wall().UnixNano(),
 		}); err != nil {
 			t.Fatalf("begin purge intent: %v", err)

@@ -38,21 +38,25 @@ type PurgeMemberRow struct {
 // either fully visible or not visible at all.
 func (s *Store) InsertPlan(ctx context.Context, p Plan, items []Item) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
+		return insertPlanTx(ctx, tx, p, items)
+	})
+}
+
+func insertPlanTx(ctx context.Context, tx *sql.Tx, p Plan, items []Item) error {
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO plans(plan_id, kind, source_plan_id, header_json, digest, status, created_at_ns, expires_at_ns)
 VALUES(?,?,?,?,?,?,?,?)`,
-			string(p.ID), p.Kind, p.SourcePlanID, p.HeaderJSON, string(p.Digest), p.Status, p.CreatedAtNS, p.ExpiresAtNS)
-		if err != nil {
-			return errs.Newf(errs.CodeStateWriteFailed, "insert plan %s: %v", p.ID, err)
+		string(p.ID), p.Kind, p.SourcePlanID, p.HeaderJSON, string(p.Digest), p.Status, p.CreatedAtNS, p.ExpiresAtNS)
+	if err != nil {
+		return errs.Newf(errs.CodeStateWriteFailed, "insert plan %s: %v", p.ID, err)
+	}
+	for _, it := range items {
+		it.PlanID = p.ID
+		if err := insertItemTx(ctx, tx, it); err != nil {
+			return err
 		}
-		for _, it := range items {
-			it.PlanID = p.ID
-			if err := insertItemTx(ctx, tx, it); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 const planColumns = `plan_id, kind, source_plan_id, header_json, digest, status, created_at_ns, expires_at_ns`
@@ -144,16 +148,31 @@ func (s *Store) InsertPurgeMembers(ctx context.Context, planID domain.PlanID, me
 		return nil
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
-		for _, m := range members {
-			_, err := tx.ExecContext(ctx, `
-INSERT INTO purge_members(plan_id, ordinal, item_id, verification_json) VALUES(?,?,?,?)`,
-				string(planID), m.Ordinal, string(m.ItemID), m.VerificationJSON)
-			if err != nil {
-				return errs.Newf(errs.CodeStateWriteFailed, "insert purge member: %v", err)
-			}
-		}
-		return nil
+		return insertPurgeMembersTx(ctx, tx, planID, members)
 	})
+}
+
+// InsertPurgePlan stores a purge plan and every member in one transaction.
+// A failed member insert leaves no visible plan header behind.
+func (s *Store) InsertPurgePlan(ctx context.Context, p Plan, members []PurgeMember) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		if err := insertPlanTx(ctx, tx, p, nil); err != nil {
+			return err
+		}
+		return insertPurgeMembersTx(ctx, tx, p.ID, members)
+	})
+}
+
+func insertPurgeMembersTx(ctx context.Context, tx *sql.Tx, planID domain.PlanID, members []PurgeMember) error {
+	for _, m := range members {
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO purge_members(plan_id, ordinal, item_id, verification_json) VALUES(?,?,?,?)`,
+			string(planID), m.Ordinal, string(m.ItemID), m.VerificationJSON)
+		if err != nil {
+			return errs.Newf(errs.CodeStateWriteFailed, "insert purge member: %v", err)
+		}
+	}
+	return nil
 }
 
 // ListPurgeMembers returns a purge plan's members joined with their items.

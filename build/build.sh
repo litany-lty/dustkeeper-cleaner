@@ -65,6 +65,8 @@ environment:
                        container entry point). Never a cross compiler.
   VERIFY_ARTIFACT=...  use this artifact verifier instead of building
                        build/verify-artifact (used by the script's own tests)
+  REVIEW_SMOKE_HELPER=... use this prebuilt review-smoke driver instead of
+                       building build/review-smoke
   DUSTKEEPER_BUILD_ENV=...  how to describe the build environment in the release
                        manifest, e.g. "docker:golang@sha256:..." for a pinned
                        builder image. Recorded, not interpreted.
@@ -223,124 +225,28 @@ if [ -z "$VERIFY" ]; then
 	fi
 fi
 
-# json_str reads one string field out of an envelope. It is deliberately narrow:
-# the smoke only needs three identifiers, and adding a JSON parser to a shell
-# script would be a new dependency to keep working.
-json_str() {
-	sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
-}
+# The smoke driver owns its loopback TLS fake models and invokes the artifact as
+# a subprocess. Building it separately keeps test-only trust material and fake
+# responses out of the production binary.
+REVIEW_SMOKE=${REVIEW_SMOKE_HELPER:-}
+if [ -z "$REVIEW_SMOKE" ]; then
+	REVIEW_SMOKE="$TMPD/review-smoke"
+	if ! go build -trimpath -buildvcs=false -o "$REVIEW_SMOKE" ./build/review-smoke; then
+		echo "error: could not build the review smoke helper; refusing to produce unchecked artifacts" >&2
+		exit 1
+	fi
+fi
 
-# smoke_qr exercises the two actions the product is for, on the artifact that will
-# be published: register a directory, index it, plan a quarantine, apply it, list
-# the vault and restore the object. It runs in a temporary tree and a temporary
-# state directory, so it cannot touch anything of the operator's.
-#
-# It proves the artifact starts, opens its own database, performs a reversible
-# move and can undo it. It is not a substitute for the source tests: those use a
-# controlled clock and cover the refusal paths, and the manifest says which checks
-# this artifact actually ran.
+# smoke_qr drives the real artifact through two isolated installations. A local
+# TLS server first rejects the candidate and must leave its bytes in place; the
+# second installation supplies explicit evidence plus an independent retained
+# copy, receives two fake-model approvals, quarantines, lists and restores the
+# object, then compares its bytes. The helper's CA, credentials, evidence, state
+# and trees are private temporary files. No production bypass is involved.
 smoke_qr() {
 	art=$1
 	work=$2
-	mkdir -p "$work/tree" "$work/state" "$work/config"
-	printf 'smoke payload\n' >"$work/tree/old.zip"
-	# The bytes that have to come back. Asking "is there a file at the original
-	# path" after a restore is satisfied by a file that was never moved, or by an
-	# empty one, so the content is kept and compared instead.
-	mkdir -p "$work/keep"
-	cp "$work/tree/old.zip" "$work/keep/old.zip"
-	# The rule's minimum age is a day (the schema refuses anything shorter), so the
-	# file has to look older than that. touch -t is POSIX on both targets.
-	touch -t 202001010000 "$work/tree/old.zip"
-	rule=$work/rule.json
-	cat >"$rule" <<'JSON'
-{"dsl_version":1,"scope_id":"smoke","action":"quarantine",
- "match":{"min_mtime_age_seconds":86400,"min_size_bytes":0,"max_size_bytes":1073741824,
-          "relative_dir_prefixes":[],"basename_patterns":["*.zip"]},
- "except":{"relative_dir_prefixes":[],"basename_patterns":[]},"retention_seconds":604800}
-JSON
-
-	# One environment for every step: the state directory, not a flag, is what the
-	# binary uses, and the smoke must prove that path works.
-	run() {
-		DUSTKEEPER_STATE_DIR="$work/state" DUSTKEEPER_CONFIG_DIR="$work/config" "$art" "$@"
-	}
-
-	# step runs one call and, when it fails, shows what the tool actually said.
-	# Without this a failed smoke reports an empty log whenever the error is
-	# reported as JSON on stdout (which is what the tool does for --json).
-	#
-	# The names are prefixed because this runs inside build_target's scope: a
-	# plain `out` here would overwrite the artifact path the caller still needs.
-	step() {
-		s_code=$1
-		s_out=$2
-		shift 2
-		if ! run "$@" >"$s_out" 2>>"$work/log"; then
-			echo "smoke: step $s_code failed: dustkeeper $*" >&2
-			sed -n '1,40p' "$s_out" >&2 || true
-			return "$s_code"
-		fi
-		return 0
-	}
-
-	step 10 "$work/init.json" init --json || return $?
-	step 11 "$work/scope.json" scope add --path "$work/tree" --kind managed_disposable --name smoke --json || return $?
-	step 12 "$work/scan.json" scan --scope smoke --json || return $?
-	step 13 "$work/import.json" rule import --file "$rule" --id smoke-rule --json || return $?
-	step 14 "$work/preview.json" rule preview --id smoke-rule --revision 1 --json || return $?
-	digest=$(json_str review_digest <"$work/preview.json")
-	if [ -z "$digest" ]; then
-		echo "smoke: the preview returned no review_digest" >&2
-		return 14
-	fi
-	step 15 "$work/activate.json" rule activate --id smoke-rule --revision 1 --digest "$digest" --json || return $?
-	step 16 "$work/plan.json" plan create --rule smoke-rule --json || return $?
-	plan_id=$(json_str plan_id <"$work/plan.json")
-	plan_digest=$(json_str digest <"$work/plan.json")
-	if [ -z "$plan_id" ] || [ -z "$plan_digest" ]; then
-		echo "smoke: the plan returned no id or digest" >&2
-		return 16
-	fi
-	step 17 "$work/apply.json" plan apply --id "$plan_id" --digest "$plan_digest" --json || return $?
-
-	# A quarantine that reported success and left the source where it was is not a
-	# quarantine. The list below would still look right, which is why this is
-	# checked against the filesystem and not against the tool's own report.
-	if [ -e "$work/tree/old.zip" ]; then
-		echo "smoke: the source is still at its original path after a quarantine was applied" >&2
-		return 17
-	fi
-
-	step 18 "$work/list.json" quarantine list --json || return $?
-	item=$(json_str item_id <"$work/list.json")
-	if [ -z "$item" ]; then
-		echo "smoke: nothing was listed after a quarantine was applied" >&2
-		return 18
-	fi
-	if ! grep -q '"restorable"[[:space:]]*:[[:space:]]*true' "$work/list.json"; then
-		echo "smoke: the quarantined object was not restorable" >&2
-		return 18
-	fi
-	step 19 "$work/restore.json" quarantine restore --object "$item" --json || return $?
-	if [ ! -f "$work/tree/old.zip" ]; then
-		echo "smoke: the restore did not put the file back" >&2
-		return 19
-	fi
-	# Same bytes, not merely "a file is there": a restore that writes the wrong
-	# content is worse than one that fails, because the listing looked fine.
-	if ! cmp -s "$work/keep/old.zip" "$work/tree/old.zip"; then
-		echo "smoke: the restored file's content differs from the file that was quarantined" >&2
-		return 19
-	fi
-	# And the object's own record has to agree: nothing may stay listed as
-	# restorable once it is back.
-	step 20 "$work/list2.json" quarantine list --json || return $?
-	if grep -q "\"$item\"" "$work/list2.json"; then
-		echo "smoke: $item is still listed as a quarantined object after its restore" >&2
-		return 20
-	fi
-	return 0
+	"$REVIEW_SMOKE" --artifact "$art" --work "$work"
 }
 
 build_target() {
@@ -479,14 +385,21 @@ build_target() {
 	else
 		record_fact "target=$TARGET smoke=ok smoke_output=\"$(printf '%s' "$smoke" | head -1)\""
 		smoke_work="$TMPD/smoke"
-		mkdir -p "$smoke_work"
-		if smoke_qr "$out" "$smoke_work" >"$smoke_work/log" 2>&1; then
-			record_fact "target=$TARGET smoke_qr=ok flow=\"init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore,quarantine list\" source_gone_after_apply=yes restored_bytes_match=yes"
+		# The smoke driver refuses a caller-owned directory that is not 0700: it
+		# writes a private CA there and will not carry on with a wider one. The mode
+		# is therefore set explicitly rather than left to the ambient umask, which is
+		# 022 on this host and is not ours to assume.
+		mkdir -m 0700 -p "$smoke_work"
+		# The log lives next to the work directory, not inside it: the driver
+		# requires the directory it is handed to be empty, and a log file created
+		# before it starts would be a caller-owned entry it must refuse.
+		if smoke_qr "$out" "$smoke_work" >"$TMPD/smoke.log" 2>&1; then
+			record_fact "target=$TARGET smoke_qr=ok review_tls=yes review_rejection_retained=yes review_evidence_backup=yes flow=\"init,scope add,scan,rule import,rule preview,rule activate,plan create,plan apply,quarantine list,quarantine restore,quarantine list\" source_gone_after_apply=yes restored_bytes_match=yes"
 		else
 			step=$?
 			fail_target "$TARGET failed the quarantine/restore smoke (step $step); see the log"
-			sed -n '1,60p' "$smoke_work/log" >&2 || true
-			if grep -q 'openat2 unavailable\|function not implemented' "$smoke_work/log"; then
+			sed -n '1,60p' "$TMPD/smoke.log" >&2 || true
+			if grep -q 'openat2 unavailable\|function not implemented' "$TMPD/smoke.log"; then
 				# The artifact is fine; the runtime cannot execute it. Saying so is
 				# the difference between "our build is broken" and "this host cannot
 				# run what it just built", and it is still a failed release.

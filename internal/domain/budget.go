@@ -43,9 +43,17 @@ func (l *RunLedger) TimeUp(mono time.Duration) bool {
 	return mono >= l.SoftTime
 }
 
-// ReadUp reports whether the read budget is spent.
+// ReadUp reports whether the read budget is spent. It is the safe-boundary gate
+// checked before starting another unit of work.
 func (l *RunLedger) ReadUp() bool {
 	return l != nil && l.MaxRead > 0 && l.Read >= l.MaxRead
+}
+
+// ReadExceeded reports whether completed reads went beyond the allowance.
+// Readers charge a data chunk before they can observe the EOF that follows it,
+// so equality fits even though it closes the gate for the next unit of work.
+func (l *RunLedger) ReadExceeded() bool {
+	return l != nil && l.MaxRead > 0 && l.Read > l.MaxRead
 }
 
 // AddRead accounts for bytes actually read. Reads are never refunded: the disk
@@ -182,6 +190,10 @@ func (b *Budget) TimeUp(c Clock) bool {
 
 // ReadUp reports whether the run's read allowance is spent.
 func (b *Budget) ReadUp() bool { return b != nil && b.Run.ReadUp() }
+
+// ReadExceeded reports whether reads charged through this view crossed the
+// shared run allowance.
+func (b *Budget) ReadExceeded() bool { return b != nil && b.Run.ReadExceeded() }
 
 // AddRead charges bytes to the shared run ledger.
 func (b *Budget) AddRead(n int64) {

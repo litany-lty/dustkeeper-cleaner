@@ -1,3 +1,5 @@
+> 本地开发分支提示：新增 Q/P 双重审核门禁，原离线安装流程不足以启用本分支。正式版本和制品保持原样；新分支的配置、证据与未完成发布条件见 [安全审核说明](safe-review.md)。
+
 # dustkeeper 运维手册
 
 面向要在一台真实机器上把它装起来、跑起来、并在出问题时知道该看哪里的人。
@@ -325,6 +327,54 @@ dustkeeper events --item <item_id>
 
 用 `--json` 接监控时，`retryable` 字段直接告诉你"重试是否有意义"，不用解析 prose。
 
+### 8.1 三结果与结果页
+
+一轮清理只产生三种结果：**已删除**、**待删除（可恢复）**、**保留**。每个文件只能落在其中一个里，
+结果页也只有这三节。
+
+```sh
+dustkeeper cleanup setup --scopes downloads --categories archive_unknown_contents --observation-days 14
+# 只打印"将被批准的五件事"+ digest；确认时把 digest 原样传回去（两步，先看后批）
+dustkeeper cleanup setup --digest <digest> --scopes downloads --categories archive_unknown_contents --observation-days 14
+dustkeeper run              # 结尾一行：本次删除/待删除/保留各几个 + 结果页路径
+dustkeeper cleanup report   # 原样打印最近一页；--json 输出页面数据
+```
+
+结果页默认在 `<state>/reports/latest.md`（同目录 `latest.json`，以及每一轮的 `result-<run_id>.md`），
+可用 `cleanup setup --result-dir` 改到别处。**没有确认策略时**页面落在 `<state>/reports`，因为
+"没确认"就是"没批准任何目录"，`setup` 预览里给的目录还不算数——`run` 打印的永远是它实际写入的路径。
+
+要记住的五条：
+
+1. **观察期取两者较大值。** 新对象 = `max(规则保留期, 策略观察天数)`。策略只能抬高下限，不能缩短已经
+   记录过保留期的对象；旧对象的保留期字段一个字都不改。
+2. **直删需要四件事同时成立。** 类别在确认过的直删列表里、本地检查无阻碍、双方模型明确同意、授权有效。
+   少一件就只能是"待删除"。类别列表默认是空的。
+3. **通知没送达就不清空。** 永久清空前会发一次系统通知；通知失败或无人值守时如实返回失败，这一轮不清空，
+   对象继续留在观察区（可恢复）。结果页照常生成，`run` 会打印 `the user was not told: …`。
+4. **保留会写进页面。** "模型说保留"和"模型服务失败"是两个不同的原因码：前者是结论，后者是没结论。
+   两者都不产生 pending，也不会让这个范围停摆。
+5. **数字只有一套。** `run` 的摘要行和结果页读的是同一份汇总（`report.Page`），不是两处各算一次。
+
+**放行闸门是可校准的，但默认为严。** JEV 必须同时满足"置信度 ≥ 90%"和"允许概率 ≥ 90%"才会给出 allow，
+而 allow 同时是"直接删除"和"进入观察区"的前置条件。在真实端点上实测 30 条返回（13 条 `allow_review`），
+置信度最高 0.79、允许概率最高 0.86——默认值下一条都过不去，所以这台机器上它**既不删也不移**。
+想让删除这条路可达，就显式调低（单位是整数百分比，配置格式不接受小数）：
+
+```json
+{"review": {"jev_min_confidence_pct": 70, "jev_min_allow_probability_pct": 80}}
+```
+
+调低多少是风险决定，不是配置问题：同一组样本在 70/80 下四次里只有一次两方都同意。`timeout_seconds`
+（5..120，默认 30）控制单次模型请求的等待；实测 20s 会让 MiniMax 偶尔超时，超时会被记成"模型不可用"
+并跳过该文件，而不是等它。
+
+页面里的"已删除"只认**已完成并确认**的动作：候选、模型意见、intent、debug 模拟都不计入。超过 200 条时
+显示总量与"还有 N 条未显示"。`cleanup report` 是只读命令：它读文件，不移动、不删除、也不写审计。
+
+仓库里另有一个独立工具 `cmd/cleanup-report`，那是**只读目录盘点**（看使用痕迹、已知引用、空间上限），
+不读状态库、不生成许可，和这里的 `cleanup report` 不是一回事。
+
 ---
 
 ## 9. 出问题了：恢复与对账
@@ -483,6 +533,10 @@ rm -rf /srv/app/disposable-exports/.dustkeeper           # 仅在第 4 步确认
 | `purge apply` 报 `DIGEST_MISMATCH` | 计划内容在生成后变了；`purge show` 会说明重算摘要是否与存档一致 |
 | 隔离区一直增长 | `auto_purge` 没开，或保留期还没到；`purge plan` 会列出到期对象 |
 | `INSTANCE_BUSY` 反复出现 | 有残留实例或另一个定时任务；`ps` 查一下，锁文件在 `<state>/instance.lock` |
+| `run` 每个对象都是"left alone: protected" | 该路径被 `protect add` 过或刚 restore 过；这是有意的，不会自动过期 |
+| `run` 报 `notify_failed` 且对象没被清空 | 设计如此：提醒没送达就不清空。看 `events` 里 `action=notify` 的 detail，修好通知出口后下一轮会自动重试 |
+| `cleanup report` 说没有结果页 | 还没有跑过 `run`；页面由每轮 `run` 写在 `<state>/reports/latest.md`（或确认策略时的 `--result-dir`） |
+| `cleanup setup --digest` 报 `DIGEST_MISMATCH` | 两次调用之间参数改过；重新预览一次，把新的 digest 原样传回去 |
 | macOS 上 `EXC_BAD_ACCESS` / `EBADF` | 权限授予对象错了（授予终端而非二进制）；或磁盘异常 |
 | 时间相关测试失败 | 检查时区与 `TZ`；程序内部全部用 UTC 纳秒 |
 | `ACCESS_DENIED` 但 `ls` 正常 | 程序用 fd 相对路径 + `O_NOFOLLOW`，不跟符号链接；检查路径中是否有链接段 |

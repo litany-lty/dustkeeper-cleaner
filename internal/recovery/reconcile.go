@@ -204,6 +204,8 @@ func (r *Reconciler) reconcileOne(ctx context.Context, sc *execute.ScopeCtx, po 
 		return r.reconcileRestore(ctx, sc, po)
 	case "purge":
 		return r.reconcilePurge(ctx, sc, po)
+	case "delete":
+		return r.reconcileDelete(ctx, sc, po)
 	default:
 		return r.holdUnfixable(ctx, po, out, "UNKNOWN_ACTION",
 			"the pending operation has no recorded action")
@@ -450,6 +452,106 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 		return r.holdUnfixable(ctx, po, out, "UNEXPLAINED_QUARANTINE_STATE",
 			"the observed source and vault state matches no explainable outcome")
 	}
+}
+
+// reconcileDelete resolves a permanent deletion at the original path that
+// committed its intent and never recorded what happened.
+//
+// It is the only branch whose success cannot be verified: after the unlink there
+// is nothing left to read. All it can do is tell three observable states apart
+// and refuse to call the first one a deletion.
+func (r *Reconciler) reconcileDelete(ctx context.Context, sc *execute.ScopeCtx, po store.PendingOp) Result {
+	it := po.Item
+	out := Result{Item: it.ID, OpID: po.OpID, Action: "delete", Scope: string(it.ScopeID)}
+
+	contract, cerr := r.operationContract(po)
+	if cerr != nil {
+		return r.recordFailure(ctx, po, out, "DELETE_CONTRACT_UNREADABLE", cerr)
+	}
+	// A direct deletion that removed nothing returns the item to the plan it came
+	// from. That state is read from the contract rather than assumed: writing
+	// "planned" for an operation that started somewhere else would put the item
+	// back into a lifecycle it never left.
+	if contract.PriorState != domain.StatePlanned {
+		return r.recordFailure(ctx, po, out, "PRIOR_STATE_UNKNOWN",
+			errs.Newf(errs.CodeRecoveryRequired,
+				"the delete contract records prior state %q; a direct deletion starts from %q",
+				contract.PriorState, domain.StatePlanned))
+	}
+
+	// A direct deletion never uses the vault. An object under the item's name
+	// means this operation did something other than what it recorded, and neither
+	// branch below may describe that.
+	if _, vaultFound, verr := statVault(sc, it.ObjectName); verr != nil {
+		return r.recordFailure(ctx, po, out, "VAULT_STAT_FAILED", verr)
+	} else if vaultFound {
+		return r.holdUnfixable(ctx, po, out, "UNEXPECTED_VAULT_OBJECT",
+			"a direct deletion records no vault step, yet an object with this name exists there; nothing was changed")
+	}
+
+	srcID, srcFound, serr := statEntry(sc, it.RawRelative)
+	if serr != nil {
+		return r.recordFailure(ctx, po, out, "SOURCE_STAT_FAILED", serr)
+	}
+
+	switch {
+	case srcFound && srcID.Equal(contract.ExpectedIdent):
+		// Nothing was removed, and the file is still the one the plan approved.
+		// The attempt is closed and the item returns to its plan. Replaying the
+		// removal here would be a deletion performed by the recovery pass, on
+		// authority that was granted to a different moment.
+		if err := r.Store.AbortIntent(ctx, intentOf(po), domain.StatePlanned,
+			`{"source":"reconciled","result":"file still present and unchanged; the deletion did not happen"}`); err != nil {
+			return r.recordFailure(ctx, po, out, "ABORT_FAILED", err)
+		}
+		out.Outcome = "aborted"
+		out.Detail = "the file is still there and unchanged; the deletion never happened and the plan stays valid"
+		return out
+
+	case !srcFound:
+		// The path holds nothing. That is consistent with a completed unlink, but
+		// it is equally consistent with somebody else having removed the file, so
+		// the completion records only what can be observed. The source directory
+		// is flushed first: the entry disappeared, and that disappearance has to
+		// be on disk before the removal is written down as done.
+		parent, perr := sc.Root.OpenParent(it.RawRelative)
+		if perr != nil {
+			if errors.Is(perr, unix.ENOENT) {
+				// The directory is gone as well, so there is nothing left to
+				// flush. The removal is still explainable.
+				return r.completeReconciledDelete(ctx, po, out)
+			}
+			return r.recordFailure(ctx, po, out, "SOURCE_PARENT_UNAVAILABLE", perr)
+		}
+		defer parent.Close()
+		if err := execute.SyncAfterUnlink(parent, sc.AnchorFD(), "reconcile-delete"); err != nil {
+			return r.recordFailure(ctx, po, out, "SYNC_FAILED", err)
+		}
+		return r.completeReconciledDelete(ctx, po, out)
+
+	default:
+		// A different object now occupies the path. This operation removed
+		// nothing, and nothing may be removed now: the new file was never
+		// reviewed.
+		return r.holdUnfixable(ctx, po, out, "SOURCE_REPLACED",
+			"the path now holds a different file than the one this operation was approved to delete; that file was left untouched")
+	}
+}
+
+// completeReconciledDelete closes an intent whose file is no longer at the path.
+//
+// The wording is deliberate: RECONCILED_ABSENT says the path is empty and this
+// operation is over. It does not claim a verified unlink, because a recovery
+// pass cannot observe one.
+func (r *Reconciler) completeReconciledDelete(ctx context.Context, po store.PendingOp, out Result) Result {
+	if err := r.Store.CompletePurge(ctx, intentOf(po),
+		`{"source":"reconciled","result":"RECONCILED_ABSENT","action":"delete"}`); err != nil {
+		return r.recordFailure(ctx, po, out, "COMPLETE_FAILED", err)
+	}
+	r.releasePin(ctx, po.Item, &out)
+	out.Outcome = "completed"
+	out.Detail = "the path was already empty; recorded as RECONCILED_ABSENT, not as a verified unlink"
+	return out
 }
 
 // captureEvidence records the object that actually moved, together with the

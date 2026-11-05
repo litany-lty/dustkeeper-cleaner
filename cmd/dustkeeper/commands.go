@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/clocktrust"
 	"dustkeeper/internal/config"
 	"dustkeeper/internal/domain"
@@ -18,6 +19,7 @@ import (
 	"dustkeeper/internal/fsops"
 	"dustkeeper/internal/policy"
 	"dustkeeper/internal/recovery"
+	"dustkeeper/internal/report"
 	"dustkeeper/internal/run"
 	"dustkeeper/internal/scope"
 	"dustkeeper/internal/store"
@@ -217,9 +219,25 @@ func cmdDoctor(ctx context.Context, a *app, args []string) (output, error) {
 					clockDetail = "more than 48 hours passed between runs; purging stays suspended until you acknowledge the clock"
 				}
 			}
+		} else {
+			clockOK = false
+			clockDetail = "the stored last-run timestamp is invalid; clock trust cannot be established"
 		}
 	}
+	// Report the same persistent trust decision the executor will enforce.
+	if verdict, err := clocktrust.Start(a.store, a.clock).Assess(ctx); err != nil {
+		clockOK = false
+		clockDetail = "clock trust could not be established: " + err.Error()
+	} else if !verdict.Trusted {
+		clockOK = false
+		clockDetail = verdict.Reason
+	}
 	if *ackClock {
+		unlock, err := lockInstance(a.paths.StateDir)
+		if err != nil {
+			return output{}, err
+		}
+		defer unlock()
 		// The acknowledgement is a transaction, not a timestamp: it clears the
 		// latch, restarts the retention window of every object whose start time
 		// cannot be proven, and records what it did. Writing clock_ack_ns alone -
@@ -560,6 +578,17 @@ func cmdResume(ctx context.Context, a *app, args []string) (output, error) {
 	})
 }
 
+// notifiedOf renders one scope's delivery outcome for the operational log.
+func notifiedOf(s run.ScopeRun) string {
+	if s.Notification == nil {
+		return "not_applicable"
+	}
+	if s.Notification.Delivered {
+		return "delivered"
+	}
+	return "failed: " + s.Notification.Detail
+}
+
 // cmdRun performs one bounded background pass.
 func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 	fs := flagset("run", io.Discard)
@@ -583,6 +612,9 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 	}
 
 	var rep run.Report
+	var pagePaths report.Paths
+	var pageCounts [3]int
+	var pageNote string
 	out, err := a.withInstance(func() (output, error) {
 		r := &run.Runner{
 			Store:      a.store,
@@ -591,12 +623,17 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 			Registrar:  a.registrar(),
 			Exec:       a.executor(),
 			Reconciler: a.reconciler(),
+			Notify:     a.notifySender(),
 		}
+		// The page this run writes describes this run, so the window is taken
+		// around it rather than from the calendar.
+		startedNS := a.clock.Wall().UnixNano()
 		var rerr error
 		rep, rerr = r.Run(ctx)
 		if rerr != nil {
 			return output{}, rerr
 		}
+		endedNS := a.clock.Wall().UnixNano()
 		// The run's own record, before the envelope is rendered: run_id, the control
 		// it reached, what it read and moved, and one line per scope explaining any
 		// phase that did not run. A scheduler waking somebody up needs the scope and
@@ -637,6 +674,8 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 				"skipped", s.Skipped,
 				"purge_skipped", s.PurgeSkipped,
 				"quarantine_skipped", s.QuarantineSkipped,
+				"expiry_skipped", strings.Join(s.ExpirySkipped, " | "),
+				"notified", notifiedOf(s),
 				"message", s.Message)
 		}
 		for _, op := range rep.Reconciliation.Results {
@@ -648,16 +687,27 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 				"outcome", op.Outcome,
 				"detail", op.Detail)
 		}
+		// The result page is written here, while the instance lock is held, so
+		// that two runs can never interleave their halves into one page. A
+		// failure to write it is not a failure of the run: the files were still
+		// handled, and the run already recorded what it did. It is reported,
+		// because a product whose promise is "there is a page at a fixed place"
+		// must not quietly leave the previous run's page there instead.
+		page, pageErr := a.writeRunPage(ctx, rep, startedNS, endedNS)
+		if pageErr != nil {
+			pageNote = pageErr.Error()
+			a.log.Log("run", "phase", "run", "run_id", rep.RunID,
+				"result_page_error", pageNote)
+		} else {
+			pagePaths = page.paths
+			pageCounts = [3]int{page.page.Deleted.Total, page.page.Observed.Total, page.page.Kept.Total}
+			a.log.Log("run", "phase", "run", "run_id", rep.RunID,
+				"result_page", page.paths.Markdown,
+				"deleted", pageCounts[0], "observed", pageCounts[1], "kept", pageCounts[2])
+		}
 		res := ok()
 		res.Data = rep
-		res.Human = []string{
-			fmt.Sprintf("run %s", rep.RunID),
-			fmt.Sprintf("  reconciled %d operation(s): %d completed, %d aborted, %d held, %d unknown",
-				rep.Reconciliation.Examined, rep.Reconciliation.Completed,
-				rep.Reconciliation.Aborted, rep.Reconciliation.Held, rep.Reconciliation.Unknown),
-			fmt.Sprintf("  quarantined %d object(s), purged %d object(s), read %d bytes",
-				rep.Quarantined, rep.Purged, rep.ReadBytes),
-		}
+		res.Human = runSummaryLines(rep, pagePaths, pageCounts, pageNote)
 		if !rep.ClockTrusted {
 			res.Human = append(res.Human, "  clock: "+rep.ClockNote)
 			res.Message = rep.ClockNote
@@ -677,6 +727,15 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 					res.Human = append(res.Human,
 						fmt.Sprintf("      %s skipped: %s", note.phase, note.why))
 				}
+			}
+			// A due object that was left alone is the answer to "why is this
+			// still here", so it is printed rather than counted.
+			for _, why := range s.ExpirySkipped {
+				res.Human = append(res.Human, "      left alone: "+why)
+			}
+			if s.Notification != nil && !s.Notification.Delivered {
+				res.Human = append(res.Human,
+					"      the user was not told: "+s.Notification.Detail)
 			}
 		}
 		return res, nil
@@ -703,7 +762,79 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 		out.Status = string(errs.StatusOf(errs.CodeClockUntrusted))
 		out.Next = []string{"dustkeeper doctor --acknowledge-clock"}
 	}
+	// A run that handled files but could not leave a page behind is partial, not
+	// successful: the user was told to look at a place, and looking there would
+	// show the previous run.
+	if pageNote != "" && out.Code == "" {
+		out.Code = errs.CodePartial
+		out.Status = string(errs.StatusPartial)
+		out.Message = "the run finished but its result page could not be written: " + pageNote
+		out.Next = append(out.Next, "dustkeeper cleanup report")
+	}
+	if pagePaths.Markdown != "" && out.Code == "" {
+		out.Next = append(out.Next, "dustkeeper cleanup report")
+	}
 	return out, nil
+}
+
+// runSummaryLines states what this run did.
+//
+// The three-outcome breakdown comes from the written page, so it is printed only
+// when the page exists. The counters passed in are zeroed until then, and
+// printing them anyway would report "0 deleted" for a run that deleted files and
+// failed to leave a page behind: an unchecked zero is a claim, not a blank.
+func runSummaryLines(rep run.Report, pagePaths report.Paths, counts [3]int, pageNote string) []string {
+	lines := []string{
+		fmt.Sprintf("run %s", rep.RunID),
+		fmt.Sprintf("  reconciled %d operation(s): %d completed, %d aborted, %d held, %d unknown",
+			rep.Reconciliation.Examined, rep.Reconciliation.Completed,
+			rep.Reconciliation.Aborted, rep.Reconciliation.Held, rep.Reconciliation.Unknown),
+		fmt.Sprintf("  quarantined %d object(s), purged %d object(s), read %d bytes",
+			rep.Quarantined, rep.Purged, rep.ReadBytes),
+	}
+	if pageNote != "" || pagePaths.Markdown == "" {
+		detail := pageNote
+		if detail == "" {
+			detail = "no page was written"
+		}
+		return append(lines, "  this run's breakdown is unknown: the result page could not be written: "+detail)
+	}
+	return append(lines,
+		fmt.Sprintf("  this run: %d deleted, %d moved to the observation area, %d left alone",
+			counts[0], counts[1], counts[2]),
+		"  result page: "+pagePaths.Markdown)
+}
+
+// runPage is one run's page together with where it was written.
+type runPage struct {
+	page  report.Page
+	paths report.Paths
+}
+
+// writeRunPage renders this run's result page from the records the run just wrote.
+//
+// The page answers "what did this run do", so the window is the run's own
+// duration. It is collected from items and events only - nothing the run held in
+// memory can add a line to it - which is why the page cannot promise something the
+// database does not also claim.
+func (a *app) writeRunPage(ctx context.Context, rep run.Report, startNS, endNS int64) (runPage, error) {
+	pol, err := cleanup.Load(ctx, a.store)
+	if err != nil {
+		return runPage{}, err
+	}
+	page, err := report.Collect(ctx, a.store, report.Window{
+		StartNS: startNS,
+		EndNS:   endNS,
+		RunID:   rep.RunID,
+	})
+	if err != nil {
+		return runPage{}, err
+	}
+	paths, err := report.Write(a.resultDirOf(pol), page)
+	if err != nil {
+		return runPage{}, err
+	}
+	return runPage{page: page, paths: paths}, nil
 }
 
 // cmdScan indexes metadata for one scope. It reads no file content.
@@ -795,8 +926,9 @@ func (a *app) registrar() *scope.Registrar {
 
 func (a *app) executor() *execute.Executor {
 	return &execute.Executor{
-		Store: a.store,
-		Clock: a.clock,
+		Review: a.reviewer(),
+		Store:  a.store,
+		Clock:  a.clock,
 		Config: execute.ConfigView{
 			BufferBytes:    a.cfg.Runtime.IOBufferBytes,
 			ReadRatePerSec: a.cfg.Runtime.ReadRateBytesPerSecond,

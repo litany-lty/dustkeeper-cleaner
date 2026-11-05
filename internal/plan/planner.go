@@ -7,12 +7,14 @@ import (
 	"strings"
 	"time"
 
+	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/config"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/policy"
 	"dustkeeper/internal/rules"
 	"dustkeeper/internal/store"
+	"dustkeeper/internal/strictjson"
 )
 
 // DefaultTTL is the plan approval window. It starts after the item list is
@@ -71,6 +73,35 @@ type RulePlanResult struct {
 	Scanned   int            `json:"scanned"`
 }
 
+// observationSeconds is how long the confirmed cleanup policy says a newly
+// isolated object stays in the observation area.
+//
+// It is read, never clamped here: a policy row that cannot be read is a refusal,
+// because planning against a retention nobody confirmed would bind the item to a
+// promise the operator never made.
+func (p *Planner) observationSeconds(ctx context.Context) (int64, error) {
+	pol, err := cleanup.Load(ctx, p.Store)
+	if err != nil {
+		return 0, err
+	}
+	return pol.RetentionSeconds(), nil
+}
+
+// effectiveRetention is the longer of what the rule promised and what the
+// cleanup policy promises.
+//
+// Neither may shorten the other. Taking the rule's value alone let a three-day
+// rule undercut the fourteen-day observation default, which is the setting the
+// product is defined by; taking the policy's alone would silently shorten a rule
+// that promised thirty days, and the six objects already isolated under such a
+// rule must keep their period exactly as it was recorded.
+func effectiveRetention(ruleSeconds, observationSeconds int64) int64 {
+	if observationSeconds > ruleSeconds {
+		return observationSeconds
+	}
+	return ruleSeconds
+}
+
 // CreateRulePlan freezes the current candidates into a plan.
 func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (RulePlanResult, error) {
 	res := RulePlanResult{Reasons: map[string]int{}}
@@ -84,8 +115,22 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 		return res, errs.New(errs.CodeInvalidArgument,
 			"the action limit for this plan is zero, which means this action is forbidden")
 	}
+	if req.MaxBytes <= 0 {
+		return res, errs.New(errs.CodeInvalidArgument,
+			"the byte limit for this plan is zero, which means this action is forbidden")
+	}
 
 	persistentDigest, rootID, err := scopeIdentity(req.Scope)
+	if err != nil {
+		return res, err
+	}
+
+	// How long a newly isolated object must stay in the observation area is
+	// decided once, before the iteration: the candidate iterator below holds the
+	// database's single connection, so a query from inside it would wait for
+	// ever. Reading it here also means every item of one plan is bound to the
+	// same value.
+	observationSeconds, err := p.observationSeconds(ctx)
 	if err != nil {
 		return res, err
 	}
@@ -206,6 +251,10 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 
 		objectName := domain.NewID("obj")
 		itemID := domain.ItemID(objectName)
+		// One value for the binding, the item and the preview document: three
+		// copies that could disagree is three ways to answer "when does this
+		// clear" differently.
+		boundRetention := effectiveRetention(req.Rule.RetentionSeconds, observationSeconds)
 
 		binding := ItemBindingV1{
 			BindingVersion:           BindingVersion,
@@ -218,7 +267,7 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 			ProtectionRevision:       req.Scope.ProtectionRevision,
 			SafetyPolicyVersion:      SafetyPolicyVersion,
 			SourceKind:               req.Kind,
-			BoundRetentionSeconds:    req.Rule.RetentionSeconds,
+			BoundRetentionSeconds:    boundRetention,
 			MetadataPolicyVersion:    MetadataPolicyVersion,
 		}
 		if req.QuarantineGrant != nil {
@@ -246,7 +295,7 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 			SourceParentIdentityJSON: o.ParentJSON,
 			PreIdentityJSON:          o.IdentityJSON,
 			PreTokenJSON:             o.TokenJSON,
-			BoundRetentionSeconds:    req.Rule.RetentionSeconds,
+			BoundRetentionSeconds:    boundRetention,
 			State:                    domain.StatePlanned,
 		}
 		if req.PurgeGrant != nil {
@@ -263,7 +312,7 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 			ObjectName:            objectName,
 			Reason:                domain.ReasonLifecycle,
 			SourceKind:            req.Kind,
-			BoundRetentionSeconds: req.Rule.RetentionSeconds,
+			BoundRetentionSeconds: boundRetention,
 			RuleID:                strPtr(string(req.RuleRef.ID)),
 			RuleRevision:          i64Ptr(req.RuleRef.Revision),
 			RuleDigest:            strPtr(string(req.RuleRef.Digest)),
@@ -402,14 +451,21 @@ func itemDocOf(it store.Item) (PlanItemDoc, error) {
 	}
 
 	var binding ItemBindingV1
-	_ = json.Unmarshal([]byte(it.BindingJSON), &binding)
+	strict := strictjson.Defaults()
+	strict.StrictStruct = true
+	if err := strictjson.Unmarshal([]byte(it.BindingJSON), &binding, strict); err != nil {
+		return PlanItemDoc{}, errs.Newf(errs.CodeStateWriteFailed,
+			"item %s binding unreadable: %v", it.ID, err)
+	}
 
 	var keeper *KeeperEvidenceV1
 	if it.KeeperJSON != nil {
 		var k KeeperEvidenceV1
-		if err := json.Unmarshal([]byte(*it.KeeperJSON), &k); err == nil {
-			keeper = &k
+		if err := strictjson.Unmarshal([]byte(*it.KeeperJSON), &k, strict); err != nil {
+			return PlanItemDoc{}, errs.Newf(errs.CodeStateWriteFailed,
+				"item %s keeper evidence unreadable: %v", it.ID, err)
 		}
+		keeper = &k
 	}
 
 	return PlanItemDoc{
@@ -476,6 +532,9 @@ func VerifyPlanDigest(p store.Plan, items []store.Item, approved domain.Digest) 
 	doc, err := BuildDocFromStore(p, items)
 	if err != nil {
 		return err
+	}
+	if doc.PolicyDigest != string(policy.PolicyDigest()) {
+		return errs.New(errs.CodePlanStale, "the built-in safety policy changed; create and approve a fresh plan")
 	}
 	recomputed, err := doc.ComputeDigest()
 	if err != nil {

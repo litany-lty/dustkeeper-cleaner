@@ -54,9 +54,17 @@ func lockFile(path string, wait bool, timeout time.Duration) (*Lock, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, errs.Wrap(errs.CodeAccessDenied, err)
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		if err != nil {
+			return nil, errs.Wrap(errs.CodeAccessDenied, err)
+		}
+		return nil, errs.New(errs.CodeAccessDenied, "lock path must be a regular file")
 	}
 
 	deadline := time.Now().Add(timeout)

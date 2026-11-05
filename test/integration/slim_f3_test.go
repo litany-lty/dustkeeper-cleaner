@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -19,23 +18,21 @@ import (
 // object", when a stopped batch is reported as stopped, and what a reconciliation
 // pass does with a failure that may clear on its own.
 
-// countingClock reports a monotonic reading that advances by a fixed step on every
-// call, so a test can decide which checkpoint inside one action crosses the run's
-// deadline. Wall time comes from the environment's fake clock unchanged.
-type countingClock struct {
-	wall  domain.Clock
-	step  time.Duration
-	mu    sync.Mutex
-	calls int
+// manifestDeadlineClock crosses the deadline only after preparation becomes
+// durable. Extra earlier checks must not change which checkpoint is exercised.
+type manifestDeadlineClock struct {
+	wall        domain.Clock
+	manifestDir string
 }
 
-func (c *countingClock) Wall() time.Time { return c.wall.Wall() }
+func (c *manifestDeadlineClock) Wall() time.Time { return c.wall.Wall() }
 
-func (c *countingClock) Mono() time.Duration {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.calls++
-	return time.Duration(c.calls) * c.step
+func (c *manifestDeadlineClock) Mono() time.Duration {
+	entries, _ := os.ReadDir(c.manifestDir)
+	if len(entries) > 0 {
+		return 30 * time.Second
+	}
+	return 0
 }
 
 // manifestsIn lists the preparation manifests a scope has written.
@@ -73,13 +70,10 @@ func TestSlimQuarantineFinalGate(t *testing.T) {
 	sctx := e.scopeCtx(sc.ID)
 	e.exec.Guard = e.guard(sctx)
 
-	// Quarantine asks the clock for its monotonic reading three times before the
-	// intent: before the read, after the read, and immediately before the intent.
-	// A step of 10s against a 25s slice is still allowed at the first two and
-	// over the line at the third, which is exactly the "the budget ran out after
-	// the manifest was already durable" case.
+	// Expire only after the manifest is durable, independently of the number of
+	// preliminary budget or review checks.
 	normal := e.exec.Clock
-	e.exec.Clock = &countingClock{wall: normal, step: 10 * time.Second}
+	e.exec.Clock = &manifestDeadlineClock{wall: normal, manifestDir: filepath.Join(e.base, "trees", "exports", ".dustkeeper", "manifests")}
 	t.Cleanup(func() { e.exec.Clock = normal })
 
 	budget := domain.NewBudget(25, 1<<30, 10, 1<<30, 0)

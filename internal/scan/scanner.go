@@ -255,9 +255,23 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 	// the marker's own subtree leaves "repo/src/main.go" exposed, because no
 	// segment of that path is ".git".
 	for _, marker := range []string{".git", ".hg", ".svn"} {
+		markerRel := marker
+		if len(rel) > 0 {
+			markerRel = string(rel) + "/" + marker
+		}
+		if herr := entryStatError(markerRel); herr != nil {
+			if errors.Is(herr, unix.ENOENT) {
+				continue
+			}
+			stats.Unreadable++
+			return dirFailedWith(fmt.Sprintf("project marker %q could not be inspected", marker)), nil
+		}
 		if _, _, merr := dir.StatEntry(marker); merr == nil {
 			stats.ProtectedDirs++
 			return dirDone, nil
+		} else if !errors.Is(merr, unix.ENOENT) {
+			stats.Unreadable++
+			return dirFailedWith(fmt.Sprintf("project marker %q could not be inspected", marker)), nil
 		}
 	}
 
@@ -295,6 +309,11 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 
 	for {
 		entries, err := dir.Readdir(s.ReadDirBatch)
+		if f := TestHookReadDirError; f != nil {
+			if hookErr := f(string(rel), len(entries)); hookErr != nil {
+				err = hookErr
+			}
+		}
 		if err != nil && len(entries) == 0 {
 			if errors.Is(err, io.EOF) {
 				break
@@ -418,6 +437,16 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 			}
 			return dirFailedWith(fmt.Sprintf("%d entries could not be inspected (first: %s)",
 				unverifiedCount, unverifiedFirst)), nil
+		}
+		if err != nil {
+			if ferr := flush(); ferr != nil {
+				return dirFailedWith("flush failed"), ferr
+			}
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			stats.Unreadable++
+			return dirFailedWith("read error"), nil
 		}
 		if run.TimeUp(s.Clock.Mono()) {
 			// Flush what we have, then report the directory as unfinished. Its

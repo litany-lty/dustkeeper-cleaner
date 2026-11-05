@@ -23,10 +23,11 @@ var allCodes = []Code{
 	CodeProtectionAliasUnresolved, CodePaused, CodePauseRequested, CodeKeeperMissing,
 	CodeDurabilityFailed, CodeStateWriteFailed, CodeIOError, CodeDBError,
 	CodeMigrationTooNew, CodeMigrationTooOld, CodeDiskPressure,
-	CodeModelUnavailable,
+	CodeModelUnavailable, CodeReviewRequired,
 	CodePartial,
 	CodeCancelled,
 	CodeNoCandidates, CodeSkippedProtected, CodeDeepScanRequired, CodeBudgetExhausted,
+	CodeKept,
 }
 
 // documented maps each code to the exit status published in README and helpText.
@@ -53,11 +54,12 @@ var documented = map[Code]int{
 	CodeDBError: 7, CodeMigrationTooNew: 7, CodeMigrationTooOld: 7, CodeDiskPressure: 7,
 
 	CodeModelUnavailable: 8,
+	CodeReviewRequired:   6,
 	CodePartial:          9,
 	CodeCancelled:        130,
 
 	CodeNoCandidates: 0, CodeSkippedProtected: 0, CodeDeepScanRequired: 0,
-	CodeBudgetExhausted: 0,
+	CodeBudgetExhausted: 0, CodeKept: 0,
 }
 
 func TestEveryCodeHasAnExitStatus(t *testing.T) {
@@ -102,7 +104,7 @@ func TestEveryCodeHasAStatus(t *testing.T) {
 		t.Errorf("PARTIAL must report status partial")
 	}
 	// Informational outcomes are successes, not failures.
-	for _, c := range []Code{CodeNoCandidates, CodeSkippedProtected, CodeDeepScanRequired, CodeBudgetExhausted} {
+	for _, c := range []Code{CodeNoCandidates, CodeSkippedProtected, CodeDeepScanRequired, CodeBudgetExhausted, CodeKept} {
 		if StatusOf(c) != StatusOK || Exit(c) != 0 {
 			t.Errorf("%s is informational and must not fail the run", c)
 		}

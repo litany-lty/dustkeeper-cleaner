@@ -11,6 +11,7 @@ import (
 
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
+	"dustkeeper/internal/policy"
 	"dustkeeper/internal/store"
 )
 
@@ -19,7 +20,7 @@ import (
 const MetadataPolicyVersion = 1
 
 // SafetyPolicyVersion identifies the global protection list generation.
-const SafetyPolicyVersion = 1
+const SafetyPolicyVersion = policy.PolicyVersion
 
 // BindingVersions are written into every stored contract.
 const (

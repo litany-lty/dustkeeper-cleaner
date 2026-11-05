@@ -111,8 +111,8 @@ func TestACompensationWhoseRecordCannotBeClosedStopsTheRun(t *testing.T) {
 	}
 
 	// And the run stopped: the second object was never touched.
-	if secondResult := resultFor(t, out, second.ID); secondResult.Code != string(errs.CodePaused) {
-		t.Fatalf("the second member was %q, so the batch went on after a storage failure", secondResult.Code)
+	if secondResult := resultFor(t, out, second.ID); secondResult.Code != string(errs.CodeStateWriteFailed) || secondResult.Evidence != domain.EvidenceNotStarted {
+		t.Fatalf("the second member did not retain the batch stop reason without starting: %+v", secondResult)
 	}
 	if !e.exists("exports", string(second.RawRelative)) {
 		t.Fatal("the second object was moved out of the tree by a batch that had already stopped")

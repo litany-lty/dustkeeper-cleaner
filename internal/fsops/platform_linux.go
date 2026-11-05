@@ -24,7 +24,7 @@ const renameNoReplaceFlag = 1
 // our own walk.
 func openDirChain(rootFD int, parts []string, rootDev uint64) (int, error) {
 	if len(parts) == 0 {
-		fd, err := unix.Dup(rootFD)
+		fd, err := dupCloseOnExec(rootFD)
 		if err != nil {
 			return -1, fmt.Errorf("fsops: dup: %w", err)
 		}

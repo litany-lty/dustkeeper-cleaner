@@ -94,6 +94,9 @@ func ParseDraft(raw []byte, allowedScopes map[string]bool) (Draft, error) {
 		IntegerOnly:  true,
 		StrictStruct: true,
 	}); err != nil {
+		if se, ok := err.(*strictjson.Error); ok && se.Kind == strictjson.KindUnknown {
+			return Draft{}, mapStrict(err)
+		}
 		return Draft{}, errs.Newf(errs.CodeDSLInvalid,
 			"the model answer is not a strict JSON draft: %v", err)
 	}

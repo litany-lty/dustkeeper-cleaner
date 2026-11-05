@@ -15,6 +15,7 @@ package clocktrust
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"dustkeeper/internal/domain"
@@ -86,9 +87,11 @@ func (g *Guard) Assess(ctx context.Context) (Verdict, error) {
 	}
 	var base int64
 	if baseStr != "" {
-		if v, perr := parseInt(baseStr); perr == nil {
-			base = v
+		v, perr := parseInt(baseStr)
+		if perr != nil || v <= 0 {
+			return Verdict{Trusted: false, Reason: "the stored trusted clock baseline is invalid; acknowledge the clock before purging"}, nil
 		}
+		base = v
 	}
 
 	if base > 0 {
@@ -194,26 +197,7 @@ func Acknowledge(ctx context.Context, st *store.Store, c domain.Clock) (AckRepor
 }
 
 func parseInt(s string) (int64, error) {
-	var v int64
-	var neg bool
-	if s == "" {
-		return 0, errs.New(errs.CodeInvalidArgument, "empty integer")
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if i == 0 && (c == '-' || c == '+') {
-			neg = c == '-'
-			continue
-		}
-		if c < '0' || c > '9' {
-			return 0, errs.Newf(errs.CodeInvalidArgument, "%q is not an integer", s)
-		}
-		v = v*10 + int64(c-'0')
-	}
-	if neg {
-		v = -v
-	}
-	return v, nil
+	return strconv.ParseInt(s, 10, 64)
 }
 
 func formatInt(v int64) string {

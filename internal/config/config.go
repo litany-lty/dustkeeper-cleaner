@@ -8,14 +8,18 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"dustkeeper/internal/errs"
+	"dustkeeper/internal/review"
 	"dustkeeper/internal/strictjson"
 )
 
@@ -68,9 +72,10 @@ type Model struct {
 
 // Config is the whole file.
 type Config struct {
-	ConfigVersion int     `json:"config_version"`
-	Runtime       Runtime `json:"runtime"`
-	Model         *Model  `json:"model"`
+	Review        *review.Settings `json:"review,omitempty"`
+	ConfigVersion int              `json:"config_version"`
+	Runtime       Runtime          `json:"runtime"`
+	Model         *Model           `json:"model"`
 }
 
 // Default returns the documented defaults.
@@ -106,17 +111,33 @@ func Default() Config {
 // Load reads path, or returns defaults when the file does not exist. A missing
 // file is not an error: every command works on defaults until `init` writes one.
 func Load(path string) (Config, bool, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return Default(), true, nil
 	}
 	if err != nil {
 		return Config{}, false, errs.Wrap(errs.CodeAccessDenied, err)
 	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Config{}, false, errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	if !info.Mode().IsRegular() {
+		return Config{}, false, errs.New(errs.CodeInvalidArgument, "config must be a regular file")
+	}
+	const maxConfigBytes = 256 * kib
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
+	if err != nil {
+		return Config{}, false, errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	if len(data) > maxConfigBytes {
+		return Config{}, false, fromStrict(&strictjson.Error{Kind: strictjson.KindTooLarge, Detail: "configuration exceeds 262144 bytes"})
+	}
 
 	var c Config
 	if err := strictjson.Unmarshal(data, &c, strictjson.Options{
-		MaxBytes:     256 * kib,
+		MaxBytes:     maxConfigBytes,
 		MaxDepth:     8,
 		IntegerOnly:  true,
 		StrictStruct: true,
@@ -186,6 +207,9 @@ func (c Config) Validate() error {
 		}
 	}
 
+	if err := c.Review.Validate(); err != nil {
+		return err
+	}
 	if c.Model != nil {
 		return c.Model.validate()
 	}
@@ -208,12 +232,21 @@ func (m *Model) validate() error {
 	if m.BaseURL == "" {
 		return errs.New(errs.CodeInvalidArgument, "model.base_url is required when the model is enabled")
 	}
-	if m.APIKeyEnv == "" {
-		return errs.New(errs.CodeInvalidArgument, "model.api_key_env is required when the model is enabled")
+	if m.APIKeyEnv == "" || strings.ContainsAny(m.APIKeyEnv, "=\x00") {
+		return errs.New(errs.CodeInvalidArgument, "model.api_key_env must name a usable environment variable when the model is enabled")
+	}
+	if m.Model == "" || strings.TrimSpace(m.Model) != m.Model || strings.ContainsFunc(m.Model, unicode.IsControl) {
+		return errs.New(errs.CodeInvalidArgument, "model.model is required without boundary whitespace or control characters")
 	}
 	u, err := url.Parse(m.BaseURL)
-	if err != nil {
-		return errs.Newf(errs.CodeInvalidArgument, "model.base_url is not a URL: %v", err)
+	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return errs.New(errs.CodeInvalidArgument, "model.base_url must be a complete URL without credentials, query or fragment")
+	}
+	if u.Port() != "" {
+		port, err := strconv.Atoi(u.Port())
+		if err != nil || port < 1 || port > 65535 {
+			return errs.New(errs.CodeInvalidArgument, "model.base_url has an invalid port")
+		}
 	}
 	switch u.Scheme {
 	case "https":
@@ -289,6 +322,12 @@ func ResolvePaths() (Paths, error) {
 		stateDir = filepath.Join(x, "dustkeeper")
 	} else {
 		stateDir = filepath.Join(home, ".local", "state", "dustkeeper")
+	}
+	for _, entry := range []struct{ name, dir string }{{"config", configDir}, {"state", stateDir}} {
+		if !filepath.IsAbs(entry.dir) || filepath.Clean(entry.dir) != entry.dir {
+			return Paths{}, errs.Newf(errs.CodeInvalidArgument,
+				"%s directory must be an absolute normalized path", entry.name)
+		}
 	}
 
 	return Paths{

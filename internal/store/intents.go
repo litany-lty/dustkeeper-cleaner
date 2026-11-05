@@ -287,15 +287,17 @@ func (s *Store) OpHasTerminalEvent(ctx context.Context, opID domain.OperationID)
 
 // Intent is a request to begin one operation on one item.
 type Intent struct {
-	OpID         domain.OperationID
-	ItemID       domain.ItemID
-	PlanID       *domain.PlanID
-	Action       string
-	PriorState   string
-	NextState    string
-	ContractJSON string
-	OccurredAtNS int64
-	PinKeeper    bool
+	Review            domain.ReviewApproval
+	ReviewContentHash string
+	OpID              domain.OperationID
+	ItemID            domain.ItemID
+	PlanID            *domain.PlanID
+	Action            string
+	PriorState        string
+	NextState         string
+	ContractJSON      string
+	OccurredAtNS      int64
+	PinKeeper         bool
 }
 
 // BeginIntent commits the operation intent and the item transition together.
@@ -306,9 +308,10 @@ type Intent struct {
 func (s *Store) BeginIntent(ctx context.Context, in Intent) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		var state string
+		var itemPlan string
 		var pending sql.NullString
 		err := tx.QueryRowContext(ctx,
-			"SELECT state, pending_op_id FROM items WHERE item_id=?", string(in.ItemID)).Scan(&state, &pending)
+			"SELECT state, pending_op_id, plan_id FROM items WHERE item_id=?", string(in.ItemID)).Scan(&state, &pending, &itemPlan)
 		if errors.Is(err, sql.ErrNoRows) {
 			return errs.Newf(errs.CodeItemNotFound, "item %q does not exist", in.ItemID)
 		}
@@ -322,6 +325,30 @@ func (s *Store) BeginIntent(ctx context.Context, in Intent) error {
 		if state != in.PriorState {
 			return errs.Newf(errs.CodePlanStale,
 				"item %s is %q, expected %q", in.ItemID, state, in.PriorState)
+		}
+		if (in.Action == domain.ActionQuarantine || in.Action == domain.ActionDelete) &&
+			(in.PlanID == nil || string(*in.PlanID) != itemPlan) {
+			executionPlan := "<missing>"
+			if in.PlanID != nil {
+				executionPlan = string(*in.PlanID)
+			}
+			return errs.Newf(errs.CodePlanStale,
+				"item %s belongs to plan %s, not execution plan %s", in.ItemID, itemPlan, executionPlan)
+		}
+
+		var reviewJSON *string
+		if in.Action == domain.ActionQuarantine || in.Action == domain.ActionPurge || in.Action == domain.ActionDelete {
+			if in.Review == nil {
+				return errs.New(errs.CodeReviewRequired, "intent has no dual-review approval")
+			}
+			if err := in.Review.CheckIntent(string(in.ItemID), in.Action, s.NowNS()); err != nil {
+				return err
+			}
+			audit := in.Review.AuditJSON()
+			if !json.Valid([]byte(audit)) {
+				return errs.New(errs.CodeReviewRequired, "review audit is invalid")
+			}
+			reviewJSON = &audit
 		}
 
 		res, err := tx.ExecContext(ctx, `
@@ -346,6 +373,7 @@ WHERE item_id=? AND state=? AND pending_op_id IS NULL`,
 			Phase:           domain.PhaseIntent,
 			OccurredAtNS:    in.OccurredAtNS,
 			ContractJSON:    in.ContractJSON,
+			ResultJSON:      reviewJSON,
 		})
 	})
 }

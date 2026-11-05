@@ -9,14 +9,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"golang.org/x/sys/unix"
 
+	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/clocktrust"
 	"dustkeeper/internal/config"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
+	"dustkeeper/internal/notify"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/policy"
 	"dustkeeper/internal/recovery"
@@ -34,6 +37,14 @@ type Runner struct {
 	Registrar  *scope.Registrar
 	Exec       *execute.Executor
 	Reconciler *recovery.Reconciler
+	// Notify is the one channel the product tells the user through.
+	//
+	// It is required for automatic clearing and may be nil only for an
+	// installation that never clears anything: a nil channel reports itself as
+	// "not configured", and an object whose reminder could not be delivered is
+	// left in the observation area. A nil default that quietly succeeded is
+	// exactly the shape R27 forbids.
+	Notify notify.Sender
 }
 
 // ScopeRun reports what happened to one scope.
@@ -54,7 +65,17 @@ type ScopeRun struct {
 	Purged            int    `json:"purged"`
 	PurgedBytes       int64  `json:"purged_logical_bytes"`
 	DueNotAuthorised  int    `json:"due_but_not_authorised"`
-	IdentityWeak      string `json:"root_identity_weak,omitempty"`
+	// ExpirySkipped names the due objects the expiry review refused, with the
+	// reason each one was refused. It is a list rather than a count because "three
+	// objects were skipped" cannot be acted on: "the place is in use again" and
+	// "the object is protected" call for different decisions.
+	ExpirySkipped []string `json:"expiry_skipped,omitempty"`
+	// Notification is what the summary message achieved at the end of this
+	// scope's work. A delivery that failed is reported as failed, and the counts
+	// above stand on their own: the message is how the user hears about them, not
+	// what makes them true.
+	Notification *notify.Result `json:"notification,omitempty"`
+	IdentityWeak string         `json:"root_identity_weak,omitempty"`
 	Control           string `json:"control,omitempty"`
 	Message           string `json:"message,omitempty"`
 	// FailureCode names why this scope's work stopped, on the scope's own row.
@@ -198,6 +219,10 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 			}
 			rep.Control = strongerControl(rep.Control, ControlOfError(runErr))
 		}
+		// The one message the user gets about this scope. It is sent after the
+		// work, from the same numbers the report carries, so "what the user was
+		// told" and "what the record says" cannot drift apart.
+		r.tellUser(ctx, &result)
 		rep.Scopes = append(rep.Scopes, result)
 		rep.Quarantined += result.Quarantined
 		rep.Purged += result.Purged
@@ -284,13 +309,17 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, runLedger *domain
 		sr.PurgeSkipped = blocked
 		sr.QuarantineSkipped = blocked
 	} else {
-		purged, bytes, due, control, perr := r.purgeDue(ctx, sctx, runLedger, pLedger, guard)
-		sr.Purged, sr.PurgedBytes, sr.DueNotAuthorised = purged, bytes, due
-		sr.Control = strongerControl(sr.Control, control)
-		if perr != nil {
-			return sr, perr
+		purge := r.purgeDue(ctx, sctx, runLedger, pLedger, guard)
+		sr.Purged, sr.PurgedBytes, sr.DueNotAuthorised = purge.Purged, purge.Bytes, purge.Refused
+		sr.ExpirySkipped = purge.Skipped
+		if purge.Note != "" {
+			sr.PurgeSkipped = purge.Note
 		}
-		if control == domain.ControlStopScope || control == domain.ControlStopRun {
+		sr.Control = strongerControl(sr.Control, purge.Control)
+		if purge.Err != nil {
+			return sr, purge.Err
+		}
+		if purge.Control == domain.ControlStopScope || purge.Control == domain.ControlStopRun {
 			return sr, nil
 		}
 	}
@@ -342,18 +371,39 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, runLedger *domain
 	return sr, err
 }
 
+// purgeOutcome is what one scope's clearing phase produced.
+//
+// It is a struct rather than five return values because a run report has to
+// explain itself: the count of objects that were left alone and the reasons they
+// were left alone belong to the same answer.
+type purgeOutcome struct {
+	Purged  int
+	Bytes   int64
+	Refused int
+	Skipped []string
+	// Note explains a phase-level refusal, such as a reminder that could not be
+	// delivered. It is not a per-object reason, so it is not in Skipped.
+	Note    string
+	Control string
+	Err     error
+}
+
 // purgeDue creates one scheduled purge plan for the objects that are due.
 //
 // The queue is read with a keyset cursor and a bounded page size. Objects that
 // cannot be processed automatically are counted and skipped, and the scan
 // continues: a first page full of un-authorised objects used to hide every
 // authorised object behind it, every run, for ever.
+//
+// Each candidate passes the expiry review before it is counted against any
+// allowance. That review is what makes "this object was due and was left alone"
+// an answer with a reason rather than a silent subtraction from the budget.
 func (r *Runner) purgeDue(ctx context.Context, sc *execute.ScopeCtx, runLedger *domain.RunLedger,
-	ledger *domain.ActionLedger, guard *clocktrust.Guard) (int, int64, int, string, error) {
+	ledger *domain.ActionLedger, guard *clocktrust.Guard) purgeOutcome {
 
 	cfg := r.Config.Runtime
 	if cfg.MaxAutoPurgeFiles <= 0 || cfg.MaxAutoPurgeBytes <= 0 {
-		return 0, 0, 0, domain.ControlContinue, nil
+		return purgeOutcome{Control: domain.ControlContinue}
 	}
 
 	nowNS := r.Clock.Wall().UnixNano()
@@ -365,6 +415,7 @@ func (r *Runner) purgeDue(ctx context.Context, sc *execute.ScopeCtx, runLedger *
 	var (
 		authorised []store.Item
 		refused    int
+		skipped    []string
 		totalBytes int64
 		afterDue   int64
 		afterItem  string
@@ -384,7 +435,7 @@ collect:
 		}
 		page, err := r.Store.PurgeQueuePage(ctx, sc.Scope.ID, nowNS, afterDue, afterItem, pageSize)
 		if err != nil {
-			return 0, 0, refused, domain.ControlStopRun, err
+			return purgeOutcome{Refused: refused, Skipped: skipped, Control: domain.ControlStopRun, Err: err}
 		}
 		if len(page) == 0 {
 			break
@@ -392,9 +443,28 @@ collect:
 		for _, it := range page {
 			afterDue = purgeDueKey(it)
 			afterItem = string(it.ID)
-			quota, ok := r.automaticAuthority(ctx, it, quotas)
+			quota, ok, authorityErr := r.automaticAuthority(ctx, it, quotas)
+			if authorityErr != nil {
+				return purgeOutcome{Refused: refused, Skipped: skipped, Control: ControlOfError(authorityErr), Err: authorityErr}
+			}
 			if !ok {
 				refused++
+				continue
+			}
+			// The expiry review comes next, and still before any allowance is
+			// counted. An object that must not be cleared - restored, protected, a
+			// place in use again, a vault object that changed - leaves with a
+			// reason and costs the run nothing.
+			//
+			// It runs after the authority check on purpose: the authority is a
+			// database read that can fail in a way the run has to hear about, and
+			// a review that ran first would hide that failure behind a refusal
+			// about the object.
+			if why, rerr := r.Exec.ReviewExpiry(ctx, sc, it); rerr != nil {
+				return purgeOutcome{Refused: refused, Skipped: skipped, Control: ControlOfError(rerr), Err: rerr}
+			} else if why != "" {
+				refused++
+				skipped = append(skipped, string(it.ID)+": "+why)
 				continue
 			}
 			size := itemSize(it)
@@ -432,13 +502,24 @@ collect:
 	}
 
 	if len(authorised) == 0 {
-		return 0, 0, refused, domain.ControlContinue, nil
+		return purgeOutcome{Refused: refused, Skipped: skipped, Control: domain.ControlContinue}
+	}
+
+	// The reminder before an irreversible act, and the gate it carries.
+	//
+	// R27 is explicit that "the log says so" is not notification, so the only
+	// thing that lets the clearing proceed is a delivery the channel reported as
+	// successful. When it was not, nothing is cleared: the objects stay in the
+	// observation area, which costs the user nothing but a later date, and the
+	// run says why.
+	if note, ok := r.remindBeforeClearing(ctx, authorised); !ok {
+		return purgeOutcome{Refused: refused, Skipped: skipped, Note: note, Control: domain.ControlContinue}
 	}
 
 	p, err := plan.CreatePurgePlan(ctx, r.Store, sc.Scope, authorised,
 		domain.PlanScheduledPurge, nowNS, int64(plan.DefaultTTL))
 	if err != nil {
-		return 0, 0, refused, domain.ControlStopScope, err
+		return purgeOutcome{Refused: refused, Skipped: skipped, Control: domain.ControlStopScope, Err: err}
 	}
 
 	// The purge phase may spend at most what is left in the shared purge ledger,
@@ -446,7 +527,8 @@ collect:
 	phase := domain.NewPhaseBudget(runLedger, ledger, ledger.RemainingFiles(), ledger.RemainingBytes())
 	res, err := r.Exec.ApplyPurgePlan(ctx, sc, p.ID, p.Digest, phase, guard.Assert)
 	if err != nil {
-		return res.Completed, 0, refused, ControlOfError(err), err
+		return purgeOutcome{Purged: res.Completed, Refused: refused, Skipped: skipped,
+			Control: ControlOfError(err), Err: err}
 	}
 
 	var bytes int64
@@ -462,9 +544,137 @@ collect:
 		}
 	}
 	if stopErr := batchStop(res); stopErr != nil {
-		return res.Completed, bytes, refused, strongerControl(res.Control, ControlOfError(stopErr)), stopErr
+		return purgeOutcome{Purged: res.Completed, Bytes: bytes, Refused: refused, Skipped: skipped,
+			Control: strongerControl(res.Control, ControlOfError(stopErr)), Err: stopErr}
 	}
-	return res.Completed, bytes, refused, res.Control, nil
+	return purgeOutcome{Purged: res.Completed, Bytes: bytes, Refused: refused, Skipped: skipped,
+		Control: res.Control}
+}
+
+// tellUser sends the one message the product promises after a scope's work, and
+// records what it achieved.
+//
+// The text is built from the numbers on the report row, so the message and the
+// record are the same fact told twice rather than two calculations that can
+// disagree. Nothing is sent for a run that touched nothing: a message that says
+// "0 deleted, 0 moved" every morning is how a user learns to ignore the one that
+// matters.
+func (r *Runner) tellUser(ctx context.Context, sr *ScopeRun) {
+	if sr == nil || (sr.Quarantined == 0 && sr.Purged == 0) {
+		return
+	}
+	body := summaryMessage(sr.Purged, sr.Quarantined, r.observationDays(ctx))
+	res := r.deliver(ctx, body)
+	sr.Notification = &res
+	// The outcome is written down whichever way it went. A record that only exists
+	// when delivery worked cannot answer "was the user told", which is the only
+	// question anyone asks of it.
+	if err := notify.Record(ctx, r.Store, r.Clock.Wall().UnixNano(), body, res); err != nil {
+		sr.Message = joinNote(sr.Message, "the notification outcome could not be recorded: "+err.Error())
+	}
+	if !res.Delivered {
+		sr.Message = joinNote(sr.Message, "the user was not told: "+res.Detail)
+	}
+}
+
+// remindBeforeClearing sends the short warning that precedes a permanent
+// deletion, and reports whether the clearing may proceed.
+//
+// A user who turned notifications off in the confirmed policy has already said
+// they do not want to be told, so the reminder is not a gate for them; what
+// remains is the details page, which is still written. Everyone else gets the
+// gate: no delivery, no deletion this run.
+func (r *Runner) remindBeforeClearing(ctx context.Context, due []store.Item) (string, bool) {
+	pol, err := cleanup.Load(ctx, r.Store)
+	if err != nil {
+		return "notify_unchecked: the cleanup policy could not be read, so the reminder could not be decided: " + err.Error(), false
+	}
+	if pol.Notify == cleanup.NotifyNone {
+		return "", true
+	}
+	var bytes int64
+	for _, it := range due {
+		bytes += itemSize(it)
+	}
+	body := fmt.Sprintf("%d 个文件已到期，本次将永久删除（%s）。删除前可在详情页查看并恢复。",
+		len(due), humanBytes(bytes))
+	res := r.deliver(ctx, body)
+	if err := notify.Record(ctx, r.Store, r.Clock.Wall().UnixNano(), body, res); err != nil {
+		return "notify_unrecorded: the reminder was sent but could not be recorded, so it cannot be shown to have been delivered: " + err.Error(), false
+	}
+	if !res.Delivered {
+		return "notify_failed: " + res.Detail + "; nothing was cleared this run", false
+	}
+	return "", true
+}
+
+// deliver sends one message through the configured channel.
+//
+// A nil channel is not "the system one": it is "this installation has no way of
+// telling anyone", and it reports itself as not delivered. Defaulting a nil to a
+// real channel would make an installation that was never configured look like one
+// that delivered.
+func (r *Runner) deliver(ctx context.Context, body string) notify.Result {
+	if r.Notify == nil {
+		return notify.Result{Attempted: false, Delivered: false,
+			Detail: "no notification channel is configured"}
+	}
+	return r.Notify.Send(ctx, "Dustkeeper", body)
+}
+
+// observationDays is how long a newly isolated object is observed, for the
+// message text. A policy that cannot be read yields zero, which the message
+// omits rather than guessing at.
+func (r *Runner) observationDays(ctx context.Context) int {
+	pol, err := cleanup.Load(ctx, r.Store)
+	if err != nil {
+		return 0
+	}
+	return pol.ObservationDays
+}
+
+// summaryMessage is the sentence R26 asks for: what was deleted, what was moved
+// and when the earliest of them can go, and where to look.
+func summaryMessage(deleted, observed, days int) string {
+	parts := make([]string, 0, 3)
+	if deleted > 0 {
+		parts = append(parts, fmt.Sprintf("本次删除 %d 个文件", deleted))
+	}
+	if observed > 0 {
+		if days > 0 {
+			parts = append(parts, fmt.Sprintf("%d 个文件进入待删除区，最早 %d 天后清空", observed, days))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d 个文件进入待删除区", observed))
+		}
+	}
+	if len(parts) == 0 {
+		return "本次没有文件被删除或移动。"
+	}
+	return strings.Join(parts, "；") + "。查看详情／恢复请打开本机结果页。"
+}
+
+// humanBytes renders a size for a one-line message.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	value := float64(n)
+	for _, suffix := range []string{"KiB", "MiB", "GiB", "TiB"} {
+		value /= unit
+		if value < unit {
+			return fmt.Sprintf("%.1f %s", value, suffix)
+		}
+	}
+	return fmt.Sprintf("%.1f PiB", value/unit)
+}
+
+// joinNote appends one explanation to another without losing either.
+func joinNote(existing, extra string) string {
+	if existing == "" {
+		return extra
+	}
+	return existing + "; " + extra
 }
 
 // batchStop turns a stopped batch back into the reason it stopped.
@@ -513,29 +723,36 @@ func grantIDOf(it store.Item) domain.GrantID {
 // a grant existed, not what it approved, so the number the user saw in the
 // approval prompt never reached the executor.
 func (r *Runner) automaticAuthority(ctx context.Context, it store.Item,
-	cache map[domain.GrantID]grantQuota) (grantQuota, bool) {
+	cache map[domain.GrantID]grantQuota) (grantQuota, bool, error) {
 
 	if it.AutoPurgeGrantID == nil || it.SourceKind != domain.SourceScheduledRule {
-		return grantQuota{}, false
+		return grantQuota{}, false, nil
 	}
 	id := *it.AutoPurgeGrantID
 	if q, ok := cache[id]; ok {
-		return q, q.files > 0 && q.bytes > 0
+		return q, q.files > 0 && q.bytes > 0, nil
 	}
 	g, err := r.Store.GetGrant(ctx, id)
-	if err != nil || g.Status != domain.GrantActive || g.Capability != domain.CapAutoPurge {
+	if err != nil {
+		if errs.CodeOf(err) != errs.CodeGrantRequired {
+			return grantQuota{}, false, err
+		}
 		cache[id] = grantQuota{}
-		return grantQuota{}, false
+		return grantQuota{}, false, nil
+	}
+	if g.Status != domain.GrantActive || g.Capability != domain.CapAutoPurge {
+		cache[id] = grantQuota{}
+		return grantQuota{}, false, nil
 	}
 	var b plan.GrantBindingV1
 	if err := json.Unmarshal([]byte(g.BindingJSON), &b); err != nil {
 		// An unreadable binding is not an unlimited approval.
 		cache[id] = grantQuota{}
-		return grantQuota{}, false
+		return grantQuota{}, false, nil
 	}
 	q := grantQuota{files: b.ApprovedMaxFiles, bytes: b.ApprovedMaxLogicalBytes}
 	cache[id] = q
-	return q, q.files > 0 && q.bytes > 0
+	return q, q.files > 0 && q.bytes > 0, nil
 }
 
 // ScanState reports how complete one scanning batch was.
@@ -692,6 +909,9 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 				continue
 			}
 			return total, bytes, domain.ControlStopScope, qerr
+		}
+		if err := plan.CheckAutomaticGrant(qg, sc.Scope, rule, domain.CapAutoQuarantine); err != nil {
+			return total, bytes, domain.ControlStopScope, err
 		}
 		pg, pgErr := r.Store.ActiveGrant(ctx, sc.Scope.ID, rule.ID, rule.Revision, domain.CapAutoPurge)
 		if pgErr != nil && errs.CodeOf(pgErr) != errs.CodeGrantRequired {
@@ -945,7 +1165,7 @@ func strongerControl(a, b string) string {
 
 func ControlOfError(err error) string {
 	switch errs.CodeOf(err) {
-	case errs.CodePaused, errs.CodeHeld, errs.CodeScopeChanged, errs.CodeProtectionAliasUnresolved:
+	case errs.CodeReviewRequired, errs.CodeModelUnavailable, errs.CodePaused, errs.CodeHeld, errs.CodeScopeChanged, errs.CodeProtectionAliasUnresolved:
 		return domain.ControlStopScope
 	case errs.CodePlanStale, errs.CodePlanExpired:
 		return domain.ControlStopPlan

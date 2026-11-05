@@ -9,7 +9,7 @@ import (
 // PolicyVersion is bumped whenever the built-in protection list changes. The
 // version enters every plan binding, so an updated list invalidates plans made
 // under the old one.
-const PolicyVersion = 1
+const PolicyVersion = 4
 
 // globalRule is one built-in protection.
 type globalRule struct {
@@ -26,6 +26,9 @@ var globalRules = []globalRule{
 	{"segment", ".hg", "source repository metadata"},
 	{"segment", ".svn", "source repository metadata"},
 	{"segment", ".dustkeeper", "Dustkeeper private directory"},
+	{"segment", ".ssh", "credential directory"},
+	{"segment", ".gnupg", "credential directory"},
+	{"segment", ".aws", "credential directory"},
 
 	{"suffix", ".app", "application bundle"},
 	{"suffix", ".bundle", "application bundle"},
@@ -63,6 +66,8 @@ var globalRules = []globalRule{
 	{"name", ".netrc", "credential file"},
 	{"name", ".pgpass", "credential file"},
 	{"name", "credentials", "credential file"},
+	{"name", "accesskey.csv", "credential export"},
+	{"name", "osskey.txt", "credential export"},
 
 	{"suffix", ".bak", "backup copy"},
 	{"suffix", ".backup", "backup copy"},
@@ -82,7 +87,7 @@ func GlobalProtected(rel string) (bool, string) {
 		switch r.kind {
 		case "segment":
 			for _, s := range segments[:len(segments)-1] {
-				if s == r.value {
+				if strings.EqualFold(s, r.value) {
 					return true, r.reason
 				}
 			}
@@ -92,21 +97,35 @@ func GlobalProtected(rel string) (bool, string) {
 			// inside "App.app/", and a rule for "*" must not empty a photo
 			// library. Over-protecting a directory that happens to end in one of
 			// these suffixes only keeps files; under-protecting loses them.
-			if strings.HasSuffix(name, r.value) {
+			if hasSuffixFold(name, r.value) {
 				return true, r.reason
 			}
 			for _, seg := range segments[:len(segments)-1] {
-				if strings.HasSuffix(seg, r.value) {
+				if hasSuffixFold(seg, r.value) {
 					return true, r.reason
 				}
 			}
 		case "name":
-			if name == r.value {
+			if strings.EqualFold(name, r.value) {
 				return true, r.reason
 			}
 		}
 	}
 	return false, ""
+}
+
+// AdvisoryOnlyReviewable permits opinions about old backup/log copies while
+// preserving the ordinary global execution prohibition and credential guards.
+func AdvisoryOnlyReviewable(rel string) bool {
+	protected, reason := GlobalProtected(rel)
+	return protected && (reason == "backup copy" || reason == "active log file")
+}
+
+func hasSuffixFold(s, suffix string) bool {
+	if len(s) < len(suffix) {
+		return false
+	}
+	return strings.EqualFold(s[len(s)-len(suffix):], suffix)
 }
 
 // PolicyDigest summarises the protection policy. It is part of every plan

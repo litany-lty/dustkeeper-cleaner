@@ -73,11 +73,16 @@ func (r *Registrar) Add(ctx context.Context, opt AddOptions) (store.Scope, error
 	if err != nil {
 		return store.Scope{}, err
 	}
-	if err := r.refusePath(resolved); err != nil {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		if err != nil {
+			return store.Scope{}, errs.Wrap(errs.CodeAccessDenied, err)
+		}
+		return store.Scope{}, errs.New(errs.CodeAccessDenied, "user home directory is unavailable")
+	}
+	if err := r.refusePath(resolved, home); err != nil {
 		return store.Scope{}, err
 	}
-
-	home, _ := os.UserHomeDir()
 
 	// One fixed user-level lock makes "two state directories, one tree"
 	// impossible during registration.
@@ -195,11 +200,10 @@ func resolveExistingDir(p string) (string, error) {
 }
 
 // refusePath rejects roots whose scope would be meaningless or dangerous.
-func (r *Registrar) refusePath(resolved string) error {
+func (r *Registrar) refusePath(resolved, home string) error {
 	// resolved has already been through EvalSymlinks. Compare it against paths
 	// that have been resolved the same way, otherwise /var vs /private/var on
 	// macOS makes every containment test silently false.
-	home, _ := os.UserHomeDir()
 	home, stateDir := canonical(home), canonical(r.Paths.StateDir)
 
 	if resolved == string(filepath.Separator) {

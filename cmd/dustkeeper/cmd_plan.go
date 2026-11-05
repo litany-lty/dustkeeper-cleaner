@@ -44,6 +44,9 @@ func planCreate(ctx context.Context, a *app, args []string) (output, error) {
 	if *id == "" {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--rule is required")
 	}
+	if *maxFiles < 0 || *maxBytes < 0 {
+		return output{}, errs.New(errs.CodeInvalidArgument, "plan limits cannot be negative; zero selects the configured default")
+	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
 	}
@@ -124,7 +127,7 @@ func planCreate(ctx context.Context, a *app, args []string) (output, error) {
 			fmt.Sprintf("  expires: %s", time.Unix(0, res.Plan.ExpiresAtNS).Format(time.RFC3339)),
 		}
 		for _, it := range res.Items {
-			o.Human = append(o.Human, "  "+string(it.ID)+"  "+string(it.RawRelative))
+			o.Human = append(o.Human, fmt.Sprintf("  %s  %q", it.ID, string(it.RawRelative)))
 		}
 		o.Human = append(o.Human, "", "plan digest (repeat it to apply):", "  "+string(res.Plan.Digest))
 		o.Next = []string{
@@ -198,7 +201,7 @@ func planShow(ctx context.Context, a *app, args []string) (output, error) {
 		"  " + digestNote,
 	}
 	for _, it := range items {
-		out.Human = append(out.Human, fmt.Sprintf("  %-28s %-24s %s", it.ID, it.State, string(it.RawRelative)))
+		out.Human = append(out.Human, fmt.Sprintf("  %-28s %-24s %q", it.ID, it.State, string(it.RawRelative)))
 	}
 	if p.Status == domain.PlanReady {
 		out.Next = []string{

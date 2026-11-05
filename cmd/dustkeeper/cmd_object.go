@@ -12,6 +12,7 @@ import (
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
+	"dustkeeper/internal/fsops"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/rescue"
 	"dustkeeper/internal/store"
@@ -37,6 +38,9 @@ func quarantineList(ctx context.Context, a *app, args []string) (output, error) 
 	limit := fs.Int("limit", 200, "maximum objects to list")
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
+	}
+	if *limit <= 0 {
+		return output{}, errs.New(errs.CodeInvalidArgument, "--limit must be positive")
 	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
@@ -76,15 +80,18 @@ func quarantineList(ctx context.Context, a *app, args []string) (output, error) 
 
 	collect := func(sc store.Scope) error {
 		for _, state := range states {
-			items, err := a.store.ListItemsByState(ctx, sc.ID, state, *limit)
+			remaining := *limit - len(rows)
+			if remaining <= 0 {
+				return nil
+			}
+			items, err := a.store.ListItemsByState(ctx, sc.ID, state, remaining)
 			if err != nil {
 				return err
 			}
 			for _, it := range items {
-				dueAt := int64(0)
-				if it.QuarantinedAtNS != nil && it.BoundRetentionSeconds > 0 {
-					dueAt = *it.QuarantinedAtNS + it.BoundRetentionSeconds*int64(time.Second)
-				}
+				// Clock acknowledgement can extend this deadline without changing
+				// the original quarantine time or bound duration.
+				dueAt := ptrVal(it.PurgeNotBeforeNS)
 				r := row{
 					ItemID:        string(it.ID),
 					ScopeID:       string(it.ScopeID),
@@ -133,6 +140,9 @@ func quarantineList(ctx context.Context, a *app, args []string) (output, error) 
 			return output{}, err
 		}
 		for _, sc := range scopes {
+			if len(rows) >= *limit {
+				break
+			}
 			if err := collect(sc); err != nil {
 				return output{}, err
 			}
@@ -157,7 +167,7 @@ func quarantineList(ctx context.Context, a *app, args []string) (output, error) 
 		} else {
 			state += " / blocked"
 		}
-		out.Human = append(out.Human, fmt.Sprintf("%-28s %-24s %-20s %s",
+		out.Human = append(out.Human, fmt.Sprintf("%-28s %-24s %-20s %q",
 			r.ItemID, state, r.ScopeID, r.RelativePath))
 		if r.Blocked != "" {
 			out.Human = append(out.Human, "    blocked: "+r.Blocked)
@@ -250,11 +260,11 @@ func quarantineRestore(ctx context.Context, a *app, args []string) (output, erro
 			"protected": true,
 		}
 		out.Human = []string{
-			fmt.Sprintf("restored %s to %s", it.ID, preview),
+			fmt.Sprintf("restored %s to %q", it.ID, preview),
 			"  the original path and the actual path are now protected",
 			"  protection does not expire; remove it explicitly with `protect remove`",
 		}
-		out.Next = []string{fmt.Sprintf("dustkeeper protect list --scope %s", it.ScopeID)}
+		out.Next = []string{fmt.Sprintf("dustkeeper protect list --scope %s", shellQuote(string(it.ScopeID)))}
 		return out, nil
 	})
 }
@@ -285,6 +295,9 @@ func protectAdd(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	if *scopeRef == "" || *rel == "" {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--scope and --relative are required")
+	}
+	if _, err := fsops.SplitRelative([]byte(*rel)); err != nil {
+		return output{}, errs.Newf(errs.CodeInvalidArgument, "protection path: %v", err)
 	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
@@ -364,7 +377,7 @@ func protectList(ctx context.Context, a *app, args []string) (output, error) {
 		out.Human = append(out.Human, "no path protections")
 	}
 	for _, p := range prot {
-		out.Human = append(out.Human, fmt.Sprintf("%-24s %-18s %-8s %-12s %s",
+		out.Human = append(out.Human, fmt.Sprintf("%-24s %-18s %-8s %-12s %q",
 			p.ID, p.ScopeID, p.MatchKind, p.Source, string(p.RawRelative)))
 	}
 	return out, nil
@@ -377,6 +390,14 @@ func protectRemove(ctx context.Context, a *app, args []string) (output, error) {
 	rel := fs.String("relative", "", "path relative to the scope root")
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
+	}
+	if *id != "" && (*scopeRef != "" || *rel != "") {
+		return output{}, errs.New(errs.CodeInvalidArgument, "use --id or --scope with --relative, not both")
+	}
+	if *rel != "" {
+		if _, err := fsops.SplitRelative([]byte(*rel)); err != nil {
+			return output{}, errs.Newf(errs.CodeInvalidArgument, "protection path: %v", err)
+		}
 	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
@@ -433,6 +454,9 @@ func purgePlan(ctx context.Context, a *app, args []string) (output, error) {
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
 	}
+	if *limit < 0 {
+		return output{}, errs.New(errs.CodeInvalidArgument, "--limit cannot be negative")
+	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
 	}
@@ -480,7 +504,7 @@ func purgePlan(ctx context.Context, a *app, args []string) (output, error) {
 				// Every purgeable object must carry the retention bound and the
 				// captured evidence from its quarantine. Anything else is not
 				// silently skipped: it is reported.
-				if it.CapturedIdentityJSON == nil || it.ContentHash == nil || it.QuarantinedAtNS == nil {
+				if it.CapturedIdentityJSON == nil || it.CapturedTokenJSON == nil || it.ContentHash == nil || it.MetadataHash == nil || it.QuarantinedAtNS == nil {
 					blocked++
 					continue
 				}
@@ -527,7 +551,7 @@ func purgePlan(ctx context.Context, a *app, args []string) (output, error) {
 			fmt.Sprintf("  expires: %s", time.Unix(0, p.ExpiresAtNS).Format(time.RFC3339)),
 		}
 		for _, it := range selected {
-			out.Human = append(out.Human, fmt.Sprintf("  %-28s %s", it.ID, string(it.RawRelative)))
+			out.Human = append(out.Human, fmt.Sprintf("  %-28s %q", it.ID, string(it.RawRelative)))
 		}
 		if blocked > 0 {
 			out.Human = append(out.Human, fmt.Sprintf("  %d due object(s) lack complete evidence and were left out", blocked))
@@ -666,7 +690,7 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 			out := ok()
 			out.Data = rep
 			out.Human = []string{
-				fmt.Sprintf("inventory of %s (no database was opened)", rep.Root),
+				fmt.Sprintf("inventory of %q (no database was opened)", rep.Root),
 				fmt.Sprintf("  %d object(s): %d complete, %d manifest without object, %d orphan, %d unverified, %d conflict, %d unknown",
 					rep.Objects, rep.Complete, rep.Missing, rep.Orphans, rep.Unverified, rep.Conflicts, rep.Unknown),
 				"  objects directory: " + rep.ObjectState,
@@ -676,7 +700,7 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 				out.Human = append(out.Human, "  owner instance: "+rep.InstanceID)
 			}
 			for _, e := range rep.Entries {
-				line := fmt.Sprintf("  %-28s %-22s %s", e.Object, e.Status, e.RawRelative)
+				line := fmt.Sprintf("  %-28s %-22s %q", e.Object, e.Status, e.RawRelative)
 				out.Human = append(out.Human, line)
 				for _, n := range e.Notes {
 					out.Human = append(out.Human, "      "+n)
@@ -711,7 +735,7 @@ func cmdRecover(ctx context.Context, a *app, args []string) (output, error) {
 					listingLimit(rep) + "); nothing was changed"
 			}
 			if rep.Unverified > 0 || incomplete {
-				out.Next = append(out.Next, "dustkeeper recover inspect --root "+rep.Root)
+				out.Next = append(out.Next, "dustkeeper recover inspect --root "+shellQuote(rep.Root))
 			}
 			return out, nil
 		}

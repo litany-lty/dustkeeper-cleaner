@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"unicode/utf8"
 )
@@ -56,7 +57,7 @@ type Options struct {
 	MaxDepth int
 	// IntegerOnly rejects any number written with a fraction or exponent.
 	IntegerOnly bool
-	// StrictStruct enables DisallowUnknownFields on the final bind.
+	// StrictStruct requires exact JSON field names and rejects unknown fields.
 	StrictStruct bool
 }
 
@@ -85,6 +86,11 @@ func Unmarshal(data []byte, dst any, opts Options) error {
 	if err := scan(data, opts); err != nil {
 		return err
 	}
+	if opts.StrictStruct {
+		if err := exactFields(data, reflect.TypeOf(dst)); err != nil {
+			return err
+		}
+	}
 
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -96,6 +102,85 @@ func Unmarshal(data []byte, dst any, opts Options) error {
 	}
 	if dec.More() {
 		return &Error{Kind: KindTrailing, Detail: "extra value after top-level document", Offset: dec.InputOffset()}
+	}
+	return nil
+}
+
+// encoding/json matches struct fields without regard to case. That lets two
+// distinct input keys overwrite one budget even after duplicate-key checks.
+// Match only declared JSON names; map keys remain case-sensitive data.
+func exactFields(raw json.RawMessage, typ reflect.Type) error {
+	if typ == nil {
+		return nil
+	}
+	if typ.Implements(reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()) {
+		return nil
+	}
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		fields := make(map[string]reflect.Type)
+		var collect func(reflect.Type)
+		collect = func(t reflect.Type) {
+			for i := 0; i < t.NumField(); i++ {
+				f := t.Field(i)
+				if f.PkgPath != "" {
+					continue
+				}
+				name := strings.Split(f.Tag.Get("json"), ",")[0]
+				if name == "-" {
+					continue
+				}
+				ft := f.Type
+				if ft.Kind() == reflect.Pointer {
+					ft = ft.Elem()
+				}
+				if f.Anonymous && name == "" && ft.Kind() == reflect.Struct {
+					collect(ft)
+					continue
+				}
+				if name == "" {
+					name = f.Name
+				}
+				fields[name] = f.Type
+			}
+		}
+		collect(typ)
+		var object map[string]json.RawMessage
+		if json.Unmarshal(raw, &object) != nil {
+			return nil
+		} // final bind reports the shape
+		for name, value := range object {
+			ft, ok := fields[name]
+			if !ok {
+				return &Error{Kind: KindUnknown, Detail: fmt.Sprintf("unknown field %q", name)}
+			}
+			if err := exactFields(value, ft); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		var object map[string]json.RawMessage
+		if json.Unmarshal(raw, &object) != nil {
+			return nil
+		}
+		for _, value := range object {
+			if err := exactFields(value, typ.Elem()); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		var values []json.RawMessage
+		if json.Unmarshal(raw, &values) != nil {
+			return nil
+		}
+		for _, value := range values {
+			if err := exactFields(value, typ.Elem()); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

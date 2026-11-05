@@ -65,7 +65,7 @@ func scopeAdd(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	out.Human = []string{
 		fmt.Sprintf("registered scope %s (%s)", sc.ID, sc.Kind),
-		"  root: " + string(sc.RawRoot),
+		fmt.Sprintf("  root: %q", string(sc.RawRoot)),
 	}
 	if domain.MutableKind(sc.Kind) {
 		out.Human = append(out.Human,
@@ -87,6 +87,13 @@ func scopeList(ctx context.Context, a *app, args []string) (output, error) {
 	kind := fs.String("kind", "", "filter by kind")
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
+	}
+	if *kind != "" {
+		switch *kind {
+		case domain.KindObserve, domain.KindAssisted, domain.KindManagedDisposable, domain.KindReference:
+		default:
+			return output{}, errs.Newf(errs.CodeInvalidArgument, "unknown scope kind %q", *kind)
+		}
 	}
 	if err := a.openStore(); err != nil {
 		return output{}, err
@@ -110,7 +117,7 @@ func scopeList(ctx context.Context, a *app, args []string) (output, error) {
 		return out, nil
 	}
 	for _, sc := range scopes {
-		out.Human = append(out.Human, fmt.Sprintf("%-18s %-20s %-8s %s",
+		out.Human = append(out.Human, fmt.Sprintf("%-18s %-20s %-8s %q",
 			sc.ID, sc.Kind, sc.Status, string(sc.RawRoot)))
 	}
 	return out, nil
@@ -163,9 +170,18 @@ func scopeShow(ctx context.Context, a *app, args []string) (output, error) {
 	if err != nil {
 		return output{}, err
 	}
-	protections, _ := a.store.ListProtections(ctx, sc.ID, true)
-	rules, _ := a.store.ListRules(ctx, sc.ID)
-	grants, _ := a.store.ListGrants(ctx, sc.ID)
+	protections, err := a.store.ListProtections(ctx, sc.ID, true)
+	if err != nil {
+		return output{}, err
+	}
+	rules, err := a.store.ListRules(ctx, sc.ID)
+	if err != nil {
+		return output{}, err
+	}
+	grants, err := a.store.ListGrants(ctx, sc.ID)
+	if err != nil {
+		return output{}, err
+	}
 
 	out := ok()
 	out.ScopeID = string(sc.ID)
@@ -182,7 +198,7 @@ func scopeShow(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	out.Human = []string{
 		fmt.Sprintf("scope %s (%s) %s", sc.ID, sc.Kind, sc.Status),
-		"  root:        " + string(sc.RawRoot),
+		fmt.Sprintf("  root:        %q", string(sc.RawRoot)),
 		fmt.Sprintf("  generation:  %d   protection revision: %d", sc.Generation, sc.ProtectionRevision),
 		fmt.Sprintf("  observed:    %d file(s)", obs),
 		fmt.Sprintf("  quarantine:  %d object(s), %d due for purge", quarantined, due),
@@ -210,6 +226,10 @@ func scopePause(ctx context.Context, a *app, args []string, resume bool) (output
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
 	}
+	if !resume && *acceptStale {
+		return output{}, errs.New(errs.CodeInvalidArgument,
+			"--accept-stale-hold is valid only with scope resume")
+	}
 	if *ref == "" && fs.NArg() > 0 {
 		*ref = fs.Arg(0)
 	}
@@ -224,6 +244,10 @@ func scopePause(ctx context.Context, a *app, args []string, resume bool) (output
 		sc, err := resolveScope(ctx, a.store, *ref)
 		if err != nil {
 			return output{}, err
+		}
+		if !resume && sc.Status == domain.ScopeHeld {
+			return output{}, errs.Newf(errs.CodeHeld,
+				"scope %s is held; pause cannot replace a stronger safety hold", sc.ID)
 		}
 		target := domain.ScopePaused
 		if resume {

@@ -41,6 +41,10 @@ func CreatePurgePlan(ctx context.Context, st *store.Store, sc store.Scope, items
 	docs := make([]PlanItemDoc, 0, len(items))
 	members := make([]store.PurgeMember, 0, len(items))
 	for i, it := range items {
+		if it.ScopeID != sc.ID {
+			return store.Plan{}, errs.Newf(errs.CodeScopeChanged,
+				"item %s belongs to scope %s, not purge-plan scope %s", it.ID, it.ScopeID, sc.ID)
+		}
 		// A purge plan is only ever about lifecycle objects. Historical duplicates
 		// are refused here as well as in the executor, so the refusal happens
 		// before an operator is shown a plan that would delete them; the item rows
@@ -125,10 +129,7 @@ func CreatePurgePlan(ctx context.Context, st *store.Store, sc store.Scope, items
 		CreatedAtNS: nowNS,
 		ExpiresAtNS: expires,
 	}
-	if err := st.InsertPlan(ctx, stored, nil); err != nil {
-		return store.Plan{}, err
-	}
-	if err := st.InsertPurgeMembers(ctx, planID, members); err != nil {
+	if err := st.InsertPurgePlan(ctx, stored, members); err != nil {
 		return store.Plan{}, err
 	}
 	return stored, nil

@@ -59,7 +59,10 @@ func (c OperationContractV1) validateForAction(action string) error {
 		wantNext = domain.StateQIntent
 	case "restore", "compensate":
 		wantNext = domain.StateRIntent
-	case "purge":
+	case "purge", "delete":
+		// A purge removes an isolated object and a delete removes a file at its
+		// original path; both end in the irreversible state and neither has a
+		// destination directory.
 		wantNext = domain.StatePIntent
 	default:
 		return errs.Newf(errs.CodeRecoveryRequired,
@@ -90,6 +93,15 @@ func (c OperationContractV1) validateForAction(action string) error {
 		if c.DestParentIdentity == nil || c.DestParentIdentity.IsZero() {
 			return errs.New(errs.CodeRecoveryRequired,
 				"the "+action+" contract records no destination directory, so the place the object was meant to land cannot be checked")
+		}
+	case "delete":
+		// A direct deletion destroys the only copy, so the contract's hash is the
+		// last statement of what was there. Reconciliation cannot re-read the
+		// bytes to check it, but it can refuse to close an operation that never
+		// recorded them: a completion without a hash would say "something was
+		// removed" and nothing more.
+		if _, err := c.ContentDigest(); err != nil {
+			return err
 		}
 	}
 	return nil

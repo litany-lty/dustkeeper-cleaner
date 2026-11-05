@@ -111,6 +111,10 @@ type DirFD interface {
 	DirFD() int
 }
 
+func dupCloseOnExec(fd int) (int, error) {
+	return unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
+}
+
 // classifyDirOpenError refines an O_DIRECTORY|O_NOFOLLOW failure.
 //
 // macOS reports ENOTDIR, not ELOOP, when the component is a symlink to a
@@ -148,8 +152,14 @@ type Root struct {
 // OpenRoot opens path as a directory without following a symlink on the final
 // component, then records the device number used for cross-mount checks.
 func OpenRoot(p string) (*Root, error) {
-	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
+		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
+			var lst unix.Stat_t
+			if lerr := unix.Lstat(p, &lst); lerr == nil && lst.Mode&unix.S_IFMT == unix.S_IFLNK {
+				return nil, fmt.Errorf("%w: %q", ErrSymlink, p)
+			}
+		}
 		return nil, fmt.Errorf("fsops: open root %q: %w", p, err)
 	}
 	var st unix.Stat_t
@@ -186,6 +196,7 @@ func (r *Root) Close() error {
 		return nil
 	}
 	r.closed = true
+	r.fd = -1
 	return r.f.Close()
 }
 
@@ -280,6 +291,7 @@ func (d *Dir) Close() error {
 		return nil
 	}
 	d.closed = true
+	d.fd = -1
 	return d.f.Close()
 }
 
@@ -374,6 +386,7 @@ func (p *Parent) Close() error {
 		return nil
 	}
 	p.done = true
+	p.fd = -1
 	return p.f.Close()
 }
 
@@ -400,7 +413,7 @@ func (r *Root) OpenParent(rel []byte) (*Parent, error) {
 
 	var fd int
 	if len(parts) == 1 {
-		fd, err = unix.Dup(r.fd)
+		fd, err = dupCloseOnExec(r.fd)
 		if err != nil {
 			return nil, fmt.Errorf("fsops: dup root: %w", err)
 		}
@@ -449,6 +462,7 @@ func (f *File) Close() error {
 		return nil
 	}
 	f.closed = true
+	f.fd = -1
 	return f.f.Close()
 }
 
@@ -507,7 +521,7 @@ func (r *Root) MkdirAll(rel []byte, perm uint32) error {
 	if err != nil {
 		return err
 	}
-	cur, err := unix.Dup(r.fd)
+	cur, err := dupCloseOnExec(r.fd)
 	if err != nil {
 		return fmt.Errorf("fsops: dup root: %w", err)
 	}
@@ -595,6 +609,9 @@ func UnlinkAt(dir DirFD, name string) error {
 
 // ReadLinkAt reads a symlink target, used only for reporting.
 func ReadLinkAt(dir DirFD, name string, buf []byte) (string, error) {
+	if err := ValidateName(name); err != nil {
+		return "", err
+	}
 	n, err := unix.Readlinkat(dir.DirFD(), name, buf)
 	if err != nil {
 		return "", err
@@ -741,7 +758,7 @@ func (d *Dir) ParentOf(name string) (*Parent, error) {
 	if err := ValidateName(name); err != nil {
 		return nil, err
 	}
-	fd, err := unix.Dup(d.fd)
+	fd, err := dupCloseOnExec(d.fd)
 	if err != nil {
 		return nil, fmt.Errorf("fsops: dup dir: %w", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,8 +52,14 @@ func NewHTTPProvider(m config.Model) (*HTTPProvider, error) {
 			"provider %q is not supported in phase one; use %q", m.Provider, ProviderOpenAICompatible)
 	}
 	u, err := url.Parse(m.BaseURL)
-	if err != nil {
-		return nil, errs.Newf(errs.CodeInvalidArgument, "base_url is not a URL: %v", err)
+	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, errs.New(errs.CodeInvalidArgument, "base_url must be a complete URL without credentials, query or fragment")
+	}
+	if u.Port() != "" {
+		port, err := strconv.Atoi(u.Port())
+		if err != nil || port < 1 || port > 65535 {
+			return nil, errs.New(errs.CodeInvalidArgument, "base_url has an invalid port")
+		}
 	}
 	if u.Scheme != "https" && !(u.Scheme == "http" && config.IsLoopbackHost(u.Hostname())) {
 		return nil, errs.New(errs.CodeInvalidArgument,
@@ -68,6 +75,10 @@ func NewHTTPProvider(m config.Model) (*HTTPProvider, error) {
 		if apiKey == "" {
 			return nil, errs.Newf(errs.CodeModelUnavailable,
 				"the API key environment variable %s is not set", m.APIKeyEnv)
+		}
+		if !validBearerToken(apiKey) {
+			return nil, errs.Newf(errs.CodeModelUnavailable,
+				"the API key environment variable %s is not a valid HTTP bearer value", m.APIKeyEnv)
 		}
 	}
 
@@ -91,6 +102,18 @@ func NewHTTPProvider(m config.Model) (*HTTPProvider, error) {
 			},
 		},
 	}, nil
+}
+
+func validBearerToken(value string) bool {
+	if value == "" || strings.TrimSpace(value) != value {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if (value[i] < 0x20 && value[i] != '\t') || value[i] == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // maxScopesInPrompt is the ceiling for the allowed-scope list. Above it the
@@ -214,8 +237,18 @@ func (p *HTTPProvider) Draft(ctx context.Context, req DraftRequest) ([]byte, err
 		return nil, errs.New(errs.CodeModelUnavailable,
 			"the rule-draft service returned a body that is not a chat completion")
 	}
-	if len(parsed.Choices) == 0 {
-		return nil, errs.New(errs.CodeModelUnavailable, "the rule-draft service returned no choices")
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, errs.New(errs.CodeModelUnavailable,
+			"the rule-draft service returned trailing data after the chat completion")
+	}
+	if len(parsed.Choices) != 1 {
+		return nil, errs.Newf(errs.CodeModelUnavailable,
+			"the rule-draft service returned %d choices; exactly one is required", len(parsed.Choices))
+	}
+	if finish := parsed.Choices[0].FinishReason; finish != "" && finish != "stop" {
+		return nil, errs.New(errs.CodeModelUnavailable,
+			"the rule-draft service did not finish normally")
 	}
 	content := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	if content == "" {

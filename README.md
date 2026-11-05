@@ -3,6 +3,64 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Go](https://img.shields.io/badge/go-1.26.1-00ADD8)
 
+## 本地开发中的安全审核（未发布）
+
+只读真实模型调试入口与逐项说明见 [Debug 模式](docs/debug-mode.md)。真实文件外发需覆盖相应文件、字段和服务的授权；debug 始终不删除。
+
+新增只读候选盘点工具 `cmd/cleanup-report`，汇总使用痕迹、已知引用、资料保护和分配空间上限；不生成删除许可。10轮改进和实际Downloads盘点结果见 [改进记录](docs/tasks/ten-round-improvement-20261030.md)。
+
+本分支新增了证据约束的 JEV＋MiniMax 双重审核，隔离与永久清空均要求新审核；未配置审核时不再执行纯规则 Q/P。仅完成本地定向验证，真实模型评测和新版发布冒烟仍待完成，正式实例保持暂停。配置导入、证据要求、已验证范围和下一步计划见 [安全审核说明](docs/safe-review.md)。以下 FINAL-1.0 说明描述原已发布版本，不代表本分支的新功能已发布。
+
+### 三结果清理（本分支，未发布）
+
+一段话概括：一次审核只允许三种结果，**没有第四种**。验收记录（真实命令输出、未验证清单、安装现状）在
+[`docs/tasks/three-outcomes-20261104-acceptance.md`](docs/tasks/three-outcomes-20261104-acceptance.md)。
+
+| 结果 | 条件 | 动作 |
+|---|---|---|
+| **已删除** | 属于已批准的直接清理类别；本地检查无保护、无在用阻碍；JEV 与 LLM **都**明确同意永久删除；授权有效 | 原路径永久删除并记账，出现在本轮结果页 |
+| **待删除（可恢复）** | 没有明确保留信号；还不足以永久删除；能确认在批准范围内可安全移动 | 移入私有隔离区，记录原因与最早清空时间，可原样恢复 |
+| **保留** | 任一模型要求保留；受保护 / 仍在用 / 身份变化；移动安全性未知；模型服务失败 | 原位不动，并在结果页写明原因（"接口失败"与"已确认有用"是两种不同的原因码） |
+
+三条边界值得单独记住：
+
+- **同意不是授权。** 双方同意只是直删的必要条件之一；没有把该类别写进确认过的策略，结果只能是"待删除"。
+- **移动安全性由本地事实决定，不由模型决定。** 模型说"可以删"，但程序测不出能不能安全移动时，文件留在原位。
+- **服务失败不等于清理成功。** 审核没跑完时退出码与原因都指向"什么都没做"，不会印成"0 个删除"的干净收尾。
+
+一次性确认（两步，先看后批）：
+
+```sh
+dustkeeper cleanup setup --scopes exports --categories archive_unknown_contents --observation-days 14
+# 只打印"将被批准的五件事"和它的 digest，不改任何状态；确认时把 digest 原样传回去
+dustkeeper cleanup setup --digest <上一步给的 digest> --scopes exports --categories archive_unknown_contents --observation-days 14
+```
+
+五件事分别管什么：管理哪些目录、哪些类别允许直接删除（默认**空**，即永不直删）、其它候选观察多久（14 或 30 天，
+默认 14）、每轮文件数与字节额度、通知出口。观察期取 `max(规则保留期, 策略天数)`：策略只能把下限抬高，
+**不会缩短**已经记录过保留期的对象。
+
+每轮结束写一页结果，位置固定（默认 `<state>/reports/latest.md`，`--result-dir` 可改）：
+
+```sh
+dustkeeper run            # 结尾打印一行：本次删除/待删除/保留各几个，以及页面在哪
+dustkeeper cleanup report # 原样打印最近一页；--json 输出页面数据
+```
+
+结果页只有三区，空区也打印（"没有"和"漏了"必须能区分），超过 200 条时显示总量与"还有 N 条未显示"。
+永久清空前的提醒只走 macOS 系统通知一种出口：**提醒没送达，这一轮就不清空**，日志写了不算通知。
+`cleanup report` 与仓库里那个只读盘点工具 `cmd/cleanup-report` 不是一回事：前者读本轮结果页，后者扫目录元数据。
+
+**哪些还没验证（别当成已验证）：**
+
+- 真实双模型在真实文件上的判断质量：本机缺 MiniMax 凭据、外部 JEV 缺代理配置，**没有取得过真实同意**。
+  已删除路径的证据全部来自合成模型服务器。
+- 真实 Downloads 全量运行：一次也没有；所有分支验证都在临时目录或隔离实例里。
+- 跑满一个 30 天观察期：没有，只有把时钟推过去的夹具。
+- launchd 在无 GUI 会话下的真实通知记录：没有，只有用失败通道模拟过的逻辑判据。
+- 正式实例仍是 `paused`，装的是旧二进制；解除暂停需要单独授权，不在本分支的改动范围内。
+
+
 一次有边界、可恢复的文件清理器。它把「策略」「授权」「执行」「恢复」拆成四件互不代劳的事：
 模型只写规则草稿，程序只按已批准的规则和额度行动，**被隔离的对象在永久清空前可以申请恢复；永久清空之后
 Dustkeeper 无法撤销；恢复不会覆盖已存在的目标**；删不干净的状态一律停下来等人看。
@@ -117,6 +175,8 @@ scope / plan / object ID。退出码：`0` 成功（含「无候选」）、`2` 
 | `schedule render` | 生成 systemd / launchd 模板 | 否 |
 | `protect add/list/remove` | 路径保护（不自动过期） | 否 |
 | `plan create/show/apply` | 冻结并执行隔离计划 | apply 会隔离 |
+| `cleanup setup` | 一次性确认五件事（两步：预览 digest，再确认） | 否，只写策略 |
+| `cleanup report` | 打印最近一页三区结果；`--json` 给机器读 | 否 |
 | `rule draft/import/show/validate/enable/preview/activate/authorize/revoke/disable` | 规则全生命周期；主流程用 `enable` | 否 |
 | `scope add/list/show/pause/resume` | 登记与管理范围 | 仅 `managed_disposable` 建私有隔离区 |
 | `doctor` | 权限、数据库、文件系统能力、时钟、待对账 | 仅自有探针 |

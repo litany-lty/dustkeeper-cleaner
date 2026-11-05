@@ -22,6 +22,7 @@ import (
 	"dustkeeper/internal/diag"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
+	"dustkeeper/internal/notify"
 	"dustkeeper/internal/store"
 
 	"dustkeeper/migrations"
@@ -51,9 +52,33 @@ type app struct {
 
 	store    *store.Store
 	instance string
+	// sender is the one notification channel. It is never nil: a nil channel
+	// would report "not configured" and stop every automatic clearing, which is
+	// the right default for a missing configuration and the wrong default for an
+	// installation that never had to think about it.
+	sender notify.Sender
 	// log is the bounded operational log. It is nil until a mutating command opens
 	// it, and a nil logger drops records rather than panicking.
 	log *diag.Logger
+}
+
+// testSender replaces the notification channel in the command line tests.
+//
+// It is the same kind of seam as the clock: nothing reads it from the
+// environment, there is no flag for it, and it lives in the test binary's reach
+// only. A test that clears files has to be able to say whether the user was told,
+// and a real system notification is neither reliable nor observable from a test.
+var testSender notify.Sender
+
+// notifySender is the channel this invocation delivers through.
+func (a *app) notifySender() notify.Sender {
+	if a.sender != nil {
+		return a.sender
+	}
+	if testSender != nil {
+		return testSender
+	}
+	return notify.MacOS{}
 }
 
 // output is what a command returns. Every field ends up in the JSON envelope,
@@ -396,12 +421,16 @@ func lookup(name string, args []string) (func(context.Context, *app, []string) (
 		return cmdEvents, args, true
 	case "run":
 		return cmdRun, args, true
+	case "debug":
+		return cmdDebug, args, true
 	case "pause":
 		return cmdPause, args, true
 	case "resume":
 		return cmdResume, args, true
 	case "schedule":
 		return cmdSchedule, args, true
+	case "cleanup":
+		return cmdCleanup, args, true
 	}
 	return nil, nil, false
 }
@@ -447,6 +476,8 @@ func (a *app) openStore() error {
 			"%s has no instance identity; it is not a state database this build can act on. Nothing was created or changed - restore it from a copy, or start a new state directory",
 			a.paths.DBFile)
 	}
+	// Approval expiry and the intent transaction must use one clock.
+	st.SetNow(func() int64 { return a.clock.Wall().UnixNano() })
 	a.store = st
 	a.instance = id
 	return nil
@@ -560,6 +591,7 @@ Commands:
                            finish or explain interrupted operations
   status | events          run state and audit trail
   run                      reconcile, scan, apply granted work
+  debug --root <dir>       simulate cleanup; --execute calls models, never deletes
   pause | resume           global safety pause marker
   schedule render          print systemd / launchd templates
 

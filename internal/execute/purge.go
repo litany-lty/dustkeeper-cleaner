@@ -8,11 +8,13 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/fsops"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/policy"
+	"dustkeeper/internal/review"
 	"dustkeeper/internal/store"
 )
 
@@ -64,16 +66,29 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		return res, err
 	}
 	nowNS := e.Clock.Wall().UnixNano()
-	if it.PurgeNotBeforeNS == nil || nowNS < *it.PurgeNotBeforeNS {
+	if it.PurgeNotBeforeNS == nil {
 		return res, errs.New(errs.CodePlanStale, "the retention period for this object has not elapsed")
 	}
-	if it.CapturedIdentityJSON == nil || it.CapturedTokenJSON == nil || it.ContentHash == nil {
-		return res, errs.New(errs.CodeHeld, "this object has no complete post-move evidence; reconcile first")
-	}
-
 	binding, err := PlanBindingOf(it)
 	if err != nil {
 		return res, err
+	}
+	if it.QuarantinedAtNS == nil || it.BoundRetentionSeconds <= 0 || binding.BoundRetentionSeconds != it.BoundRetentionSeconds {
+		return res, errs.New(errs.CodeHeld, "the recorded retention start or duration cannot be verified")
+	}
+	earliest, valid := domain.AddSecondsNS(*it.QuarantinedAtNS, it.BoundRetentionSeconds)
+	if !valid {
+		return res, errs.New(errs.CodeHeld, "the recorded retention deadline is invalid")
+	}
+	deadline := *it.PurgeNotBeforeNS
+	if earliest > deadline {
+		deadline = earliest
+	}
+	if nowNS < deadline {
+		return res, errs.New(errs.CodePlanStale, "the retention period for this object has not elapsed")
+	}
+	if it.CapturedIdentityJSON == nil || it.CapturedTokenJSON == nil || it.ContentHash == nil || it.MetadataHash == nil || *it.ContentHash == "" || *it.MetadataHash == "" {
+		return res, errs.New(errs.CodeHeld, "this object has no complete post-move evidence; reconcile first")
 	}
 
 	// Authority. A manual purge needs an approved plan bound to the current
@@ -101,15 +116,46 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		return res, errs.Newf(errs.CodeHeld, "the original path is protected: %s", why)
 	}
 
-	capturedID, err := decodeID(*it.CapturedIdentityJSON)
-	if err != nil {
-		return res, err
-	}
 	capturedTok, err := decodeTok(*it.CapturedTokenJSON)
 	if err != nil {
 		return res, err
 	}
+	if opt.Budget != nil && (opt.Budget.TimeUp(e.Clock) || !opt.Budget.CanReserve(capturedTok.Size) || opt.Budget.RemainingRead() < capturedTok.Size) {
+		return res, errs.New(errs.CodeBudgetExhausted, "action budget unavailable before review")
+	}
 
+	// The expiry review asks the irreversible question and nothing else. An
+	// answer short of an explicit agreement leaves the object where it is: there
+	// is nothing reversible left to do with it, so "insufficient" here means
+	// "keep observing", not "move it somewhere quieter".
+	reviewed, err := e.reviewItem(ctx, review.Request{
+		Action:        domain.ActionPurge,
+		ScopeID:       string(sc.Scope.ID),
+		ItemID:        string(it.ID),
+		RelativePath:  string(it.RawRelative),
+		Category:      cleanup.CategoryOf(string(it.RawRelative)),
+		SizeBytes:     capturedTok.Size,
+		AgeDays:       ageDays(capturedTok, e.Clock.Wall()),
+		Checks:        measuredChecks(capturedTok),
+		FactsComplete: true,
+		Movable:       true,
+		Authorized:    true,
+	})
+	if err != nil {
+		return res, err
+	}
+	if reviewed.Disposition != domain.DispositionDelete {
+		return e.recordKeep(ctx, sc, it, planIDOf(opt.Plan), reviewed)
+	}
+	approval := reviewed.Approval
+	if approval == nil {
+		return res, errs.New(errs.CodeReviewRequired, "a review allowed deletion but carries no approval")
+	}
+
+	capturedID, err := decodeID(*it.CapturedIdentityJSON)
+	if err != nil {
+		return res, err
+	}
 	objParent, err := sc.Objects.ParentOf(it.ObjectName)
 	if err != nil {
 		return res, errs.Wrap(errs.CodeAccessDenied, err)
@@ -170,6 +216,13 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		return res, errs.New(errs.CodeBudgetExhausted, "the action budget for this run is exhausted")
 	}
 
+	if opt.Plan != nil && e.Clock.Wall().UnixNano() > opt.Plan.ExpiresAtNS {
+		return res, errs.New(errs.CodePlanExpired, "purge plan expired during review")
+	}
+	if err := approval.Verify(string(ev.Content)); err != nil {
+		return res, err
+	}
+
 	// Last look before the unlink. It narrows the window between verification and
 	// deletion; it cannot close it, and the design says so rather than implying
 	// an atomicity the syscall does not offer.
@@ -217,13 +270,15 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 	}
 
 	intent := store.Intent{
-		OpID:         opID,
-		ItemID:       it.ID,
-		Action:       "purge",
-		PriorState:   domain.StateQuarantined,
-		NextState:    domain.StatePIntent,
-		ContractJSON: string(contractJSON),
-		OccurredAtNS: nowNS,
+		OpID:              opID,
+		ItemID:            it.ID,
+		Action:            "purge",
+		Review:            approval,
+		ReviewContentHash: string(ev.Content),
+		PriorState:        domain.StateQuarantined,
+		NextState:         domain.StatePIntent,
+		ContractJSON:      string(contractJSON),
+		OccurredAtNS:      nowNS,
 	}
 	if opt.Plan != nil {
 		intent.PlanID = &opt.Plan.ID
@@ -231,7 +286,12 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 
 	// The pause gate also covers purging: a pause request must be able to stop
 	// the next permanent deletion, not only the next quarantine.
-	if err := e.Gate.CheckAndCommit(func() error { return e.Store.BeginIntent(ctx, intent) }); err != nil {
+	if err := e.Gate.CheckAndCommit(func() error {
+		if err := e.scopeGate(ctx, sc); err != nil {
+			return err
+		}
+		return e.Store.BeginIntent(ctx, intent)
+	}); err != nil {
 		return res, err
 	}
 
@@ -327,6 +387,9 @@ func (e *Executor) checkAutomaticAuthority(ctx context.Context, sc *ScopeCtx, it
 	if active.Revision != *b.RuleRevision {
 		return errs.New(errs.CodeGrantRequired,
 			"the rule was revised after this object was isolated; the old grant does not carry over")
+	}
+	if err := plan.CheckAutomaticGrant(g, sc.Scope, active, domain.CapAutoPurge); err != nil {
+		return err
 	}
 	if b.RuleDigest != nil && string(active.Digest) != *b.RuleDigest {
 		return errs.New(errs.CodeGrantRequired, "the rule content changed after this object was isolated")
@@ -507,4 +570,12 @@ func baseOf(rel string) string {
 		return rel[i+1:]
 	}
 	return rel
+}
+
+// planIDOf is the plan an operation should be recorded against, if any.
+func planIDOf(p *store.Plan) *domain.PlanID {
+	if p == nil {
+		return nil
+	}
+	return &p.ID
 }

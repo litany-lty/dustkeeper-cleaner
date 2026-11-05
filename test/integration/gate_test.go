@@ -72,6 +72,9 @@ func TestAutomaticPurgeHonoursTheGrantCeiling(t *testing.T) {
 	e.scan(sc.ID)
 
 	const retention = 7 * 24 * time.Hour
+	// The observation period is set to the same seven days so that the window
+	// under test is the rule's, not the product default of fourteen.
+	e.confirmPolicy(7, sc.ID)
 	r := e.rule(sc.ID, "rule-1", []string{"*.zip"}, nil, 30*24*time.Hour, retention)
 	e.grant(r, domain.CapAutoQuarantine, 10, 1<<30)
 	// This is the number the approval prompt showed: one object.
@@ -244,6 +247,9 @@ func TestDiskPressurePausesQuarantineButNotADuePurge(t *testing.T) {
 	e.scan(sc.ID)
 
 	const retention = 7 * 24 * time.Hour
+	// The window under test is the rule's seven days, so the observation period is
+	// brought down to match rather than left at the product default.
+	e.confirmPolicy(7, sc.ID)
 	r := e.rule(sc.ID, "rule-1", []string{"*.zip"}, nil, 30*24*time.Hour, retention)
 	e.grant(r, domain.CapAutoQuarantine, 10, 1<<30)
 	e.grant(r, domain.CapAutoPurge, 10, 1<<30)

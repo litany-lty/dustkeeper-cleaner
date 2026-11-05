@@ -7,17 +7,20 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/fsops"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/policy"
+	"dustkeeper/internal/review"
 	"dustkeeper/internal/scope"
 	"dustkeeper/internal/store"
 )
 
 // Executor performs quarantine, restore and purge.
 type Executor struct {
+	Review ReviewFunc
 	Store  *store.Store
 	Clock  domain.Clock
 	Config ConfigView
@@ -79,16 +82,27 @@ func (e *Executor) validateItem(sc *ScopeCtx, p store.Plan, it store.Item, b pla
 	return nil
 }
 
-// Quarantine moves one item into the private vault.
+// Quarantine is the entry point every caller uses to handle one planned item.
 //
-// The order is load-bearing:
+// It measures the local facts, asks the reviewers one question, and then does
+// the one thing the resulting disposition permits: nothing, a reversible move,
+// or - only when the category is in the confirmed direct-delete set and a
+// standing grant covers this scope - a permanent deletion at the original path.
 //
-//	verify -> hash -> manifest durable -> intent commit -> rename -> verify -> sync -> commit
-//
-// Any interruption leaves the file explainable: either it is still where the
-// plan says, or the vault holds an object whose identity and content hash were
-// recorded before the move.
+// The name is kept because the plan path, the runner and the tests all reach
+// this function, and a separate "delete" entry point would let a caller choose
+// the destructive branch without ever passing the review.
 func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, it store.Item, budget *domain.Budget) (domain.OperationResult, error) {
+	return e.process(ctx, sc, p, it, budget)
+}
+
+// process measures, asks, and dispatches.
+//
+// Everything here happens before any byte moves and is cheap: one protection
+// walk, one keeper query, one token comparison. The expensive stable read and
+// the irreversible steps live in the two branches below, because which branch
+// runs is exactly what the review decides.
+func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it store.Item, budget *domain.Budget) (domain.OperationResult, error) {
 	res := domain.OperationResult{Item: it.ID, State: it.State}
 
 	binding, err := PlanBindingOf(it)
@@ -129,11 +143,7 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	if ok, why, perr := e.protected(ctx, sc, it.RawRelative, preID); perr != nil {
 		return res, perr
 	} else if ok {
-		res.Code = string(errs.CodeSkippedProtected)
-		res.Message = why
-		res.Control = domain.ControlContinue
-		res.Evidence = domain.EvidenceNotStarted
-		return res, nil
+		return skipped(res, why), nil
 	}
 
 	// Section 9.5: a path that some isolated object still depends on as its
@@ -144,7 +154,140 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	} else if inUse {
 		res.Code = string(errs.CodeSkippedProtected)
 		res.Message = "this file is the keeper of an isolated duplicate; restore or purge that object first"
+		res.Control = domain.ControlContinue
+		res.Evidence = domain.EvidenceNotStarted
 		return res, nil
+	}
+
+	if preTok.NLink > 1 {
+		res.Code = string(errs.CodeSkippedProtected)
+		res.Message = "file has more than one hard link"
+		res.Control = domain.ControlContinue
+		res.Evidence = domain.EvidenceNotStarted
+		return res, nil
+	}
+	if budget != nil && (budget.TimeUp(e.Clock) || !budget.CanReserve(preTok.Size) || budget.RemainingRead() < preTok.Size*2) {
+		return res, errs.New(errs.CodeBudgetExhausted, "action budget unavailable before review")
+	}
+
+	// What this item is, and what it is allowed to become. Both are measured
+	// here so that the question put to the reviewers is the question this item
+	// actually qualifies for: asking "may this be deleted" about a scope the user
+	// did not confirm would be a question with no authority behind the answer.
+	category := cleanup.CategoryOf(string(it.RawRelative))
+	pol, err := cleanup.Load(ctx, e.Store)
+	if err != nil {
+		return res, err
+	}
+	action, authorized, why := e.authorityFor(ctx, sc, it, binding, pol, category)
+
+	req := review.Request{
+		Action:        action,
+		ScopeID:       string(sc.Scope.ID),
+		ItemID:        string(it.ID),
+		RelativePath:  string(it.RawRelative),
+		Category:      category,
+		SizeBytes:     preTok.Size,
+		AgeDays:       ageDays(preTok, e.Clock.Wall()),
+		Identity:      preID,
+		Checks:        measuredChecks(preTok),
+		Policy:        review.PolicyFacts{DirectDeleteCategories: pol.DirectDeleteCategories, ObservationDays: pol.ObservationDays},
+		FactsComplete: preTok.Size >= 0 && preID.Inode != 0,
+		Movable:       true,
+		Authorized:    authorized,
+	}
+
+	outcome, err := e.reviewItem(ctx, req)
+	if err != nil {
+		return res, err
+	}
+	switch outcome.Disposition {
+	case domain.DispositionKeep:
+		return e.keepItem(ctx, sc, p, it, outcome)
+	case domain.DispositionDelete:
+		return e.deleteDirect(ctx, sc, p, it, binding, budget, outcome)
+	}
+	if why != "" {
+		// The reviewers allowed something; record which authority was absent so
+		// "why was this only moved" is answerable without re-deriving it.
+		outcome.Decision.MissingEvidence = append(outcome.Decision.MissingEvidence, "direct delete: "+why)
+	}
+	return e.quarantineOnly(ctx, sc, p, it, budget, outcome)
+}
+
+// authorityFor decides which question to ask. It returns the action, whether
+// permanent deletion is authorised, and - when it is not - the reason, which is
+// recorded rather than discarded.
+//
+// Four things must hold at once for the destructive branch: the user confirmed
+// this category, the scope is inside the confirmation, the item came from a
+// scheduled rule, and an active auto-purge grant is still bound to the rule
+// revision that produced it. Anything less asks the reversible question, which
+// is the only question this build may act on without that authority.
+func (e *Executor) authorityFor(ctx context.Context, sc *ScopeCtx, it store.Item, b plan.ItemBindingV1, pol cleanup.Policy, category string) (action string, authorized bool, why string) {
+	if !pol.Confirmed() {
+		return domain.DispositionQuarantine, false, "no cleanup policy has been confirmed"
+	}
+	if !pol.Covers(string(sc.Scope.ID)) {
+		return domain.DispositionQuarantine, false, "this scope is not inside the confirmed cleanup scope"
+	}
+	if !pol.MayDeleteDirectly(category) {
+		return domain.DispositionQuarantine, false, "category " + category + " is not approved for direct deletion"
+	}
+	if err := e.checkAutomaticAuthority(ctx, sc, it, b); err != nil {
+		return domain.DispositionQuarantine, false, err.Error()
+	}
+	return domain.DispositionDelete, true, ""
+}
+
+// measuredChecks states exactly what was measured before the models were asked.
+// The fields left nil are the ones this path does not measure; a reviewer that
+// needs them must answer insufficient rather than assume false.
+func measuredChecks(preTok domain.ChangeToken) review.Checks {
+	return review.Checks{
+		Protected:  review.Bool(false),
+		SingleLink: review.Bool(preTok.NLink <= 1),
+		InUse:      review.Bool(false),
+	}
+}
+
+// skipped builds the result for an item that was refused before any review.
+func skipped(res domain.OperationResult, why string) domain.OperationResult {
+	res.Code = string(errs.CodeSkippedProtected)
+	res.Message = why
+	res.Control = domain.ControlContinue
+	res.Evidence = domain.EvidenceNotStarted
+	return res
+}
+
+// quarantineOnly performs the reversible move for an item the reviewers already
+// allowed to be moved.
+//
+// The order is load-bearing:
+//
+//	verify -> hash -> manifest durable -> intent commit -> rename -> verify -> sync -> commit
+//
+// Any interruption leaves the file explainable: either it is still where the
+// plan says, or the vault holds an object whose identity and content hash were
+// recorded before the move.
+func (e *Executor) quarantineOnly(ctx context.Context, sc *ScopeCtx, p store.Plan, it store.Item, budget *domain.Budget, outcome review.Outcome) (domain.OperationResult, error) {
+	res := domain.OperationResult{Item: it.ID, State: it.State}
+
+	binding, err := PlanBindingOf(it)
+	if err != nil {
+		return res, err
+	}
+	preID, err := decodeID(it.PreIdentityJSON)
+	if err != nil {
+		return res, err
+	}
+	preTok, err := decodeTok(it.PreTokenJSON)
+	if err != nil {
+		return res, err
+	}
+	approval := outcome.Approval
+	if approval == nil {
+		return res, errs.New(errs.CodeReviewRequired, "a review allowed this move but carries no approval")
 	}
 
 	parent, err := sc.Root.OpenParent(it.RawRelative)
@@ -284,14 +427,16 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	}
 
 	intent := store.Intent{
-		OpID:         opID,
-		ItemID:       it.ID,
-		PlanID:       &p.ID,
-		Action:       "quarantine",
-		PriorState:   domain.StatePlanned,
-		NextState:    domain.StateQIntent,
-		ContractJSON: string(contractJSON),
-		OccurredAtNS: e.Clock.Wall().UnixNano(),
+		OpID:              opID,
+		ItemID:            it.ID,
+		PlanID:            &p.ID,
+		Action:            "quarantine",
+		Review:            approval,
+		ReviewContentHash: string(preHash),
+		PriorState:        domain.StatePlanned,
+		NextState:         domain.StateQIntent,
+		ContractJSON:      string(contractJSON),
+		OccurredAtNS:      e.Clock.Wall().UnixNano(),
 	}
 
 	// Last look before the intent. Everything that made this file eligible can
@@ -333,6 +478,13 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	// would let it through - and a file touched a second ago no longer satisfies
 	// the age condition the plan approved. Failure here abandons the preparation,
 	// so the manifest this call wrote does not block the next attempt.
+	if err := e.validateItem(sc, p, it, binding); err != nil {
+		return res, e.abandonPreparation(sc, it, err)
+	}
+	if err := approval.Verify(string(preHash)); err != nil {
+		return res, e.abandonPreparation(sc, it, err)
+	}
+
 	runBeforeAcceptanceHook()
 	if err := ConfirmUnchanged(src, preEv); err != nil {
 		return res, e.abandonPreparation(sc, it, changedAfterVerification(it.RawRelative, err))
@@ -343,7 +495,12 @@ func (e *Executor) Quarantine(ctx context.Context, sc *ScopeCtx, p store.Plan, i
 	if err := e.checkQuarantineSpace(sc); err != nil {
 		return res, e.abandonPreparation(sc, it, err)
 	}
-	if err := e.Gate.CheckAndCommit(func() error { return e.Store.BeginIntent(ctx, intent) }); err != nil {
+	if err := e.Gate.CheckAndCommit(func() error {
+		if err := e.scopeGate(ctx, sc); err != nil {
+			return err
+		}
+		return e.Store.BeginIntent(ctx, intent)
+	}); err != nil {
 		return res, e.abandonPreparation(sc, it, err)
 	}
 

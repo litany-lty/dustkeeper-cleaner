@@ -145,6 +145,79 @@ echo "stub go: unsupported invocation: $*" >&2
 exit 2
 `
 
+// stubReviewSmoke preserves the release-script tests' controlled artifact
+// failures while build.sh delegates the real review/TLS flow to its Go helper.
+// The helper itself has separate protocol and real-binary tests; this stub keeps
+// these tests focused on release gating and manifest behavior.
+const stubReviewSmoke = `#!/bin/sh
+set -eu
+artifact=""
+work=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--artifact) artifact=$2; shift 2 ;;
+	--work) work=$2; shift 2 ;;
+	*) echo "review smoke stub: unknown argument $1" >&2; exit 2 ;;
+	esac
+done
+if [ -z "$artifact" ] || [ -z "$work" ]; then
+	echo "review smoke stub: missing artifact or work" >&2
+	exit 2
+fi
+mkdir -p "$work/tree" "$work/state" "$work/config" "$work/keep"
+printf 'smoke payload\n' >"$work/tree/old.zip"
+cp "$work/tree/old.zip" "$work/keep/old.zip"
+touch -t 202001010000 "$work/tree/old.zip"
+cat >"$work/rule.json" <<'JSON'
+{"dsl_version":1,"scope_id":"smoke","action":"quarantine","match":{"min_mtime_age_seconds":86400,"min_size_bytes":0,"max_size_bytes":1073741824,"relative_dir_prefixes":[],"basename_patterns":["*.zip"]},"except":{"relative_dir_prefixes":[],"basename_patterns":[]},"retention_seconds":604800}
+JSON
+run() {
+	DUSTKEEPER_STATE_DIR="$work/state" DUSTKEEPER_CONFIG_DIR="$work/config" "$artifact" "$@"
+}
+json_str() {
+	sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+run init --json >/dev/null
+run scope add --path "$work/tree" --kind managed_disposable --name smoke --json >/dev/null
+run scan --scope smoke --json >/dev/null
+run rule import --file "$work/rule.json" --id smoke-rule --json >/dev/null
+run rule preview --id smoke-rule --revision 1 --json >"$work/preview.json"
+digest=$(json_str review_digest <"$work/preview.json")
+run rule activate --id smoke-rule --revision 1 --digest "$digest" --json >/dev/null
+run plan create --rule smoke-rule --json >"$work/plan.json"
+plan_id=$(json_str plan_id <"$work/plan.json")
+plan_digest=$(json_str digest <"$work/plan.json")
+run plan apply --id "$plan_id" --digest "$plan_digest" --json >/dev/null
+if [ -e "$work/tree/old.zip" ]; then
+	echo "smoke: the source is still at its original path after a quarantine was applied" >&2
+	exit 17
+fi
+run quarantine list --json >"$work/list.json"
+item=$(json_str item_id <"$work/list.json")
+if [ -z "$item" ]; then
+	echo "smoke: nothing was listed after a quarantine was applied" >&2
+	exit 18
+fi
+if ! grep -q '"restorable"[[:space:]]*:[[:space:]]*true' "$work/list.json"; then
+	echo "smoke: the quarantined object was not restorable" >&2
+	exit 18
+fi
+run quarantine restore --object "$item" --json >/dev/null
+if [ ! -f "$work/tree/old.zip" ]; then
+	echo "smoke: the restore did not put the file back" >&2
+	exit 19
+fi
+if ! cmp -s "$work/keep/old.zip" "$work/tree/old.zip"; then
+	echo "smoke: the restored file's content differs from the file that was quarantined" >&2
+	exit 19
+fi
+run quarantine list --json >"$work/list2.json"
+if grep -q "\"$item\"" "$work/list2.json"; then
+	echo "smoke: $item is still listed as a quarantined object after its restore" >&2
+	exit 20
+fi
+`
+
 // stubCC answers the questions the libc policy asks a compiler: which triple it
 // targets, which version it is, and -- the part the policy actually reads -- what
 // the link would be made of. The policy reads the startfile and the -L that the
@@ -263,6 +336,7 @@ func newScriptDir(t *testing.T) *scriptDir {
 	mustWrite(t, filepath.Join(bin, "shasum"), stubShasum, 0o755)
 	mustWrite(t, filepath.Join(bin, "stub-cc"), stubCC, 0o755)
 	mustWrite(t, filepath.Join(bin, "stub-verify"), stubVerify, 0o755)
+	mustWrite(t, filepath.Join(bin, "stub-review-smoke"), stubReviewSmoke, 0o755)
 
 	return &scriptDir{root: root, out: filepath.Join(root, "dist"), bin: bin}
 }
@@ -291,6 +365,7 @@ func (s *scriptDir) run(t *testing.T, extra map[string]string, args ...string) (
 		// A prebuilt verifier: the script would otherwise compile
 		// ./build/verify-artifact with the stub "go", which cannot compile anything.
 		"VERIFY_ARTIFACT=" + filepath.Join(s.bin, "stub-verify"),
+		"REVIEW_SMOKE_HELPER=" + filepath.Join(s.bin, "stub-review-smoke"),
 	}
 	for k, v := range extra {
 		env = append(env, k+"="+v)
@@ -877,6 +952,9 @@ func TestTheSmokeChecksTheObjectRecordAfterARestore(t *testing.T) {
 	for _, want := range []string{
 		"source_gone_after_apply=yes",
 		"restored_bytes_match=yes",
+		"review_tls=yes",
+		"review_rejection_retained=yes",
+		"review_evidence_backup=yes",
 		"quarantine restore,quarantine list",
 	} {
 		if !strings.Contains(facts, want) {

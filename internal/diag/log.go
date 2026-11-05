@@ -116,8 +116,13 @@ func sanitize(kv []any) []any {
 		// Keys are at even indexes and are never truncated: a shortened key would
 		// change the meaning of the record.
 		if i%2 == 1 {
-			if s, ok := v.(string); ok {
-				out[i] = capString(s)
+			switch value := v.(type) {
+			case string:
+				out[i] = capString(value)
+			case error:
+				out[i] = capString(value.Error())
+			case fmt.Stringer:
+				out[i] = capString(value.String())
 			}
 		}
 	}
@@ -165,6 +170,7 @@ type rotating struct {
 
 	file *os.File
 	size int64
+	err  error
 }
 
 func newRotating(dir int, displayDir, name string, max int64, keep int) (*rotating, error) {
@@ -199,18 +205,26 @@ func (r *rotating) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.err != nil {
+		return 0, r.err
+	}
 	if r.file == nil {
 		if err := r.open(); err != nil {
+			r.err = err
 			return 0, err
 		}
 	}
 	if r.size > 0 && r.size+int64(len(p)) > r.max {
 		if err := r.rotate(); err != nil {
+			r.err = err
 			return 0, err
 		}
 	}
 	n, err := r.file.Write(p)
 	r.size += int64(n)
+	if err != nil {
+		r.err = err
+	}
 	return n, err
 }
 
@@ -253,9 +267,11 @@ func (r *rotating) rotate() error {
 func (r *rotating) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var err error
+	err := r.err
 	if r.file != nil {
-		err = r.file.Close()
+		if closeErr := r.file.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
 		r.file = nil
 	}
 	if r.dir >= 0 {

@@ -28,3 +28,8 @@ var TestHookDirRead func(rel string) error
 // with the epoch completing and the observation retired. It cannot be reproduced
 // portably without a seam.
 var TestHookEntryStat func(rel string) error
+
+// TestHookReadDirError can replace the error returned with one non-empty
+// Readdir batch. It reproduces filesystems that return usable entries together
+// with EIO, which cannot be constructed portably with ordinary directory APIs.
+var TestHookReadDirError func(rel string, entries int) error

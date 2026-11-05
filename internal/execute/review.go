@@ -1,0 +1,62 @@
+package execute
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"dustkeeper/internal/domain"
+	"dustkeeper/internal/errs"
+	"dustkeeper/internal/review"
+	"dustkeeper/internal/store"
+)
+
+// ReviewFunc is the dual-review entry point the executor calls.
+//
+// It takes a fully measured Request and returns the outcome: the models' answer
+// plus the disposition the whole set of facts permits. The executor never
+// receives a bare "allow" flag, because a boolean cannot say whether it was the
+// answer to "may this be deleted" or to "may this be moved".
+type ReviewFunc func(context.Context, review.Request) (review.Outcome, error)
+
+// reviewItem asks the reviewers about one already-measured candidate.
+//
+// A keep verdict is not an error: it is a result. Only the conditions that make
+// asking impossible at all - a pause request, a missing reviewer - are returned
+// as errors, and those carry their own codes so a batch can tell "the scope is
+// paused" from "this file stays".
+func (e *Executor) reviewItem(ctx context.Context, req review.Request) (review.Outcome, error) {
+	paused, err := e.Gate.Paused()
+	if err != nil {
+		return review.Outcome{}, err
+	}
+	if paused {
+		return review.Outcome{}, errs.New(errs.CodePaused, "a pause was requested; no model review was started")
+	}
+	if e.Review == nil {
+		return review.Outcome{}, errs.New(errs.CodeReviewRequired, "dual review is required; no file action was started")
+	}
+	return e.Review(ctx, req)
+}
+
+// decodeToken reads the change token a plan bound.
+func decodeToken(it store.Item) (domain.ChangeToken, error) {
+	var tok domain.ChangeToken
+	if err := json.Unmarshal([]byte(it.PreTokenJSON), &tok); err != nil {
+		return tok, errs.Newf(errs.CodeStateWriteFailed, "change token is unreadable: %v", err)
+	}
+	return tok, nil
+}
+
+// ageDays is how old the file is by modification time, which is the only age
+// the program can measure. It is reported as such and never as "unused since".
+func ageDays(tok domain.ChangeToken, now time.Time) int {
+	if tok.MTimeNS <= 0 {
+		return 0
+	}
+	d := now.Sub(time.Unix(0, tok.MTimeNS))
+	if d < 0 {
+		return 0
+	}
+	return int(d / (24 * time.Hour))
+}

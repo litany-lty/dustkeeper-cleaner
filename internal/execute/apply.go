@@ -31,7 +31,7 @@ type ApplyResult struct {
 // persistence became unreliable; continuing would compound the problem.
 func stopCode(code string) bool {
 	switch code {
-	case string(errs.CodeHeld),
+	case string(errs.CodeReviewRequired), string(errs.CodeModelUnavailable), string(errs.CodeHeld),
 		string(errs.CodePlanStale),
 		string(errs.CodePlanExpired),
 		string(errs.CodeScopeChanged),
@@ -107,17 +107,27 @@ func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID
 	}
 	out.Planned = len(items)
 
+	resuming := p.Status == domain.PlanPartial
 	if err := e.Store.SetPlanStatus(ctx, p.ID, domain.PlanApplying); err != nil {
 		return out, err
 	}
+	p.Status = domain.PlanApplying
 
 	stopped := false
 	for _, it := range items {
+		if resuming && (it.State == domain.StateQuarantined || it.State == domain.StateRestored || it.State == domain.StatePurged) {
+			out.Skipped++
+			out.Results = append(out.Results, domain.OperationResult{
+				Item: it.ID, State: it.State, Code: string(errs.CodeOK),
+				Message: "already completed by an earlier attempt", Control: domain.ControlContinue, Evidence: domain.EvidenceNotStarted,
+			})
+			continue
+		}
 		if stopped {
 			out.Failed++
 			out.Results = append(out.Results, domain.OperationResult{
-				Item: it.ID, State: it.State, Code: string(errs.CodePaused),
-				Message: "not started: the batch stopped at an earlier item",
+				Item: it.ID, State: it.State, Code: out.Code,
+				Message: "not started: the batch stopped at an earlier item (" + out.Code + ")",
 				Control: domain.ControlContinue, Evidence: domain.EvidenceNotStarted,
 			})
 			continue
@@ -149,7 +159,9 @@ func (e *Executor) ApplyQuarantinePlan(ctx context.Context, sc *ScopeCtx, planID
 		switch res.Code {
 		case string(errs.CodeOK):
 			out.Completed++
-		case string(errs.CodeSkippedProtected), string(errs.CodeUnsupportedMetadata):
+		case string(errs.CodeSkippedProtected), string(errs.CodeUnsupportedMetadata), string(errs.CodeKept):
+			// A kept item is an answer, not a failure: the plan is complete and
+			// the results page explains why the file is still there.
 			out.Skipped++
 		default:
 			out.Failed++
@@ -200,6 +212,9 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 	if err != nil {
 		return out, err
 	}
+	if err := plan.VerifyPlanDigest(p, purgeMemberItems(members), approval); err != nil {
+		return out, err
+	}
 	out.Planned = len(members)
 	// A purge plan is refused as a whole before the plan is marked applying. The
 	// historical duplicate rows are still loadable through `plan apply`, and a
@@ -207,17 +222,26 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 	if err := requireLifecycleMembers(purgeMemberItems(members)); err != nil {
 		return out, err
 	}
+	resuming := p.Status == domain.PlanPartial
 	if err := e.Store.SetPlanStatus(ctx, p.ID, domain.PlanApplying); err != nil {
 		return out, err
 	}
 
 	stopped := false
 	for _, m := range members {
+		if resuming && m.Item.State == domain.StatePurged {
+			out.Skipped++
+			out.Results = append(out.Results, domain.OperationResult{
+				Item: m.Item.ID, State: m.Item.State, Code: string(errs.CodeOK),
+				Message: "already completed by an earlier attempt", Control: domain.ControlContinue, Evidence: domain.EvidenceNotStarted,
+			})
+			continue
+		}
 		if stopped {
 			out.Failed++
 			out.Results = append(out.Results, domain.OperationResult{
-				Item: m.Item.ID, State: m.Item.State, Code: string(errs.CodePaused),
-				Message: "not started: the batch stopped at an earlier item",
+				Item: m.Item.ID, State: m.Item.State, Code: out.Code,
+				Message: "not started: the batch stopped at an earlier item (" + out.Code + ")",
 				Control: domain.ControlContinue, Evidence: domain.EvidenceNotStarted,
 			})
 			continue
@@ -236,6 +260,10 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 			out.Control = strongerControl(out.Control, domain.ControlStopPlan)
 			stopped = true
 			out.Failed++
+			out.Results = append(out.Results, domain.OperationResult{
+				Item: m.Item.ID, State: m.Item.State, Code: out.Code, Message: out.Message,
+				Control: domain.ControlStopPlan, Evidence: domain.EvidenceNotStarted,
+			})
 			continue
 		}
 		res, execErr := e.Purge(ctx, sc, m.Item, PurgeOptions{

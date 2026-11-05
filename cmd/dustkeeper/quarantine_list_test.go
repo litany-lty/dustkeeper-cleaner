@@ -84,6 +84,7 @@ func TestQuarantineListShowsWhatIsInTheVaultAndWhetherItCanComeBack(t *testing.T
 	prev := mustCLI(t, "rule", "preview", "--id", "r1", "--revision", "1", "--json")
 	mustCLI(t, "rule", "activate", "--id", "r1", "--revision", "1",
 		"--digest", dataString(t, prev, "review_digest"), "--json")
+	installClockReviewFixture(t, base, tree, testClock{time.Now()})
 
 	created := mustCLI(t, "plan", "create", "--rule", "r1", "--json")
 	mustCLI(t, "plan", "apply",

@@ -824,14 +824,17 @@ func marshalContract(t *testing.T, c plan.OperationContractV1) string {
 // a crash between the intent and the unlink leaves.
 func stagePurgeIntent(t *testing.T, e *env, f *crashFixture, contract string) {
 	t.Helper()
+	reviewApproval, reviewHash := fakeIntentApproval(f.item.ID, "purge")
 	if err := e.st.BeginIntent(context.Background(), store.Intent{
-		OpID:         domain.OperationID(domain.NewID("op")),
-		ItemID:       f.item.ID,
-		Action:       "purge",
-		PriorState:   domain.StateQuarantined,
-		NextState:    domain.StatePIntent,
-		ContractJSON: contract,
-		OccurredAtNS: e.clock.Wall().UnixNano(),
+		OpID:              domain.OperationID(domain.NewID("op")),
+		ItemID:            f.item.ID,
+		Action:            "purge",
+		Review:            reviewApproval,
+		ReviewContentHash: reviewHash,
+		PriorState:        domain.StateQuarantined,
+		NextState:         domain.StatePIntent,
+		ContractJSON:      contract,
+		OccurredAtNS:      e.clock.Wall().UnixNano(),
 	}); err != nil {
 		t.Fatalf("begin purge intent: %v", err)
 	}

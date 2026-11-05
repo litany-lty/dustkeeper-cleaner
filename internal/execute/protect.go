@@ -177,6 +177,9 @@ func (e *Executor) scopeGate(ctx context.Context, sc *ScopeCtx) error {
 	default:
 		return errs.Newf(errs.CodePlanStale, "scope %s is %s", sc.Scope.ID, cur.Status)
 	}
+	if cur.ProtectionRevision != sc.Scope.ProtectionRevision {
+		return errs.New(errs.CodePlanStale, "the protection set changed while this scope was open; review a fresh plan")
+	}
 
 	// A scope whose own status looks fine can still hold work nobody finished: a
 	// pending operation, an object frozen by a verdict, an object between two
@@ -205,7 +208,7 @@ func (e *Executor) scopeGate(ctx context.Context, sc *ScopeCtx) error {
 // a batch stop for one reason and be described as stopping for another.
 func ControlOf(code string) string {
 	switch code {
-	case string(errs.CodePaused), string(errs.CodeHeld), string(errs.CodeScopeChanged),
+	case string(errs.CodeReviewRequired), string(errs.CodeModelUnavailable), string(errs.CodePaused), string(errs.CodeHeld), string(errs.CodeScopeChanged),
 		string(errs.CodeProtectionAliasUnresolved):
 		return domain.ControlStopScope
 	case string(errs.CodePlanStale), string(errs.CodePlanExpired), string(errs.CodeDigestMismatch):

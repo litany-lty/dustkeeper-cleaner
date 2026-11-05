@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -8,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
+	"dustkeeper/internal/store"
 )
 
 // These tests cover the last metre of the command line.
@@ -44,6 +47,31 @@ func mustCLIOn(t *testing.T, clk domain.Clock, args ...string) result {
 
 // scopeWithRule registers one managed_disposable scope, puts one old zip in it,
 // scans it, and leaves rule r1 active. Everything happens at the caller's date.
+// confirmTestPolicy writes the one-time cleanup confirmation into an initialised
+// test instance.
+//
+// It exists so that the retention tests below keep measuring the retention rule
+// and not the product's observation default: a newly isolated object is held for
+// the longer of "what the rule promised" and "what the cleanup policy promises",
+// and these fixtures use a seven-day rule. Setting the policy to the same seven
+// days leaves those assertions about the mechanism - which is what they are for.
+func confirmTestPolicy(t *testing.T, base string, observationDays int, scopes ...string) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(base, "state", "state.db"))
+	if err != nil {
+		t.Fatalf("open store for policy: %v", err)
+	}
+	defer st.Close()
+	pol := cleanup.Default()
+	pol.Scopes = scopes
+	pol.ObservationDays = observationDays
+	pol.Notify = cleanup.NotifyNone
+	pol.ConfirmedAtNS = time.Now().UnixNano()
+	if err := cleanup.Save(context.Background(), st, pol); err != nil {
+		t.Fatalf("save cleanup policy: %v", err)
+	}
+}
+
 func scopeWithRule(t *testing.T, clk domain.Clock) (base, tree string) {
 	t.Helper()
 	base = newHome(t)
@@ -63,6 +91,7 @@ func scopeWithRule(t *testing.T, clk domain.Clock) (base, tree string) {
 	}
 
 	mustCLIOn(t, clk, "init", "--json")
+	confirmTestPolicy(t, base, 7, "exports")
 	mustCLIOn(t, clk, "scope", "add", "--path", tree, "--kind", "managed_disposable",
 		"--name", "exports", "--json")
 	mustCLIOn(t, clk, "scan", "--scope", "exports", "--json")
@@ -83,24 +112,7 @@ func scopeWithRule(t *testing.T, clk domain.Clock) (base, tree string) {
 // the vaulted object's name.
 func quarantineOne(t *testing.T, clk domain.Clock) (tree, itemID, objectName string) {
 	t.Helper()
-	_, tree = scopeWithRule(t, clk)
-	created := mustCLIOn(t, clk, "plan", "create", "--rule", "r1", "--json")
-	mustCLIOn(t, clk, "plan", "apply",
-		"--id", dataString(t, created, "plan_id"),
-		"--digest", dataString(t, created, "digest"), "--json")
-
-	listed := mustCLIOn(t, clk, "quarantine", "list", "--json")
-	objects, _ := dataOf(t, listed)["objects"].([]any)
-	if len(objects) != 1 {
-		t.Fatalf("the vault holds %d object(s), want the one that was just quarantined", len(objects))
-	}
-	row, _ := objects[0].(map[string]any)
-	itemID, _ = row["item_id"].(string)
-	objectName, _ = row["object_name"].(string)
-	if itemID == "" || objectName == "" {
-		t.Fatalf("the list row does not identify the object: %v", row)
-	}
-	return tree, itemID, objectName
+	return quarantineOneWithReview(t, clk)
 }
 
 // vaultPathOf is where the payload of a quarantined object really lives.
@@ -145,7 +157,7 @@ func countsOf(t *testing.T, r result) map[string]any {
 func TestSlimControlPropagation(t *testing.T) {
 	t.Run("a file that changed under the plan stops the quarantine batch", func(t *testing.T) {
 		clk := domain.NewFakeClock(time.Now())
-		_, tree := scopeWithRule(t, clk)
+		base, tree := scopeWithRule(t, clk)
 		created := mustCLIOn(t, clk, "plan", "create", "--rule", "r1", "--json")
 		planID := dataString(t, created, "plan_id")
 		digest := dataString(t, created, "digest")
@@ -163,6 +175,9 @@ func TestSlimControlPropagation(t *testing.T) {
 		if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
 			t.Fatalf("restore mtime: %v", err)
 		}
+		// Give the current bytes valid review evidence while preserving the old
+		// plan, so this test reaches and checks the independent plan-staleness gate.
+		installClockReviewFixture(t, base, tree, clk)
 
 		applied := cliOn(t, clk, "plan", "apply", "--id", planID, "--digest", digest, "--json")
 		if applied.code == 0 {
@@ -255,7 +270,7 @@ func TestSlimControlPropagation(t *testing.T) {
 func TestSlimClockSeamDrivesRetention(t *testing.T) {
 	t.Run("the window opens only after the retention period", func(t *testing.T) {
 		clk := domain.NewFakeClock(time.Now())
-		tree, _, objectName := quarantineOne(t, clk)
+		tree, _, objectName := quarantineOneWithReview(t, clk)
 
 		// Same day: nothing is due, and the command says so without failing.
 		early := mustCLIOn(t, clk, "purge", "plan", "--scope", "exports", "--json")
@@ -292,7 +307,8 @@ func TestSlimClockSeamDrivesRetention(t *testing.T) {
 
 	t.Run("a jumped clock stops the purge and an acknowledgement resumes it", func(t *testing.T) {
 		clk := domain.NewFakeClock(time.Now())
-		_, tree := scopeWithRule(t, clk)
+		base, tree := scopeWithRule(t, clk)
+		installClockReviewFixture(t, base, tree, clk)
 		// A background run writes the trusted instant down. Without it there is no
 		// baseline to compare a jump against.
 		mustCLIOn(t, clk, "run", "--json")
@@ -386,7 +402,8 @@ type purgeOutcome struct {
 func runOnePurge(t *testing.T, route string) purgeOutcome {
 	t.Helper()
 	clk := domain.NewFakeClock(time.Now())
-	_, tree := scopeWithRule(t, clk)
+	base, tree := scopeWithRule(t, clk)
+	installClockReviewFixture(t, base, tree, clk)
 
 	created := mustCLIOn(t, clk, "plan", "create", "--rule", "r1", "--json")
 	mustCLIOn(t, clk, "plan", "apply",
@@ -493,6 +510,7 @@ func protectedSubdirFixture(t *testing.T, clk *domain.FakeClock) (tree, sub, obj
 	}
 
 	mustCLIOn(t, clk, "init", "--json")
+	confirmTestPolicy(t, base, 7, "exports")
 	mustCLIOn(t, clk, "scope", "add", "--path", tree, "--kind", "managed_disposable",
 		"--name", "exports", "--json")
 	mustCLIOn(t, clk, "protect", "add", "--scope", "exports", "--relative", "keep/a.zip", "--json")
@@ -507,6 +525,7 @@ func protectedSubdirFixture(t *testing.T, clk *domain.FakeClock) (tree, sub, obj
 	prev := mustCLIOn(t, clk, "rule", "preview", "--id", "r1", "--revision", "1", "--json")
 	mustCLIOn(t, clk, "rule", "activate", "--id", "r1", "--revision", "1",
 		"--digest", dataString(t, prev, "review_digest"), "--json")
+	installClockReviewFixture(t, base, tree, clk, "sub/old.zip")
 
 	created := mustCLIOn(t, clk, "plan", "create", "--rule", "r1", "--json")
 	mustCLIOn(t, clk, "plan", "apply",

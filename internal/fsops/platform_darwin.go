@@ -16,7 +16,7 @@ import (
 // Every intermediate directory is checked against rootDev, so a mount or a
 // symlink cannot silently redirect the walk to another volume.
 func openDirChain(rootFD int, parts []string, rootDev uint64) (int, error) {
-	cur, err := unix.Dup(rootFD)
+	cur, err := dupCloseOnExec(rootFD)
 	if err != nil {
 		return -1, fmt.Errorf("fsops: dup: %w", err)
 	}

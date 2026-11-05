@@ -94,6 +94,17 @@ func runPreRenameHook() {
 	}
 }
 
+// TestHookPreUnlink runs immediately before the unlink of a direct deletion,
+// after the last identity check. It is the same window the rename hook covers,
+// for the branch where there is no vault copy to fall back on.
+var TestHookPreUnlink func()
+
+func runPreUnlinkHook() {
+	if TestHookPreUnlink != nil {
+		TestHookPreUnlink()
+	}
+}
+
 func runCompensateHook() {
 	if TestHookPreCompensateRename != nil {
 		TestHookPreCompensateRename()

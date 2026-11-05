@@ -82,6 +82,11 @@ func Write(opt Options, dir string) ([]string, error) {
 	var written []string
 	for _, f := range files {
 		path := filepath.Join(dir, f.Name)
+		if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+			return written, errs.New(errs.CodeInvalidArgument, "schedule output must be a regular file, not a link or special file")
+		} else if err != nil && !os.IsNotExist(err) {
+			return written, errs.Wrap(errs.CodeAccessDenied, err)
+		}
 		if existing, err := os.ReadFile(path); err == nil {
 			if bytes.Equal(existing, f.Content) {
 				written = append(written, path)
@@ -92,8 +97,17 @@ func Write(opt Options, dir string) ([]string, error) {
 		} else if !os.IsNotExist(err) {
 			return written, errs.Wrap(errs.CodeAccessDenied, err)
 		}
-		if err := os.WriteFile(path, f.Content, f.Mode); err != nil {
+		dst, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, f.Mode)
+		if err != nil {
 			return written, errs.Wrap(errs.CodeAccessDenied, err)
+		}
+		_, writeErr := dst.Write(f.Content)
+		closeErr := dst.Close()
+		if writeErr != nil {
+			return written, errs.Wrap(errs.CodeAccessDenied, writeErr)
+		}
+		if closeErr != nil {
+			return written, errs.Wrap(errs.CodeAccessDenied, closeErr)
 		}
 		written = append(written, path)
 	}
@@ -105,14 +119,26 @@ func (o Options) validate() error {
 		return errs.Newf(errs.CodeInvalidArgument,
 			"the executable path must be absolute, got %q", o.Executable)
 	}
-	if strings.ContainsAny(o.Executable, "\r\n") {
-		return errs.New(errs.CodeInvalidArgument, "the executable path contains a newline")
+	for _, path := range []string{o.Executable, o.StateDir, o.ConfigFile} {
+		if strings.ContainsAny(path, "\x00\r\n") {
+			return errs.New(errs.CodeInvalidArgument, "schedule paths cannot contain NUL or line breaks")
+		}
 	}
 	if o.Label == "" {
 		return errs.New(errs.CodeInvalidArgument, "a unit label is required")
 	}
 	if strings.ContainsAny(o.Label, " \t\r\n/\\") {
 		return errs.Newf(errs.CodeInvalidArgument, "label %q is not a valid unit name", o.Label)
+	}
+	if o.Platform == Linux {
+		if len(o.Label)+len(".service") > 255 {
+			return errs.New(errs.CodeInvalidArgument, "unit name exceeds 255 bytes")
+		}
+		for _, c := range o.Label {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune(":-_.", c)) {
+				return errs.New(errs.CodeInvalidArgument, "unit label contains unsupported characters")
+			}
+		}
 	}
 	if o.Hour < 0 || o.Hour > 23 || o.Minute < 0 || o.Minute > 59 {
 		return errs.Newf(errs.CodeInvalidArgument,
@@ -125,6 +151,7 @@ func (o Options) validate() error {
 // before it expands anything, so a path with a space must be quoted and its own
 // quotes and backslashes escaped.
 func systemdQuote(s string) string {
+	s = strings.ReplaceAll(s, "%", "%%")
 	if !strings.ContainsAny(s, " \t\"'\\") {
 		return s
 	}
@@ -148,8 +175,8 @@ Description=Dustkeeper bounded cleanup
 [Service]
 Type=oneshot
 ExecStart=%s run
-Environment=DUSTKEEPER_STATE_DIR=%s
-Environment=DUSTKEEPER_CONFIG_DIR=%s
+Environment=%s
+Environment=%s
 Nice=10
 IOSchedulingClass=idle
 UMask=0077
@@ -159,8 +186,8 @@ NoNewPrivileges=true
 # reconciliation.
 TimeoutStartSec=infinity
 `, systemdQuote(opt.Executable),
-		systemdQuote(opt.StateDir),
-		systemdQuote(filepath.Dir(opt.ConfigFile)))
+		systemdQuote("DUSTKEEPER_STATE_DIR="+opt.StateDir),
+		systemdQuote("DUSTKEEPER_CONFIG_DIR="+filepath.Dir(opt.ConfigFile)))
 
 	timer := fmt.Sprintf(`[Unit]
 Description=Run Dustkeeper daily
@@ -187,10 +214,10 @@ Files
 Install as the user that owns the state directory:
 
   mkdir -p ~/.config/systemd/user
-  cp %[1]s.service %[1]s.timer ~/.config/systemd/user/
+  cp ./%[2]s ./%[3]s ~/.config/systemd/user/
   systemctl --user daemon-reload
-  systemctl --user enable --now %[1]s.timer
-  systemctl --user list-timers %[1]s.timer
+  systemctl --user enable --now -- %[3]s
+  systemctl --user list-timers -- %[3]s
 
 A user unit stops when the user's last session ends. On a server without a
 session, decide deliberately whether to enable lingering:
@@ -202,7 +229,7 @@ that runs as a dedicated unprivileged account is also acceptable — install it
 explicitly and keep it off root.
 
 Do not add a short TimeoutStartSec and do not run the cleanup core as root.
-`, opt.Label)
+`, opt.Label, shellWord(opt.Label+".service"), shellWord(opt.Label+".timer"))
 
 	return []File{
 		{Name: opt.Label + ".service", Content: []byte(service), Mode: 0o600},
@@ -283,9 +310,9 @@ File
 
 Install as the user that owns the state directory:
 
-  cp %[1]s.plist ~/Library/LaunchAgents/
-  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/%[1]s.plist
-  launchctl print gui/$(id -u)/%[1]s
+  cp ./%[2]s ~/Library/LaunchAgents/
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/%[2]s
+  launchctl print gui/$(id -u)/%[3]s
 
 Paths are written as real absolute paths. launchd does not expand "~", and it
 does not run a shell, so ProgramArguments is an array and not a command line.
@@ -295,10 +322,15 @@ permissions as your terminal. A directory that works interactively may fail
 with ACCESS_DENIED in the background. Run "dustkeeper doctor --scope <id>"
 again after granting access; this program does not request full disk access for
 the whole process.
-`, opt.Label)
+`, opt.Label, shellWord(opt.Label+".plist"), shellWord(opt.Label))
 
 	return []File{
 		{Name: opt.Label + ".plist", Content: []byte(plist), Mode: 0o600},
 		{Name: "README.txt", Content: []byte(notes), Mode: 0o600},
 	}, nil
+}
+
+// Installation notes are shell commands; the plist/unit values themselves are not.
+func shellWord(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }

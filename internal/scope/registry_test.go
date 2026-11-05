@@ -18,6 +18,11 @@ import (
 func newRegistry(t *testing.T) (*Registrar, string) {
 	t.Helper()
 	base := t.TempDir()
+	home := filepath.Join(base, "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	t.Setenv("HOME", home)
 	paths := config.Paths{
 		ConfigDir:    filepath.Join(base, "config"),
 		StateDir:     filepath.Join(base, "state"),
@@ -171,6 +176,54 @@ func TestDangerousPathsAreRefused(t *testing.T) {
 	}
 	if errs.CodeOf(err) != errs.CodeScopeRefused {
 		t.Errorf("code = %s, want SCOPE_REFUSED", errs.CodeOf(err))
+	}
+}
+
+func TestAddRefusesWhenUserHomeIsUnavailable(t *testing.T) {
+	reg, base := newRegistry(t)
+	t.Setenv("HOME", "")
+	working := t.TempDir()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(working); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+
+	_, err = reg.Add(context.Background(), AddOptions{
+		Path: makeTree(t, base, "missing-home"), Kind: "observe", Name: "missing-home",
+	})
+	if err == nil {
+		t.Fatal("scope registration succeeded without a user home")
+	}
+	if errs.CodeOf(err) != errs.CodeAccessDenied {
+		t.Fatalf("code=%s, want ACCESS_DENIED: %v", errs.CodeOf(err), err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(working, ".dustkeeper-registry.lock")); !os.IsNotExist(statErr) {
+		t.Fatalf("registration lock escaped into the current directory: %v", statErr)
+	}
+}
+
+func TestRegistrationLockRefusesSymlink(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "unrelated.txt")
+	if err := os.WriteFile(target, []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(home, ".dustkeeper-registry.lock")); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := RegistrationLock(home)
+	if lock != nil {
+		_ = lock.Release()
+	}
+	if err == nil {
+		t.Fatal("registration lock followed a symbolic link")
+	}
+	if body, readErr := os.ReadFile(target); readErr != nil || string(body) != "preserve" {
+		t.Fatalf("unrelated target changed: body=%q err=%v", body, readErr)
 	}
 }
 

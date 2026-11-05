@@ -43,7 +43,10 @@ func ruleEnable(ctx context.Context, a *app, args []string) (output, error) {
 	if err := parseFlags(fs, args); err != nil {
 		return output{}, err
 	}
-	if *id == "" || *rev == 0 {
+	if *maxFiles < 0 || *maxBytes < 0 || *purgeFiles < 0 || *purgeBytes < 0 {
+		return output{}, errs.New(errs.CodeInvalidArgument, "ceiling flags must be zero (use configuration) or positive")
+	}
+	if *id == "" || *rev <= 0 {
 		return output{}, errs.New(errs.CodeInvalidArgument, "--id and --revision are required")
 	}
 	if *mode != enableModeQuarantine && *mode != enableModeCleanup {

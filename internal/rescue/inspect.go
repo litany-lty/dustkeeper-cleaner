@@ -109,8 +109,12 @@ func Inspect(rootPath string) (Report, error) {
 
 	vault, err := root.OpenDir([]byte(domain.VaultDirName))
 	if err != nil {
-		return rep, errs.Newf(errs.CodeScopeRefused,
-			"%q has no %s directory, so it is not a managed scope", rootPath, domain.VaultDirName)
+		if errors.Is(err, unix.ENOENT) {
+			return rep, errs.Newf(errs.CodeScopeRefused,
+				"%q has no %s directory, so it is not a managed scope", rootPath, domain.VaultDirName)
+		}
+		return rep, errs.Newf(errs.CodeAccessDenied,
+			"the %s directory in %q could not be opened safely: %v", domain.VaultDirName, rootPath, err)
 	}
 	defer vault.Close()
 
@@ -144,7 +148,7 @@ func Inspect(rootPath string) (Report, error) {
 	// the same order every time.
 	for _, m := range manifests {
 		e := Entry{
-			Object:         m.manifest.ObjectID,
+			Object:         m.object,
 			Manifest:       m.name,
 			RawRelativeB64: m.manifest.RawRelativeB64,
 			ContentHash:    m.manifest.ContentHash,
@@ -165,9 +169,9 @@ func Inspect(rootPath string) (Report, error) {
 				e.Status = StatusUnverified
 				rep.Unverified++
 			}
-		} else if obj, ok := objects[m.manifest.ObjectID]; ok {
+		} else if obj, ok := objects[m.object]; ok {
 			e.ObjectSize = obj.size
-			delete(objects, m.manifest.ObjectID)
+			delete(objects, m.object)
 			if e.Status == "" {
 				if obj.err != "" {
 					// The entry could not be examined, which is not the same fact as
@@ -252,6 +256,7 @@ func readOwner(vault *fsops.Dir) (instanceID, scopeID, note string) {
 
 type manifestEntry struct {
 	name     string
+	object   string
 	manifest execute.ManifestV1
 	problem  string
 }
@@ -305,37 +310,37 @@ func readManifests(root *fsops.Root) ([]manifestEntry, string, []string) {
 			notes = append(notes, "ignored a non-manifest entry in the manifests directory: "+name)
 			continue
 		}
+		stem := strings.TrimSuffix(name, ".json")
 		body, err := dir.ReadFileAt(name, maxManifestBytes)
 		if err != nil {
 			out = append(out, manifestEntry{
-				name: name, problem: fmt.Sprintf("the manifest could not be read: %v", err),
+				name: name, object: stem, problem: fmt.Sprintf("the manifest could not be read: %v", err),
 			})
 			continue
 		}
 		var m execute.ManifestV1
 		if err := json.Unmarshal(body, &m); err != nil {
 			out = append(out, manifestEntry{
-				name: name, problem: fmt.Sprintf("the manifest is not readable JSON: %v", err),
+				name: name, object: stem, problem: fmt.Sprintf("the manifest is not readable JSON: %v", err),
 			})
 			continue
 		}
-		stem := strings.TrimSuffix(name, ".json")
 		if m.ObjectID != stem {
-			out = append(out, manifestEntry{name: name, manifest: m,
+			out = append(out, manifestEntry{name: name, object: stem, manifest: m,
 				problem: fmt.Sprintf("the manifest names object %q but the file is %q", m.ObjectID, stem)})
 			continue
 		}
 		if m.FormatVersion != 1 {
-			out = append(out, manifestEntry{name: name, manifest: m,
+			out = append(out, manifestEntry{name: name, object: stem, manifest: m,
 				problem: fmt.Sprintf("unsupported manifest format version %d", m.FormatVersion)})
 			continue
 		}
 		if m.ContentHash == "" || m.MetadataHash == "" {
-			out = append(out, manifestEntry{name: name, manifest: m,
+			out = append(out, manifestEntry{name: name, object: stem, manifest: m,
 				problem: "the manifest records no content or metadata hash, so its object cannot be identified"})
 			continue
 		}
-		out = append(out, manifestEntry{name: name, manifest: m})
+		out = append(out, manifestEntry{name: name, object: stem, manifest: m})
 	}
 	sortManifestEntries(out)
 	return out, state, notes
@@ -489,7 +494,7 @@ func listDir(d *fsops.Dir) dirListing {
 // directory read the same way.
 func sortManifestEntries(s []manifestEntry) {
 	sort.SliceStable(s, func(i, j int) bool {
-		return s[i].manifest.ObjectID < s[j].manifest.ObjectID
+		return s[i].object < s[j].object
 	})
 }
 

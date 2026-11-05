@@ -134,6 +134,55 @@ const (
 	ReasonExactDuplicate = "exact_duplicate"
 )
 
+// Model verdicts, normalised across both reviewers. Every reviewer states one
+// of three things, and the words are the same whichever question was asked:
+//
+//	allow          the requested action is justified by the supplied facts
+//	insufficient   the facts do not settle it either way
+//	keep           the item must stay where it is
+const (
+	VerdictAllow        = "allow"
+	VerdictInsufficient = "insufficient"
+	VerdictKeep         = "keep"
+)
+
+// Dispositions — the only three outcomes the product offers.
+//
+//	Delete      permanently removed, recorded as an irreversible action
+//	Quarantine  moved to the private observation area, restorable
+//	Keep        left exactly where it is, with a stated reason
+const (
+	DispositionDelete     = "delete"
+	DispositionQuarantine = "quarantine"
+	DispositionKeep       = "keep"
+)
+
+// Actions recorded on intents. "delete" is permanent removal at the original
+// path; "purge" is permanent removal of an already-isolated vault object.
+const (
+	ActionQuarantine = "quarantine"
+	ActionDelete     = "delete"
+	ActionPurge      = "purge"
+)
+
+// ReviewApproval is the permission a dual review grants for one item and one action.
+//
+// It is declared here, beside the states and actions it talks about, because the
+// state store has to record approvals and must not import the review client to
+// do it. The review package aliases this type, so an implementation cannot
+// satisfy one declaration and not the other.
+type ReviewApproval interface {
+	// Verify re-confirms the approval immediately before an action, including
+	// the content digest the review was made about.
+	Verify(contentHash string) error
+	// CheckIntent runs inside the intent transaction. It performs no I/O.
+	CheckIntent(itemID, action string, nowNS int64) error
+	// AuditJSON is what the operation record stores.
+	AuditJSON() string
+	// Disposition is the action this approval actually permits.
+	Disposition() string
+}
+
 // Event phases.
 //
 // PhasePark is deliberately non-terminal: it records "the namespace changed but

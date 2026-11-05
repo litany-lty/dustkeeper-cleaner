@@ -73,6 +73,8 @@ func seedItem(t *testing.T, s *Store, scope domain.ScopeID, itemID domain.ItemID
 	}
 }
 
+func planRef(id domain.PlanID) *domain.PlanID { return &id }
+
 // TestSchemaAndPragmas checks the migration and the read-back of every pragma.
 func TestSchemaAndPragmas(t *testing.T) {
 	s := newTestStore(t)
@@ -123,9 +125,10 @@ func TestIntentAndStateCommitTogether(t *testing.T) {
 	seedScope(t, s, "exports", domain.KindManagedDisposable)
 	seedItem(t, s, "exports", "item_1", "plan_1")
 
-	in := Intent{
+	in := Intent{Review: storageReviewFixture{},
 		OpID:         "op_1",
 		ItemID:       "item_1",
+		PlanID:       planRef("plan_1"),
 		Action:       "quarantine",
 		PriorState:   domain.StatePlanned,
 		NextState:    domain.StateQIntent,
@@ -154,8 +157,8 @@ func TestIntentAndStateCommitTogether(t *testing.T) {
 	}
 
 	// A second intent for the same item must be refused, not queued.
-	err = s.BeginIntent(ctx, Intent{
-		OpID: "op_2", ItemID: "item_1", Action: "quarantine",
+	err = s.BeginIntent(ctx, Intent{Review: storageReviewFixture{},
+		OpID: "op_2", ItemID: "item_1", PlanID: planRef("plan_1"), Action: "quarantine",
 		PriorState: domain.StateQIntent, NextState: domain.StateQIntent,
 		ContractJSON: `{}`, OccurredAtNS: 101,
 	})
@@ -175,8 +178,8 @@ func TestWrongPriorStateLeavesNoTrace(t *testing.T) {
 	seedScope(t, s, "exports", domain.KindManagedDisposable)
 	seedItem(t, s, "exports", "item_1", "plan_1")
 
-	err := s.BeginIntent(ctx, Intent{
-		OpID: "op_1", ItemID: "item_1", Action: "quarantine",
+	err := s.BeginIntent(ctx, Intent{Review: storageReviewFixture{},
+		OpID: "op_1", ItemID: "item_1", PlanID: planRef("plan_1"), Action: "quarantine",
 		PriorState: domain.StateQuarantined, NextState: domain.StateRIntent,
 		ContractJSON: `{}`, OccurredAtNS: 1,
 	})
@@ -204,8 +207,8 @@ func TestCompleteQuarantineIsIdempotent(t *testing.T) {
 	seedScope(t, s, "exports", domain.KindManagedDisposable)
 	seedItem(t, s, "exports", "item_1", "plan_1")
 
-	in := Intent{
-		OpID: "op_1", ItemID: "item_1", Action: "quarantine",
+	in := Intent{Review: storageReviewFixture{},
+		OpID: "op_1", ItemID: "item_1", PlanID: planRef("plan_1"), Action: "quarantine",
 		PriorState: domain.StatePlanned, NextState: domain.StateQIntent,
 		ContractJSON: `{}`, OccurredAtNS: 10,
 	}
