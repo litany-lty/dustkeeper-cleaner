@@ -76,7 +76,12 @@ set -eu
 cd /src
 
 apt-get update -qq
-apt-get install -y -qq musl-tools binutils >/dev/null
+# lsof is a runtime dependency, not a build one: a move is only allowed when a
+# complete process listing could be taken, and a listing that cannot run is
+# reported as "unknown" - which leaves the file alone rather than moving it. The
+# smoke therefore has to run in an environment the product supports, and this
+# image does not ship the tool.
+apt-get install -y -qq musl-tools binutils lsof >/dev/null
 
 export GOCACHE=/gocache
 # The checkout is mounted from the host, so it belongs to another uid and git

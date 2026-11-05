@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -82,7 +84,7 @@ func ProbeOpenUnder(ctx context.Context, root string, run CommandRunner) OpenObs
 	}
 	c, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	data, err := run(c, "lsof", "-nP", "-w", "-F0n", "+D", root)
+	data, err := run(c, processListingPath(), "-nP", "-w", "-F0n", "+D", root)
 	for _, field := range bytes.Split(data, []byte{0}) {
 		field = bytes.TrimLeft(field, "\n")
 		if len(field) < 2 || field[0] != 'n' {
@@ -109,6 +111,36 @@ func ProbeOpenUnder(ctx context.Context, root string, run CommandRunner) OpenObs
 func exited(err error) bool {
 	var ee *exec.ExitError
 	return errors.As(err, &ee)
+}
+
+// processListingCandidates is where the process listing lives on the systems
+// this build targets.
+//
+// The tool is looked for at these paths before PATH is consulted, because the
+// listing is the fact a move depends on and a scheduled run is not a shell: a
+// launchd job and a minimal container both start with a PATH that may not
+// include sbin. Falling back to PATH keeps the behaviour on a system that
+// installs the tool somewhere else.
+var processListingCandidates = []string{
+	"/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof", "/bin/lsof",
+}
+
+var (
+	processListingOnce sync.Once
+	processListingBin  string
+)
+
+func processListingPath() string {
+	processListingOnce.Do(func() {
+		for _, p := range processListingCandidates {
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				processListingBin = p
+				return
+			}
+		}
+		processListingBin = "lsof"
+	})
+	return processListingBin
 }
 
 func ProbeLastUsed(ctx context.Context, path string, run CommandRunner) UsageObservation {
