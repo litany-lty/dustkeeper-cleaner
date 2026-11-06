@@ -152,6 +152,11 @@ dustkeeper doctor --scope exports
 这也是它和"什么都不做"的区别：闸门在时清空是停住的，确认之后清空会恢复，但恢复的第一个动作是重新给窗口，
 而不是立刻删。不确定的时间不能被一次确认抹平成"早就到期了"。
 
+**`doctor` 不检查模型链路。** 它查目录、数据库、文件系统能力、暂停标记、待对账、时钟与各 scope 的根身份；
+不读 `review` 配置，不检查凭据文件、CA 或端点连通性。`doctor` 全绿只说明这台机器"能安全地移动文件"，
+不说明模型能用——目标机上"环境 + 模型"这两半要分别验证。要在一个目录上做只读的模型检查，用
+`debug --root <dir> --execute`（advisory 问答，不移动任何文件）；否则就只能靠一次真实 `run` 来证明。
+
 ---
 
 ## 6. 规则：从草稿到授权
@@ -374,6 +379,16 @@ dustkeeper cleanup report   # 原样打印最近一页；--json 输出页面数�
 （5..120，默认 30）控制单次模型请求的等待；实测 20s 会让 MiniMax 偶尔超时，超时会被记成"模型不可用"
 并跳过该文件，而不是等它。
 
+**自签或内网端点：`trust_ca_file` 必须是一条全程没有符号链接的真实路径。** 凭据与 CA 都是逐段
+`O_NOFOLLOW` 打开的，路径里只要有一段是链接就直接 `MODEL_UNAVAILABLE`，而那个错误信息不会指向路径。
+macOS 上 `/tmp`、`/var` 本身就是链接，Linux 上不少发行版的 `/home` 也是；先 `realpath` 再用解析后的路径
+写进配置。
+
+**外网 JEV 需要目标机自己有一条可用的出口。** 直连被地域策略挡住时（HTTP 451），JEV 那一路先失败，
+整轮退化成"模型不可用"、一个文件都不动。出口填 `review.jev_proxy_url`（只接受 `http://host:port`，
+不带用户名密码、query 或路径，程序不做直连回退）；MiniMax 不走这条代理。程序不会凭空提供代理出口，
+服务器上没有可用的 HTTP CONNECT 服务就得先装一个。
+
 页面里的"已删除"只认**已完成并确认**的动作：候选、模型意见、intent、debug 模拟都不计入。超过 200 条时
 显示总量与"还有 N 条未显示"。`cleanup report` 是只读命令：它读文件，不移动、不删除、也不写审计。
 
@@ -399,6 +414,47 @@ dustkeeper quarantine restore --object <item_id> --destination-relative sub/rest
 - 原路径已被新文件占用 → `RESTORE_CONFLICT`（exit 6），**一个字节都没动**。用 `--destination-relative`
   换个位置，或先自己处理掉那个新文件。
 - 隔离区里的对象身份对不上 → `HELD`。不要手动 `mv`，先看 `events`。
+
+### 9.1.1 恢复之后：这个 scope 的自动授权要重新确认
+
+`quarantine restore` 在写入移动的同一个事务里做两件事：给恢复的目标路径加一条保护（`source=restore`），
+并把该 scope 的 `protection_revision` 加 1——不必等到恢复真正完成。自动授权（`rule enable` 写下的 grant）
+绑定的是当时那个版本，于是：
+
+- **这个 scope 的下一次 `run` 会在动作前比对失败，整轮以 `GRANT_REQUIRED`（exit 4）停下**，一个文件都不动。
+  这是"授权不再匹配"，不是"规则错了"，也不等于把 scope 写成了 paused。
+- **其它 scope 不受影响**：它们的版本没有变。
+- 同一 scope 有多条规则时，受影响的是这个版本下的所有规则，需要逐条确认；只重新启用其中一条，
+  不能宣称整个 scope 已恢复。
+
+恢复之后的完整流程：
+
+1. `quarantine restore --object <item_id>` 把需要的文件拿回来。程序新增的路径保护保留着
+   （刚救回来的东西不该当天再被删）。
+2. `rule list` / `rule show` 看清这个 scope 有哪些规则、各自的能力、模式与额度；
+   `quarantine list --scope <id>` 看清观察区里还剩哪些对象。
+3. 对每条受影响规则**按原来的能力与原额度**重新走一次 `rule enable` → 原样传回 digest：
+   - 用原来的 rule ID 与 revision；
+   - 原来启用的是 `cleanup`（到期清空），就显式写 `--mode cleanup`；省略默认是 `quarantine`，
+     等于把它降成"只隔离"；
+   - 保留原来的 `--max-files` / `--max-bytes` / `--purge-max-files` / `--purge-max-bytes`；
+     省略会退回配置默认值，那不是原额度；
+   - 先看不带 `--digest` 的提案，再用它输出的完整确认命令提交。
+4. 新候选恢复自动清理。**这一步只覆盖新候选。**
+5. 观察区里的旧对象**不继承新授权**：它们身上记的还是被撤销的那份旧授权。分别选择——
+   - 继续保留（默认，什么都不做）；
+   - `quarantine restore` 拿回来；
+   - 到期后用既有的手动清空计划处理（`purge plan` / `purge apply`）；它要求当次明确计划，
+     仍然检查保留期、时钟、保护、对象事实与双模型，不依赖旧自动授权是否还 active。
+
+三条不要做：
+
+- 不要用"自动重新启用所有规则"的脚本代替逐条决定——那等于一次性把所有规则的能力和额度重置成默认值。
+- 不要为了"队列归零"新增批量无条件删除。没做完决定的对象继续留着是对的。
+- 不要因为一次恢复就扩大目录、动作能力或额度。
+
+这套机制是**有意保留**的设计（每个新保护都要求重新确认一次权限）。它不便宜，但把它改成"只保护被恢复
+的那个对象"要连带处理旧计划、旧隔离对象绑定的授权与授权历史，属于换一套授权体系，不是改一个字段。
 
 ### 9.2 程序中断之后的收尾
 
@@ -533,6 +589,9 @@ rm -rf /srv/app/disposable-exports/.dustkeeper           # 仅在第 4 步确认
 |---|---|
 | `run` 一直隔离 0 个 | `rule preview` 是否还有候选；`rule authorize` 是否只打印了提案没提交摘要 |
 | 刚恢复的文件又被选中 | 预期行为：恢复后自动加路径保护；若仍被选中，看 `protect list` 是否写失败 |
+| `quarantine restore` 之后 `run` 报 `GRANT_REQUIRED` | 预期行为：恢复让该 scope 的自动授权版本失效。按 9.1.1 逐条重新确认；旧隔离对象不继承新授权 |
+| 系统自带 `sqlite3` 打不开 `state.db`（`near "STRICT": syntax error`） | 系统客户端太旧（STRICT 表要 3.37+）。程序内嵌 SQLite 3.53，用 `status` / `events` / `cleanup report` 查看，不要用旧客户端改库 |
+| 服务器上整轮 `MODEL_UNAVAILABLE` | 先看 JEV 出口（直连返回 451 说明被地域策略挡住，需要 `jev_proxy_url`），再确认 `lsof` 已安装、`trust_ca_file` 路径无符号链接 |
 | 计划刚生成就 `PLAN_STALE` | 有进程在写该目录（父目录身份或 mtime 变了）；`--writers-stopped` 之后重建计划 |
 | `plan apply` 报 `INVALID_ARGUMENT` | `assisted` scope 的手工计划必须显式 `--writers-stopped`：先确认没有进程在写这棵目录 |
 | `purge apply` 报 `DIGEST_MISMATCH` | 计划内容在生成后变了；`purge show` 会说明重算摘要是否与存档一致 |
