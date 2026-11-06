@@ -94,6 +94,10 @@ actual deletion: 0 files / 0 bytes; production state unchanged
 （假端点只答 triage 那一套，advisory 的问答形状对不上），所以这条命令**只在真实端点上才算通过**——
 这一轮通过了。
 
+**本轮真实调用量**（按候选计，不是按轮计）：第 4 节第一次 `run` 3 个候选 = 3 次 JEV + 1 次 MiniMax；
+systemd 触发的那次 2 个候选 = 2 次 JEV（两个都被 JEV 判 `insufficient`，没有第二层）；
+只读检查 2 个候选 × 2 层 = 4 次。合计约 **8 次 JEV + 2 次 MiniMax**。这是要记账的部分。
+
 ## 4. 混合批次（真实模型，一次 `run`）
 
 四个合成文件（三个 mtime 固定为 2020-01-01）：
