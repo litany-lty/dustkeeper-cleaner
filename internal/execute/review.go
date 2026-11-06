@@ -19,6 +19,42 @@ import (
 // answer to "may this be deleted" or to "may this be moved".
 type ReviewFunc func(context.Context, review.Request) (review.Outcome, error)
 
+// ReviewBudget is the allowance one batch of reviews may spend.
+//
+// It is a separate interface from ReviewFunc because the batch is a different
+// object from a single question: the executor opens one batch per plan, and the
+// reviewer decides whether the batch, the task, or neither has room. Passing the
+// remaining task time as a closure keeps a single monotonic source of truth -
+// a batch can spend less than the task allows, never more.
+type ReviewBudget interface {
+	BeginBatch(remaining func() time.Duration)
+	CheckStart() string
+	EndBatch()
+}
+
+// beginBatch opens the review allowance for one plan. A nil budget means the
+// reviewer owns its own limits, which is the shape of the debug commands.
+func (e *Executor) beginBatch(b *domain.Budget) func() {
+	if e.ReviewBudget == nil {
+		return func() {}
+	}
+	var remaining func() time.Duration
+	if b != nil && b.Run != nil {
+		ledger := b.Run
+		remaining = func() time.Duration { return ledger.Remaining(e.Clock.Mono()) }
+	}
+	e.ReviewBudget.BeginBatch(remaining)
+	return e.ReviewBudget.EndBatch
+}
+
+// reviewAllowance reports which allowance, if any, stops the next candidate.
+func (e *Executor) reviewAllowance() string {
+	if e.ReviewBudget == nil {
+		return ""
+	}
+	return e.ReviewBudget.CheckStart()
+}
+
 // reviewItem asks the reviewers about one already-measured candidate.
 //
 // A keep verdict is not an error: it is a result. Only the conditions that make

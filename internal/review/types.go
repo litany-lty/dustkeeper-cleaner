@@ -116,6 +116,31 @@ type Decision struct {
 	// LLMConsulted distinguishes "the second reviewer agreed" from "the second
 	// reviewer was never asked because the first one said keep".
 	LLMConsulted bool `json:"llm_consulted"`
+	// Failure is the structured reason the review produced no verdict, or empty
+	// when it did. It is separate from ModelError because the sentence is for a
+	// person and this value decides the control range, the exit code and
+	// whether a request may already have been billed.
+	Failure string `json:"failure,omitempty"`
+	// Attempts counts HTTP attempts actually made for this candidate. It is
+	// measured at the request site, never inferred from the verdict.
+	Attempts int `json:"http_attempts"`
+	// JEVSent and LLMSent say whether that provider was asked at all, so
+	// "the second reviewer disagreed" cannot be confused with "it never ran".
+	JEVSent bool `json:"jev_sent"`
+	LLMSent bool `json:"minimax_sent"`
+	// CostStatus is what is known about this candidate's provider cost:
+	// not_sent, unknown, or usage_recorded (token counts arrived; the amount
+	// still depends on billing evidence).
+	CostStatus string `json:"cost_status"`
+}
+
+// Attempted reports whether any provider request was made for this candidate.
+func (d Decision) Attempted() bool { return d.Attempts > 0 }
+
+// NotStarted reports that the review never began, so nothing was sent and
+// nothing can have been billed.
+func (d Decision) NotStarted() bool {
+	return d.Failure == FailureRunBudget || d.Failure == FailureBatchBudget
 }
 
 type Judge interface {

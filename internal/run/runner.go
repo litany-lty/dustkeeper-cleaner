@@ -68,8 +68,14 @@ type ScopeRun struct {
 	// It is read from the objects themselves, not from the policy: a rule that
 	// promised thirty days and a policy that observes fourteen produce one
 	// date, and the message has to state that date.
-	EarliestPurgeNS *int64 `json:"earliest_purge_ns,omitempty"`
-	DueNotAuthorised  int    `json:"due_but_not_authorised"`
+	EarliestPurgeNS  *int64 `json:"earliest_purge_ns,omitempty"`
+	DueNotAuthorised int    `json:"due_but_not_authorised"`
+	// NotStarted counts candidates whose review never began because an
+	// allowance was gone, and UnknownHeld counts candidates not asked again
+	// because an earlier request for them is still unresolved. They are not
+	// keeps: neither got an answer.
+	NotStarted  int `json:"review_not_started"`
+	UnknownHeld int `json:"review_unknown_held"`
 	// ExpirySkipped names the due objects the expiry review refused, with the
 	// reason each one was refused. It is a list rather than a count because "three
 	// objects were skipped" cannot be acted on: "the place is in use again" and
@@ -81,8 +87,8 @@ type ScopeRun struct {
 	// what makes them true.
 	Notification *notify.Result `json:"notification,omitempty"`
 	IdentityWeak string         `json:"root_identity_weak,omitempty"`
-	Control           string `json:"control,omitempty"`
-	Message           string `json:"message,omitempty"`
+	Control      string         `json:"control,omitempty"`
+	Message      string         `json:"message,omitempty"`
 	// FailureCode names why this scope's work stopped, on the scope's own row.
 	// The run-level failure code only carries the first one, so with two failing
 	// scopes the second reason had nowhere to appear.
@@ -91,20 +97,24 @@ type ScopeRun struct {
 
 // Report is the machine-readable result of `run`.
 type Report struct {
-	RunID           string          `json:"run_id"`
-	ClockTrusted    bool            `json:"clock_trusted"`
-	ClockNote       string          `json:"clock_note,omitempty"`
-	Reconciliation  recovery.Report `json:"reconciliation"`
-	Scopes          []ScopeRun      `json:"scopes"`
-	Quarantined     int             `json:"quarantined_total"`
-	Purged          int             `json:"purged_total"`
-	ReadBytes       int64           `json:"read_bytes"`
-	DiskFreeBefore  uint64          `json:"disk_free_bytes_before"`
-	DiskFreeAfter   uint64          `json:"disk_free_bytes_after"`
-	DiskPressure    bool            `json:"disk_pressure"`
-	PressureNote    string          `json:"disk_pressure_note,omitempty"`
-	Control         string          `json:"control"`
-	UntouchedScopes int             `json:"scopes_not_reached"`
+	RunID          string          `json:"run_id"`
+	ClockTrusted   bool            `json:"clock_trusted"`
+	ClockNote      string          `json:"clock_note,omitempty"`
+	Reconciliation recovery.Report `json:"reconciliation"`
+	Scopes         []ScopeRun      `json:"scopes"`
+	Quarantined    int             `json:"quarantined_total"`
+	// ReviewNotStarted and ReviewUnknownHeld aggregate the per-scope review
+	// states, so "how much of this run was never asked" is one number.
+	ReviewNotStarted  int    `json:"review_not_started_total"`
+	ReviewUnknownHeld int    `json:"review_unknown_held_total"`
+	Purged            int    `json:"purged_total"`
+	ReadBytes         int64  `json:"read_bytes"`
+	DiskFreeBefore    uint64 `json:"disk_free_bytes_before"`
+	DiskFreeAfter     uint64 `json:"disk_free_bytes_after"`
+	DiskPressure      bool   `json:"disk_pressure"`
+	PressureNote      string `json:"disk_pressure_note,omitempty"`
+	Control           string `json:"control"`
+	UntouchedScopes   int    `json:"scopes_not_reached"`
 	// ClockReassessed says the verdict changed between the start and the end of
 	// the run. It is reported so that "the clock looked fine at 09:00" cannot be
 	// read as "the clock was fine all morning".
@@ -239,8 +249,16 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 			result.Message = runErr.Error()
 			result.FailureCode = errs.CodeOf(runErr)
 			rep.Failures = append(rep.Failures, string(sc.ID)+": "+runErr.Error())
+			code := errs.CodeOf(runErr)
+			if code == errs.CodeBudgetExhausted && (result.Purged+result.Quarantined > 0 ||
+				rep.Purged+rep.Quarantined > 0) {
+				// Part of this run already acted. "Ran out of its allowance" is
+				// then a partial completion, not a clean zero-action run, and the
+				// exit status must say so.
+				code = errs.CodePartial
+			}
 			if rep.FailureCode == "" {
-				rep.FailureCode = errs.CodeOf(runErr)
+				rep.FailureCode = code
 			}
 			rep.Control = strongerControl(rep.Control, ControlOfError(runErr))
 		}
@@ -250,6 +268,8 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		r.tellUser(ctx, &result)
 		rep.Scopes = append(rep.Scopes, result)
 		rep.Quarantined += result.Quarantined
+		rep.ReviewNotStarted += result.NotStarted
+		rep.ReviewUnknownHeld += result.UnknownHeld
 		rep.Purged += result.Purged
 		rep.Control = strongerControl(rep.Control, result.Control)
 		if rep.Control == domain.ControlStopRun {
@@ -349,6 +369,8 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, pol cleanup.Polic
 	} else {
 		purge := r.purgeDue(ctx, sctx, runLedger, pLedger, shared, grants, guard)
 		sr.Purged, sr.PurgedBytes, sr.DueNotAuthorised = purge.Purged, purge.Bytes, purge.Refused
+		sr.NotStarted += purge.NotStarted
+		sr.UnknownHeld += purge.UnknownHeld
 		sr.ExpirySkipped = purge.Skipped
 		if purge.Note != "" {
 			sr.PurgeSkipped = purge.Note
@@ -405,6 +427,8 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, pol cleanup.Polic
 
 	q := r.quarantineGrants(ctx, sctx, guardSet, runLedger, qLedger, pLedger, shared, grants)
 	sr.Quarantined, sr.QuarantinedBytes = q.Moved, q.MovedBytes
+	sr.NotStarted += q.NotStarted
+	sr.UnknownHeld += q.UnknownHeld
 	sr.Purged += q.Purged
 	sr.PurgedBytes += q.PurgedBytes
 	sr.EarliestPurgeNS = q.EarliestPurgeNS
@@ -418,10 +442,12 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, pol cleanup.Polic
 // explain itself: the count of objects that were left alone and the reasons they
 // were left alone belong to the same answer.
 type purgeOutcome struct {
-	Purged  int
-	Bytes   int64
-	Refused int
-	Skipped []string
+	NotStarted  int
+	UnknownHeld int
+	Purged      int
+	Bytes       int64
+	Refused     int
+	Skipped     []string
 	// Note explains a phase-level refusal, such as a reminder that could not be
 	// delivered. It is not a per-object reason, so it is not in Skipped.
 	Note    string
@@ -596,13 +622,16 @@ collect:
 		bytes += itemSize(it)
 	}
 
+	reviewState := purgeReviewState(res)
 	if err != nil {
 		return purgeOutcome{Purged: res.Completed, Refused: refused, Skipped: skipped,
+			NotStarted: res.NotStarted, UnknownHeld: reviewState,
 			Control: ControlOfError(err), Err: err}
 	}
 
 	if stopErr := batchStop(res); stopErr != nil {
 		return purgeOutcome{Purged: res.Completed, Bytes: bytes, Refused: refused, Skipped: skipped,
+			NotStarted: res.NotStarted, UnknownHeld: reviewState,
 			Control: strongerControl(res.Control, ControlOfError(stopErr)), Err: stopErr}
 	}
 	return purgeOutcome{Purged: res.Completed, Bytes: bytes, Refused: refused, Skipped: skipped,
@@ -971,6 +1000,8 @@ func CurrentEpoch(ctx context.Context, st *store.Store, id domain.ScopeID) (int6
 // user was told a deleted file was waiting in the observation area to be
 // restored.
 type quarantineOutcome struct {
+	NotStarted      int
+	UnknownHeld     int
 	Moved           int
 	MovedBytes      int64
 	Purged          int
@@ -1109,7 +1140,14 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 			WithShared(shared).WithGrant(pgLedger)
 		applied, err := r.Exec.ApplyQuarantinePlanWithBudgets(ctx, sc, res.Plan.ID, res.Plan.Digest, phase, purgePhase)
 		out.Control = strongerControl(out.Control, applied.Control)
+		out.NotStarted += applied.NotStarted
 		for _, result := range applied.Results {
+			switch result.ReviewState {
+			case domain.ReviewUnknownHold:
+				out.UnknownHeld++
+			case domain.ReviewUnknownResult:
+				out.UnknownHeld++
+			}
 			if result.Code != string(errs.CodeOK) {
 				continue
 			}
@@ -1149,6 +1187,17 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 		}
 	}
 	return out
+}
+
+// purgeReviewState counts the expiry reviews that produced no answer.
+func purgeReviewState(res execute.ApplyResult) int {
+	n := 0
+	for _, r := range res.Results {
+		if r.ReviewState == domain.ReviewUnknownHold || r.ReviewState == domain.ReviewUnknownResult {
+			n++
+		}
+	}
+	return n
 }
 
 // BuildGuard resolves protection identities with the kernel. The work is done in
@@ -1335,7 +1384,8 @@ func strongerControl(a, b string) string {
 
 func ControlOfError(err error) string {
 	switch errs.CodeOf(err) {
-	case errs.CodeReviewRequired, errs.CodeModelUnavailable, errs.CodePaused, errs.CodeHeld, errs.CodeScopeChanged, errs.CodeProtectionAliasUnresolved:
+	case errs.CodeReviewRequired, errs.CodeModelUnavailable, errs.CodePaused, errs.CodeHeld, errs.CodeScopeChanged,
+		errs.CodeProtectionAliasUnresolved, errs.CodeBudgetExhausted:
 		return domain.ControlStopScope
 	case errs.CodePlanStale, errs.CodePlanExpired:
 		return domain.ControlStopPlan

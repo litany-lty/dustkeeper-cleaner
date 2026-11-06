@@ -25,6 +25,8 @@ func (s *Service) Triage(ctx context.Context, r Request) (Outcome, error) {
 		Action:        r.Action,
 		Verdict:       d.Verdict,
 		ModelFailed:   d.ModelError != "",
+		Failure:       d.Failure,
+		Attempted:     d.Attempted(),
 		FactsComplete: r.FactsComplete,
 		Movable:       r.Movable,
 		Authorized:    r.Authorized,

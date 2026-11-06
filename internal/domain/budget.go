@@ -49,6 +49,20 @@ func (l *RunLedger) ReadUp() bool {
 	return l != nil && l.MaxRead > 0 && l.Read >= l.MaxRead
 }
 
+// Remaining reports the unspent part of the time slice at mono. A ledger with no
+// soft time has no task clock, and reports an effectively unbounded remainder so
+// a caller's "can I fit one more review" question is answered by its own batch
+// allowance instead.
+func (l *RunLedger) Remaining(mono time.Duration) time.Duration {
+	if l == nil || l.SoftTime <= 0 {
+		return time.Duration(1<<62 - 1)
+	}
+	if mono >= l.SoftTime {
+		return 0
+	}
+	return l.SoftTime - mono
+}
+
 // ReadExceeded reports whether completed reads went beyond the allowance.
 // Readers charge a data chunk before they can observe the EOF that follows it,
 // so equality fits even though it closes the gate for the next unit of work.

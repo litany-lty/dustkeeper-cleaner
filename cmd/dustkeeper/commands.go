@@ -722,6 +722,14 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 		for _, s := range rep.Scopes {
 			res.Human = append(res.Human, fmt.Sprintf("  %-18s scanned=%d complete=%v quarantined=%d purged=%d",
 				s.Scope, s.Scanned, s.ScanComplete, s.Quarantined, s.Purged))
+			// Reviews that produced no decision are named separately. "kept"
+			// would claim an answer nobody gave, and a silent count would leave
+			// the operator unable to tell a budget stop from an outage.
+			if s.NotStarted > 0 || s.UnknownHeld > 0 {
+				res.Human = append(res.Human, fmt.Sprintf(
+					"      reviews not started: %d; unanswered earlier requests not repeated: %d",
+					s.NotStarted, s.UnknownHeld))
+			}
 			// The two phases have separate reasons now, so they get separate
 			// lines: "disk pressure" explains a missing quarantine and must not
 			// look like it also stopped a purge that actually ran.
@@ -943,10 +951,12 @@ func (a *app) registrar() *scope.Registrar {
 }
 
 func (a *app) executor() *execute.Executor {
+	rev := a.reviewer()
 	return &execute.Executor{
-		Review: a.reviewer(),
-		Store:  a.store,
-		Clock:  a.clock,
+		Review:       rev.reviewerFunc(),
+		ReviewBudget: rev,
+		Store:        a.store,
+		Clock:        a.clock,
 		Config: execute.ConfigView{
 			BufferBytes:    a.cfg.Runtime.IOBufferBytes,
 			ReadRatePerSec: a.cfg.Runtime.ReadRateBytesPerSecond,

@@ -15,16 +15,20 @@ import (
 // be reported through the error channel only, so a runner that saw nil went on
 // to hand the same scope to the next rule.
 type ApplyResult struct {
-	Plan      domain.PlanID            `json:"plan_id"`
-	Status    string                   `json:"status"`
-	Planned   int                      `json:"planned_count"`
-	Completed int                      `json:"completed_count"`
-	Skipped   int                      `json:"skipped_count"`
-	Failed    int                      `json:"failed_count"`
-	Control   string                   `json:"control"`
-	Results   []domain.OperationResult `json:"results"`
-	Code      string                   `json:"code"`
-	Message   string                   `json:"message,omitempty"`
+	Plan      domain.PlanID `json:"plan_id"`
+	Status    string        `json:"status"`
+	Planned   int           `json:"planned_count"`
+	Completed int           `json:"completed_count"`
+	Skipped   int           `json:"skipped_count"`
+	Failed    int           `json:"failed_count"`
+	Control   string        `json:"control"`
+	// NotStarted counts members whose review never began because an allowance
+	// was gone. They are not failures of an action: nothing was sent and no
+	// file was touched.
+	NotStarted int                      `json:"not_started_count"`
+	Results    []domain.OperationResult `json:"results"`
+	Code       string                   `json:"code"`
+	Message    string                   `json:"message,omitempty"`
 }
 
 // stopCodes end a batch. They mean the world stopped matching the plan, or
@@ -42,6 +46,7 @@ func stopCode(code string) bool {
 		string(errs.CodeClockUntrusted),
 		string(errs.CodeProtectionAliasUnresolved),
 		string(errs.CodeUnsupportedMetadata),
+		string(errs.CodeBudgetExhausted),
 		string(errs.CodePaused):
 		return true
 	}
@@ -124,6 +129,10 @@ func (e *Executor) ApplyQuarantinePlanWithBudgets(ctx context.Context, sc *Scope
 	}
 	out.Planned = len(items)
 
+	// One plan is one batch of reviews. Opening it here is what makes the
+	// allowance per dispatch rather than per command, without giving any scope
+	// a way to reset the task's own budget.
+	defer e.beginBatch(qBudget)()
 	resuming := p.Status == domain.PlanPartial
 	if err := e.Store.SetPlanStatus(ctx, p.ID, domain.PlanApplying); err != nil {
 		return out, err
@@ -161,6 +170,9 @@ func (e *Executor) ApplyQuarantinePlanWithBudgets(ctx context.Context, sc *Scope
 			// sees failed_count rise and every result row carry an empty code, so
 			// "which item, and why" is only answerable by re-running the command.
 			res = annotateFailure(res, execErr)
+			if res.ReviewState == domain.ReviewNotStartedBudget {
+				out.NotStarted++
+			}
 			res.Control = strongerControl(res.Control, ControlOf(string(errs.CodeOf(execErr))))
 			out.Results = append(out.Results, res)
 			code := errs.CodeOf(execErr)
@@ -168,11 +180,21 @@ func (e *Executor) ApplyQuarantinePlanWithBudgets(ctx context.Context, sc *Scope
 				stopped = true
 				out.Code = string(code)
 				out.Message = execErr.Error()
-				out.Control = strongerControl(out.Control, ControlOf(out.Code))
+				// The item knows how far the stop reaches: a batch that ran out
+				// of its own allowance stops the scope, one that ran out of the
+				// task's stops the run. Deriving it from the code alone lost that
+				// difference.
+				out.Control = strongerControl(out.Control, res.Control)
+				if out.Control == domain.ControlContinue {
+					out.Control = ControlOf(out.Code)
+				}
 			}
 			continue
 		}
 		out.Results = append(out.Results, res)
+		if res.ReviewState == domain.ReviewNotStartedBudget {
+			out.NotStarted++
+		}
 		switch res.Code {
 		case string(errs.CodeOK):
 			out.Completed++
@@ -188,6 +210,12 @@ func (e *Executor) ApplyQuarantinePlanWithBudgets(ctx context.Context, sc *Scope
 	out.Status = summarise(out)
 	if err := e.Store.SetPlanStatus(ctx, p.ID, out.Status); err != nil {
 		return out, err
+	}
+	// A budget stop after some members completed is a partial completion, not a
+	// separate condition: the exit status has to say "part of this ran", which is
+	// what the caller acts on.
+	if out.Code == string(errs.CodeBudgetExhausted) && out.Completed > 0 {
+		out.Code = string(errs.CodePartial)
 	}
 	// A specific stop code (PAUSED, HELD, PLAN_STALE, ...) is more useful than
 	// the generic PARTIAL: the caller's exit status depends on which condition
@@ -292,6 +320,9 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 		if execErr != nil {
 			out.Failed++
 			res = annotateFailure(res, execErr)
+			if res.ReviewState == domain.ReviewNotStartedBudget {
+				out.NotStarted++
+			}
 			res.Control = strongerControl(res.Control, ControlOf(string(errs.CodeOf(execErr))))
 			out.Results = append(out.Results, res)
 			code := errs.CodeOf(execErr)
@@ -314,6 +345,15 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 	out.Status = summarise(out)
 	if err := e.Store.SetPlanStatus(ctx, p.ID, out.Status); err != nil {
 		return out, err
+	}
+	// A budget stop after some members completed is a partial completion, not a
+	// separate condition: the exit status has to say "part of this ran", which is
+	// what the caller acts on.
+	if out.Code == string(errs.CodeBudgetExhausted) && out.Completed > 0 {
+		out.Code = string(errs.CodePartial)
+	}
+	if out.Code == string(errs.CodeBudgetExhausted) && out.Completed > 0 {
+		out.Code = string(errs.CodePartial)
 	}
 	// A specific stop code (PAUSED, HELD, PLAN_STALE, ...) is more useful than
 	// the generic PARTIAL: the caller's exit status depends on which condition

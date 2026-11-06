@@ -27,6 +27,12 @@ var Schema002 string
 //go:embed 003.sql
 var Schema003 string
 
+// Schema004 records review requests that were sent and produced no answer, so
+// the next run does not pay for the same question twice.
+//
+//go:embed 004.sql
+var Schema004 string
+
 // Step is one forward migration.
 type Step struct {
 	Version int
@@ -40,10 +46,11 @@ var Steps = []Step{
 	{Version: 1, SQL: Schema001, Note: "baseline"},
 	{Version: 2, SQL: Schema002, Note: "park phase, purge cursor index"},
 	{Version: 3, SQL: Schema003, Note: "failed scan dirs, claim order, interrupt count"},
+	{Version: 4, SQL: Schema004, Note: "unresolved review requests"},
 }
 
 // CurrentVersion is the schema version this binary writes and expects.
-const CurrentVersion = 3
+const CurrentVersion = 4
 
 // For returns the steps needed to move a database from `from` to
 // CurrentVersion.

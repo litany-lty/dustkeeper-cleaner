@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -53,6 +54,38 @@ type Endpoint struct {
 	APIKey      string
 }
 
+// Attempts is the request fact the cost and control decisions need: how many
+// requests actually left this process, per provider. It is counted where the
+// request is made, not derived from a verdict.
+type Attempts struct {
+	JEV      int `json:"jev"`
+	MiniMax  int `json:"minimax"`
+	Attempts int `json:"attempts"`
+}
+
+// RequestFailure classifies one failed provider call. The kind decides the
+// control range (batch or run) and whether the request may already have been
+// billed; the wrapped error keeps the message a person reads.
+type RequestFailure struct {
+	Kind     string
+	Provider string
+	Status   int
+	Err      error
+}
+
+func (f *RequestFailure) Error() string {
+	if f.Err != nil {
+		return f.Err.Error()
+	}
+	return "model request failed"
+}
+
+func (f *RequestFailure) Unwrap() error { return f.Err }
+
+func failure(kind, provider string, status int, err error) error {
+	return &RequestFailure{Kind: kind, Provider: provider, Status: status, Err: err}
+}
+
 // HTTPJudge performs the independent JEV and MiniMax reviews.
 type HTTPJudge struct {
 	// MaxCalls is optional; zero preserves the ordinary caller's existing limits.
@@ -60,6 +93,8 @@ type HTTPJudge struct {
 	// ReviewBoth requests an independent diagnostic second opinion in debug.
 	ReviewBoth bool
 	calls      atomic.Int64
+	jevCalls   atomic.Int64
+	mmCalls    atomic.Int64
 	jev        Endpoint
 	minimax    Endpoint
 	client     *http.Client
@@ -67,6 +102,12 @@ type HTTPJudge struct {
 	// Zero means "use the constants above"; see Thresholds.
 	minConfidence       float64
 	minAllowProbability float64
+}
+
+// Stats reports the requests this judge has attempted.
+func (j *HTTPJudge) Stats() Attempts {
+	jev, mm := int(j.jevCalls.Load()), int(j.mmCalls.Load())
+	return Attempts{JEV: jev, MiniMax: mm, Attempts: jev + mm}
 }
 
 // SetThresholds calibrates the gate that lets JEV authorise an action.
@@ -810,11 +851,11 @@ func (j *HTTPJudge) postJSON(ctx context.Context, endpoint Endpoint, payload any
 	var timing *requestTiming
 	attempted := false
 	outcome := "transport_error"
+	provider := "jev"
+	if anthropic {
+		provider = "minimax"
+	}
 	if batch, ok := ctx.Value(timingKey{}).(*timingBatch); ok {
-		provider := "jev"
-		if anthropic {
-			provider = "minimax"
-		}
 		timing = newRequestTiming(provider)
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), timing.hooks()))
 		defer func() {
@@ -826,42 +867,82 @@ func (j *HTTPJudge) postJSON(ctx context.Context, endpoint Endpoint, payload any
 	for {
 		used := j.calls.Load()
 		if j.MaxCalls > 0 && used >= int64(j.MaxCalls) {
-			return nil, errors.New("model call budget exhausted")
+			return nil, failure(FailureRunBudget, provider, 0, errors.New("model call budget exhausted"))
 		}
 		if j.calls.CompareAndSwap(used, used+1) {
 			break
 		}
 	}
 	attempted = true
+	// The attempt is counted where it is made, before the connection is tried:
+	// a request that fails to connect was still dispatched, and the difference
+	// between "dispatched" and "not dispatched" is exactly what the cost state
+	// depends on.
+	if anthropic {
+		j.mmCalls.Add(1)
+	} else {
+		j.jevCalls.Add(1)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		outcome = transportFailureKind(err)
+		k := classifyClientError(err, client.Timeout)
 		if timing != nil {
-			return nil, timing.failure(err)
+			return nil, failure(k, provider, 0, timing.failure(err))
 		}
 		// Without a timing recorder the caller still has to know whether this
 		// was a timeout, a cancellation or a transport failure: the recorded
 		// reason is the only trace left after the call.
-		return nil, errors.New(transportFailureReason(err, client.Timeout))
+		return nil, failure(k, provider, 0, errors.New(transportFailureReason(err, client.Timeout)))
 	}
 	outcome = fmt.Sprintf("http_%d", resp.StatusCode)
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("model endpoint returned HTTP %d", resp.StatusCode)
+		kind := FailureProvider
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			kind = FailureAuth
+		}
+		return nil, failure(kind, provider, resp.StatusCode,
+			fmt.Errorf("model endpoint returned HTTP %d", resp.StatusCode))
 	}
 	limited := io.LimitReader(resp.Body, maxJudgeResponse+1)
 	raw, err := io.ReadAll(limited)
 	if err != nil {
 		outcome = transportFailureKind(err)
+		k := classifyClientError(err, client.Timeout)
 		if timing != nil {
-			return nil, timing.failure(err)
+			return nil, failure(k, provider, 0, timing.failure(err))
 		}
-		return nil, errors.New("read model response")
+		return nil, failure(k, provider, 0, errors.New("read model response"))
 	}
 	if len(raw) > maxJudgeResponse {
 		outcome = "response_too_large"
-		return nil, fmt.Errorf("model response exceeds %d bytes", maxJudgeResponse)
+		return nil, failure(FailureResponse, provider, resp.StatusCode,
+			fmt.Errorf("model response exceeds %d bytes", maxJudgeResponse))
 	}
 	outcome = "ok"
 	return raw, nil
+}
+
+// classifyClientError turns a transport error into one of the failure kinds.
+//
+// net/http reports every exhausted deadline as a plain *url.Error whose message
+// differs by platform. Asking the error tree is the only portable way to tell
+// "we waited and gave up" from "the connection was refused": only the first one
+// may already have been billed.
+func classifyClientError(err error, timeout time.Duration) string {
+	if err == nil {
+		return FailureTransport
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return FailureTimeout
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return FailureTimeout
+	}
+	if timeout > 0 && strings.Contains(err.Error(), "Client.Timeout exceeded") {
+		return FailureTimeout
+	}
+	return FailureTransport
 }

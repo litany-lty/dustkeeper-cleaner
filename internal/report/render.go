@@ -103,11 +103,12 @@ func Render(page Page) string {
 	b.WriteString("# 本轮清理结果\n\n")
 	fmt.Fprintf(&b, "生成时间：%s\n\n", time.Unix(0, page.GeneratedAtNS).Format("2006-01-02 15:04:05 -07:00"))
 	fmt.Fprintf(&b, "统计区间：%s 至 %s\n\n",
-		time.Unix(0, page.WindowStartNS).Format("2006-01-02 15:04:05"),
-		time.Unix(0, page.WindowEndNS).Format("2006-01-02 15:04:05"))
+		time.Unix(0, page.WindowStartNS).Format("2006-01-02 15:04:05 -07:00"),
+		time.Unix(0, page.WindowEndNS).Format("2006-01-02 15:04:05 -07:00"))
 	if page.RunID != "" {
 		fmt.Fprintf(&b, "运行编号：`%s`\n\n", page.RunID)
 	}
+	writeReviewSummary(&b, page.Summary)
 
 	fmt.Fprintf(&b, "## 已删除（%d）\n\n", page.Deleted.Total)
 	if page.Deleted.Total == 0 {
@@ -150,10 +151,7 @@ func Render(page Page) string {
 		b.WriteString("| 原路径 | 大小 | 保留时间 | 保留原因 | 接口失败或缺依据 |\n|---|---:|---|---|---|\n")
 		for _, e := range page.Kept.Entries {
 			why := mdCell(reasonOf(e))
-			flag := ""
-			if e.ModelFailed {
-				flag = "模型服务失败，判断未完成"
-			}
+			flag := reviewFlag(e)
 			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n",
 				mdCode(e.Path), humanBytes(e.SizeBytes),
 				time.Unix(0, e.AtNS).Format("2006-01-02 15:04:05"), why, flag)
@@ -161,6 +159,52 @@ func Render(page Page) string {
 		writeMore(&b, page.Kept)
 	}
 	return b.String()
+}
+
+// writeReviewSummary states the reviews that produced no decision. Without it a
+// page of keeps reads as "the models said no" even when nothing was ever asked.
+func writeReviewSummary(b *strings.Builder, s Summary) {
+	if s.NotStarted == 0 && s.UnknownHeld == 0 && s.ReviewFailed == 0 && s.CostUnknown == 0 {
+		return
+	}
+	b.WriteString("## 本轮审核\n\n")
+	fmt.Fprintf(b, "- 已取得判断：%d\n", s.Reviewed)
+	if s.NotStarted > 0 {
+		fmt.Fprintf(b, "- 未开始（预算用完，未发出请求）：%d\n", s.NotStarted)
+	}
+	if s.ReviewFailed > 0 {
+		fmt.Fprintf(b, "- 请求未取得结果（文件未动）：%d\n", s.ReviewFailed)
+	}
+	if s.UnknownHeld > 0 {
+		fmt.Fprintf(b, "- 上次请求结果未知，本轮未重复请求：%d\n", s.UnknownHeld)
+	}
+	if s.CostUnknown > 0 {
+		fmt.Fprintf(b, "- 费用未知（不能按 0 计）：%d\n", s.CostUnknown)
+	}
+	fmt.Fprintf(b, "- 本窗口 HTTP 尝试：%d 次\n\n", s.Attempts)
+}
+
+// reviewFlag is the one-line explanation of why a file was kept, when the reason
+// is a review condition rather than a model opinion.
+func reviewFlag(e Entry) string {
+	switch e.Reason {
+	case "not_started_budget":
+		return "预算用完，审核未开始"
+	case "review_unknown":
+		return "请求已发出但无结果；费用未知"
+	case "awaiting_request_check":
+		return "上次请求结果未知，未重复请求"
+	}
+	if !e.ModelFailed {
+		return ""
+	}
+	switch e.Failure {
+	case "timeout":
+		return "模型请求超时，判断未完成"
+	case "auth", "provider":
+		return "模型接口拒绝或出错，判断未完成"
+	}
+	return "模型服务失败，判断未完成"
 }
 
 // writeMore prints the remainder line R30 asks for.

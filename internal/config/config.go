@@ -18,6 +18,8 @@ import (
 	"strings"
 	"unicode"
 
+	"time"
+
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/review"
 	"dustkeeper/internal/strictjson"
@@ -87,7 +89,12 @@ func Default() Config {
 			IOWorkers:              1,
 			IOBufferBytes:          mib,
 			ReadRateBytesPerSecond: 20 * mib,
-			RunSoftSeconds:         60,
+			// Five minutes, not one. One dual review path may legitimately use
+			// two provider timeouts plus the batch reserve; a one-minute slice
+			// could not contain it, and the honest answer to "can this candidate
+			// be reviewed" would then be "no" for every candidate. Validation
+			// below refuses a slice that cannot fit the configured path.
+			RunSoftSeconds:         300,
 			RunReadBudgetBytes:     gib,
 			MaxAutoQuarantineFiles: 100,
 			MaxAutoQuarantineBytes: gib,
@@ -209,6 +216,19 @@ func (c Config) Validate() error {
 
 	if err := c.Review.Validate(); err != nil {
 		return err
+	}
+	// The task slice has to contain at least one full review path plus the
+	// reserve. Keeping a 60-second run around a 30+30 second double call left the
+	// second half permanently abandoned, and the run reported it as a provider
+	// outage.
+	if c.Review != nil {
+		limits := c.Review.Limits()
+		need := int((2*c.Review.Timeout() + limits.Reserve + time.Second - 1) / time.Second)
+		if r.RunSoftSeconds < need {
+			return errs.Newf(errs.CodeInvalidArgument,
+				"runtime.run_soft_seconds (%d) cannot contain one dual review path plus reserve (%d); raise it or lower review.timeout_seconds",
+				r.RunSoftSeconds, need)
+		}
 	}
 	if c.Model != nil {
 		return c.Model.validate()

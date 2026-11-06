@@ -209,7 +209,7 @@ func (e *Executor) scopeGate(ctx context.Context, sc *ScopeCtx) error {
 func ControlOf(code string) string {
 	switch code {
 	case string(errs.CodeReviewRequired), string(errs.CodeModelUnavailable), string(errs.CodePaused), string(errs.CodeHeld), string(errs.CodeScopeChanged),
-		string(errs.CodeProtectionAliasUnresolved):
+		string(errs.CodeProtectionAliasUnresolved), string(errs.CodeBudgetExhausted):
 		return domain.ControlStopScope
 	case string(errs.CodePlanStale), string(errs.CodePlanExpired), string(errs.CodeDigestMismatch):
 		return domain.ControlStopPlan

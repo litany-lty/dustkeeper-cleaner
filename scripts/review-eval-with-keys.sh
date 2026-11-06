@@ -305,7 +305,10 @@ cfg = {
         "io_workers": 1,
         "io_buffer_bytes": 1048576,
         "read_rate_bytes_per_second": 20971520,
-        "run_soft_seconds": 60,
+        # 300, not 60: one dual review path may legitimately use two provider
+        # timeouts (60+60) plus the batch reserve. A 60-second slice cannot
+        # contain it, and the run would refuse to start every candidate.
+        "run_soft_seconds": 300,
         "run_read_budget_bytes": 1073741824,
         "max_auto_quarantine_files": 100,
         "max_auto_quarantine_bytes": 2147483648,

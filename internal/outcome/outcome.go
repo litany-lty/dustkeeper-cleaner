@@ -35,6 +35,17 @@ const (
 	ReasonSafeToObserve = "safe_to_observe"
 	// ReasonDualReviewAgrees — both reviewers allowed permanent deletion.
 	ReasonDualReviewAgrees = "dual_review_agrees"
+	// ReasonNotStartedBudget — the review never began because an allowance was
+	// gone. Nothing was sent, so nothing can have been billed, and this is not a
+	// provider outage.
+	ReasonNotStartedBudget = "not_started_budget"
+	// ReasonReviewUnknown — a request was sent and no complete answer came back.
+	// The file stays, and the cost of that request is unknown rather than zero.
+	ReasonReviewUnknown = "review_unknown"
+	// ReasonRequestCheckHold — an earlier request for this same object and
+	// action still has an unknown result, so no new request is made until a
+	// person resolves it.
+	ReasonRequestCheckHold = "awaiting_request_check"
 )
 
 // ReasonText renders a reason for the result page. It is presentation, but it
@@ -58,10 +69,24 @@ func ReasonText(reason string) string {
 		return "可安全移动，进入观察区"
 	case ReasonDualReviewAgrees:
 		return "双模型同意永久删除"
+	case ReasonNotStartedBudget:
+		return "审核预算已用完，本轮未开始审核"
+	case ReasonReviewUnknown:
+		return "请求已发出但未取得结果；文件未动，费用未知"
+	case ReasonRequestCheckHold:
+		return "同一对象上次请求结果未知，未再次请求，等待核查"
 	default:
 		return reason
 	}
 }
+
+// Review failure kinds this package needs to distinguish. They are duplicated
+// from the review package because outcome deliberately imports only domain;
+// TestFailureKindsMatchTheReviewPackage keeps the two spellings equal.
+const (
+	ReviewFailureRunBudget   = "run_budget"
+	ReviewFailureBatchBudget = "batch_budget"
+)
 
 // Inputs is everything the decision uses. Local facts decide whether an action
 // can be taken at all; the models can only veto or authorise.
@@ -71,8 +96,17 @@ type Inputs struct {
 	Action string
 	// Verdict is the normalised answer (domain.VerdictAllow and friends).
 	Verdict string
-	// ModelFailed reports that the review did not complete.
+	// ModelFailed reports that the review did not complete. It is the fallback
+	// for a failure that carries no structured kind.
 	ModelFailed bool
+	// Failure is the structured reason the review produced no verdict. It is
+	// what separates "we never asked" from "we asked and do not know".
+	Failure string
+	// Attempted reports that at least one request was actually sent.
+	Attempted bool
+	// HeldUnknown reports that an earlier request for this object and action
+	// still has an unknown result, so this run did not ask again.
+	HeldUnknown bool
 	// FactsComplete reports that every fact the decision needs was measured.
 	FactsComplete bool
 	// Movable reports that local checks established reversible isolation is
@@ -97,6 +131,18 @@ type Inputs struct {
 //  6. everything else that is movable is observed, not deleted.
 func Decide(in Inputs) (disposition, reason string) {
 	switch {
+	case in.HeldUnknown:
+		// A standing unknown is not a new answer: the object was not asked
+		// about again, and calling that "kept by the model" would hide the
+		// unresolved request behind a decision nobody made.
+		return domain.DispositionKeep, ReasonRequestCheckHold
+	case in.Failure == ReviewFailureRunBudget || in.Failure == ReviewFailureBatchBudget:
+		// An allowance that stopped the dispatch is not a provider condition.
+		return domain.DispositionKeep, ReasonNotStartedBudget
+	case in.Failure != "" && in.Attempted:
+		// The request was dispatched and the answer is unknown. The file stays,
+		// and the cost stays unknown until provider evidence says otherwise.
+		return domain.DispositionKeep, ReasonReviewUnknown
 	case in.ModelFailed:
 		return domain.DispositionKeep, ReasonReviewUnavailable
 	case !in.FactsComplete:

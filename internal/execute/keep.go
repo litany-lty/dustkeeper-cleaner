@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"strconv"
+
 	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
@@ -33,16 +35,7 @@ func (e *Executor) keepItem(ctx context.Context, sc *ScopeCtx, p store.Plan, it 
 func (e *Executor) recordKeep(ctx context.Context, sc *ScopeCtx, it store.Item, planID *domain.PlanID, reviewed review.Outcome) (domain.OperationResult, error) {
 	res := domain.OperationResult{Item: it.ID, State: it.State, Control: domain.ControlContinue, Evidence: domain.EvidenceNotStarted}
 
-	payload := `{"source":"decision","disposition":` + quoteJSON(domain.DispositionKeep) +
-		`,"reason":` + quoteJSON(reviewed.Reason) +
-		`,"reason_text":` + quoteJSON(outcome.ReasonText(reviewed.Reason)) +
-		`,"verdict":` + quoteJSON(reviewed.Decision.Verdict) +
-		`,"model_error":` + quoteJSON(reviewed.Decision.ModelError) +
-		// The version this decision was about. Without it a later run can only
-		// ask "was this path kept", which would also silence a different file
-		// that has since been created at the same place.
-		`,"identity":` + quoteJSON(it.PreIdentityJSON) +
-		`,"token":` + quoteJSON(it.PreTokenJSON) + `}`
+	payload := reviewPayload(reviewed, it)
 	ruleDigest := ""
 	if binding, berr := PlanBindingOf(it); berr == nil && binding.RuleDigest != nil {
 		ruleDigest = *binding.RuleDigest
@@ -67,7 +60,37 @@ func (e *Executor) recordKeep(ctx context.Context, sc *ScopeCtx, it store.Item, 
 	// it is the one keep reason that must not be reported as a finished run:
 	// every further item would fail the same way, and telling the user
 	// "0 deleted" would describe an outage as a clean sweep.
-	if reviewed.Reason == outcome.ReasonReviewUnavailable {
+	switch reviewed.Reason {
+	case outcome.ReasonNotStartedBudget:
+		// The allowance stopped the dispatch. Nothing was sent, so this is not a
+		// provider outage and must not be reported as one: the remaining work of
+		// this batch simply has not started.
+		res.Code = string(errs.CodeBudgetExhausted)
+		res.Message = "review was not started: " + reviewed.Decision.ModelError
+		res.ReviewState = domain.ReviewNotStartedBudget
+		res.Control = domain.ControlStopScope
+		if reviewed.Decision.Failure == outcome.ReviewFailureRunBudget {
+			res.Control = domain.ControlStopRun
+		}
+		return res, errs.New(errs.CodeBudgetExhausted, res.Message)
+	case outcome.ReasonReviewUnknown:
+		// A request was made and its result is unknown. The file stays, and the
+		// cost stays unknown: it is not zero, and this run does not ask again.
+		res.Code = string(errs.CodeModelUnavailable)
+		res.Message = "the review request was sent and no result was received; the file was not touched and the request cost is unknown: " + reviewed.Decision.ModelError
+		res.ReviewState = domain.ReviewUnknownResult
+		res.Control = domain.ControlStopScope
+		return res, errs.Newf(errs.CodeModelUnavailable,
+			"review unanswered after %d request(s); no file was moved or deleted", reviewed.Decision.Attempts)
+	case outcome.ReasonRequestCheckHold:
+		// An earlier request for this object and action is still unresolved.
+		// Asking again would pay twice for the same question.
+		res.Code = string(errs.CodeKept)
+		res.Message = outcome.ReasonText(reviewed.Reason)
+		res.ReviewState = domain.ReviewUnknownHold
+		res.Control = domain.ControlContinue
+		return res, nil
+	case outcome.ReasonReviewUnavailable:
 		res.Code = string(errs.CodeModelUnavailable)
 		res.Message = "the review could not be completed, so nothing was done: " + reviewed.Decision.ModelError
 		res.Control = domain.ControlStopScope
@@ -78,6 +101,100 @@ func (e *Executor) recordKeep(ctx context.Context, sc *ScopeCtx, it store.Item, 
 	res.Code = string(errs.CodeKept)
 	res.Message = outcome.ReasonText(reviewed.Reason)
 	return res, nil
+}
+
+// reviewFactsJSON is the request half of one decision. It is written with every
+// keep so that "was anything actually sent" is answerable from the record
+// instead of being inferred from the verdict.
+func reviewFactsJSON(d review.Decision) string {
+	return `{"failure":` + quoteJSON(d.Failure) +
+		`,"http_attempts":` + strconv.Itoa(d.Attempts) +
+		`,"jev_sent":` + strconv.FormatBool(d.JEVSent) +
+		`,"minimax_sent":` + strconv.FormatBool(d.LLMSent) +
+		`,"minimax_consulted":` + strconv.FormatBool(d.LLMConsulted) +
+		`,"cost_status":` + quoteJSON(d.CostStatus) + `}`
+}
+
+// noteUnknownRequest persists the request that was sent and never answered.
+//
+// It is written before the keep record so a crash between the two loses the
+// decision but not the possibility that the request was billed. The next run
+// reads this row and does not ask again until a person resolves it.
+func (e *Executor) noteUnknownRequest(ctx context.Context, sc *ScopeCtx, it store.Item, action string, d review.Decision) error {
+	if d.Attempts <= 0 {
+		return nil
+	}
+	return e.Store.RecordReviewUnknown(ctx, store.ReviewUnknown{
+		ItemID:       it.ID,
+		Action:       action,
+		ScopeID:      string(sc.Scope.ID),
+		PathB64:      plan.B64(it.RawRelative),
+		IdentityJSON: it.PreIdentityJSON,
+		TokenJSON:    it.PreTokenJSON,
+		CreatedNS:    e.Clock.Wall().UnixNano(),
+		Attempts:     d.Attempts,
+		Failure:      d.Failure,
+		CostStatus:   d.CostStatus,
+	})
+}
+
+// heldUnknownRequest reports whether an unresolved request exists for exactly
+// these bytes. A file that has changed since is a different question, so the old
+// row does not suppress a new one - it stays on record either way.
+func (e *Executor) heldUnknownRequest(ctx context.Context, sc *ScopeCtx, it store.Item, action string) (bool, error) {
+	rows, err := e.Store.OpenReviewUnknown(ctx, string(sc.Scope.ID), plan.B64(it.RawRelative), action)
+	if err != nil {
+		return false, err
+	}
+	for _, u := range rows {
+		if u.IdentityJSON == it.PreIdentityJSON && u.TokenJSON == it.PreTokenJSON {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// recordReviewInfo writes an item-scoped review fact that is neither a decision
+// nor an action: a batch that never started, or a standing unresolved request.
+func (e *Executor) recordReviewInfo(ctx context.Context, sc *ScopeCtx, p store.Plan, it store.Item,
+	action, eventAction, reason string, d review.Decision) error {
+	ruleDigest := ""
+	if binding, err := PlanBindingOf(it); err == nil && binding.RuleDigest != nil {
+		ruleDigest = *binding.RuleDigest
+	}
+	payload := `{"source":"review_state","action":` + quoteJSON(action) +
+		`,"reason":` + quoteJSON(reason) +
+		`,"reason_text":` + quoteJSON(outcome.ReasonText(reason)) +
+		`,"model_error":` + quoteJSON(d.ModelError) +
+		`,"review":` + reviewFactsJSON(d) + `}`
+	return e.Store.AppendEvent(ctx, store.Event{
+		EventID:         domain.NewID("ev"),
+		ItemID:          &it.ID,
+		ExecutionPlanID: &p.ID,
+		Action:          eventAction,
+		Phase:           domain.PhaseInfo,
+		OccurredAtNS:    e.Clock.Wall().UnixNano(),
+		ContractJSON: `{"scope_id":` + quoteJSON(string(sc.Scope.ID)) +
+			`,"raw_relative_b64":` + quoteJSON(plan.B64(it.RawRelative)) +
+			`,"rule_digest":` + quoteJSON(ruleDigest) + `}`,
+		ResultJSON: &payload,
+	})
+}
+
+// keepRecord is the payload of a keep, kept in one place so a new field cannot
+// be added to one branch and forgotten in the other.
+func reviewPayload(reviewed review.Outcome, it store.Item) string {
+	return `{"source":"decision","disposition":` + quoteJSON(domain.DispositionKeep) +
+		`,"reason":` + quoteJSON(reviewed.Reason) +
+		`,"reason_text":` + quoteJSON(outcome.ReasonText(reviewed.Reason)) +
+		`,"verdict":` + quoteJSON(reviewed.Decision.Verdict) +
+		`,"model_error":` + quoteJSON(reviewed.Decision.ModelError) +
+		`,"review":` + reviewFactsJSON(reviewed.Decision) +
+		// The version this decision was about. Without it a later run can only
+		// ask "was this path kept", which would also silence a different file
+		// that has since been created at the same place.
+		`,"identity":` + quoteJSON(it.PreIdentityJSON) +
+		`,"token":` + quoteJSON(it.PreTokenJSON) + `}`
 }
 
 // keptRecently reports whether this exact version of this path already received

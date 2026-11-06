@@ -446,6 +446,10 @@ func lookup(name string, args []string) (func(context.Context, *app, []string) (
 		return cmdSchedule, args, true
 	case "cleanup":
 		return cmdCleanup, args, true
+	case "review":
+		return cmdReview, args, true
+	case "retention":
+		return cmdRetention, args, true
 	}
 	return nil, nil, false
 }

@@ -372,7 +372,19 @@ type OperationResult struct {
 	Message   string      `json:"message,omitempty"`
 	Control   string      `json:"control,omitempty"`
 	Evidence  string      `json:"evidence,omitempty"`
+	// ReviewState names a review that did not produce a decision: it was never
+	// started because an allowance was gone, or it was sent and never answered.
+	// It is separate from Code because "no request was made" and "the request is
+	// unanswered" are different facts and only the second may have cost money.
+	ReviewState string `json:"review_state,omitempty"`
 }
+
+// Review states reported on an operation result.
+const (
+	ReviewNotStartedBudget = "not_started_budget"
+	ReviewUnknownHold      = "unknown_hold"
+	ReviewUnknownResult    = "unknown_result"
+)
 
 // Control results (section 6.2).
 const (

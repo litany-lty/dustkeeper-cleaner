@@ -12,6 +12,7 @@ import (
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/fsops"
+	dkoutcome "dustkeeper/internal/outcome"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/policy"
 	"dustkeeper/internal/review"
@@ -38,6 +39,9 @@ type Executor struct {
 	QuarantineTrust TrustFunc
 	// TmpBuf is reused across reads so a large plan does not allocate per item.
 	TmpBuf []byte
+	// ReviewBudget is the batch allowance the reviewer applies. A nil field
+	// means the reviewer owns its own limits (debug commands).
+	ReviewBudget ReviewBudget
 }
 
 // ConfigView is the subset of configuration the executor needs.
@@ -214,6 +218,22 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 		return res, errs.New(errs.CodeBudgetExhausted, "action budget unavailable before review")
 	}
 
+	// An earlier request for this exact object and action may still be
+	// unanswered. Asking again would be a second payment for the same question,
+	// and nothing about a new process, a restart or a re-scan settles it.
+	if held, herr := e.heldUnknownRequest(ctx, sc, it, action); herr != nil {
+		return res, herr
+	} else if held {
+		out := review.Outcome{Reason: dkoutcome.ReasonRequestCheckHold,
+			Decision: review.Decision{Verdict: domain.VerdictKeep, CostStatus: review.CostUnknown,
+				ModelError: "an earlier request for this object is still unresolved"}}
+		if err := e.recordReviewInfo(ctx, sc, p, it, action, "review_hold",
+			dkoutcome.ReasonRequestCheckHold, out.Decision); err != nil {
+			return res, err
+		}
+		return e.recordKeep(ctx, sc, it, &p.ID, out)
+	}
+
 	// A decision that was already made about this exact version of this file is
 	// not asked again before its retry interval ends. Asking is a paid call, and
 	// the answer cannot have changed: the bytes and the rule binding are the
@@ -227,6 +247,28 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 		res.Control = domain.ControlContinue
 		res.Evidence = domain.EvidenceNotStarted
 		return res, nil
+	}
+
+	// The batch allowance is checked before the request is built. A candidate
+	// that cannot be reviewed is not started: it is not sent, it cannot have
+	// been billed, and the remaining items of this plan are left for the next
+	// batch instead of each reporting the same provider outage.
+	if failure := e.reviewAllowance(); failure != "" {
+		d := review.Decision{Verdict: domain.VerdictKeep, Failure: failure, CostStatus: review.CostNotSent,
+			ModelError: "review was not started: this batch has no allowance left"}
+		if err := e.recordReviewInfo(ctx, sc, p, it, action, "review_not_started",
+			dkoutcome.ReasonNotStartedBudget, d); err != nil {
+			return res, err
+		}
+		res.Code = string(errs.CodeBudgetExhausted)
+		res.Message = d.ModelError
+		res.ReviewState = domain.ReviewNotStartedBudget
+		res.Control = domain.ControlStopScope
+		if failure == review.FailureRunBudget {
+			res.Control = domain.ControlStopRun
+			res.Message = "review was not started: the task review allowance is exhausted"
+		}
+		return res, errs.New(errs.CodeBudgetExhausted, res.Message)
 	}
 
 	facts := e.measureFacts(ctx, sc, it, preID, preTok)
@@ -252,6 +294,14 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 	outcome, err := e.reviewItem(ctx, req)
 	if err != nil {
 		return res, err
+	}
+	// The request was sent and no answer came back: record that fact before the
+	// keep, so a crash between the two loses the decision but never the
+	// possibility that the request was billed.
+	if outcome.Reason == dkoutcome.ReasonReviewUnknown {
+		if uerr := e.noteUnknownRequest(ctx, sc, it, action, outcome.Decision); uerr != nil {
+			return res, uerr
+		}
 	}
 	switch outcome.Disposition {
 	case domain.DispositionKeep:

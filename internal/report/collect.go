@@ -54,6 +54,23 @@ type Entry struct {
 	// Operation is the intent that produced this line, so a reader can trace one
 	// row back to its record.
 	Operation string `json:"operation,omitempty"`
+	// Review facts, copied from the record. A line that says "kept" without
+	// saying whether anything was asked is the ambiguity this field removes.
+	Failure     string `json:"review_failure,omitempty"`
+	Attempts    int    `json:"http_attempts,omitempty"`
+	CostStatus  string `json:"cost_status,omitempty"`
+	ReviewState string `json:"review_state,omitempty"`
+}
+
+// Summary counts what the three sections cannot: reviews that produced no
+// decision. They are not keeps and they are not failures of a file action.
+type Summary struct {
+	Reviewed     int `json:"reviewed"`
+	NotStarted   int `json:"review_not_started"`
+	UnknownHeld  int `json:"review_unknown_held"`
+	ReviewFailed int `json:"review_failed_kept"`
+	Attempts     int `json:"http_attempts"`
+	CostUnknown  int `json:"cost_unknown"`
 }
 
 // Section is one of the three lists, with what did not fit.
@@ -77,6 +94,7 @@ type Page struct {
 	Deleted       Section `json:"deleted"`
 	Observed      Section `json:"to_be_deleted"`
 	Kept          Section `json:"kept"`
+	Summary       Summary `json:"review_summary"`
 }
 
 // Window selects the slice of history one page describes.
@@ -117,11 +135,16 @@ func Collect(ctx context.Context, st *store.Store, w Window) (Page, error) {
 	// (a retry, a reconciliation), and a page that lists a file twice reads like
 	// two files were deleted.
 	seen := map[sectionKey]struct{}{}
+	// The review-state facts are counted once per item, in the same window as
+	// the sections, so "three reviews not started" cannot be three events about
+	// one file.
+	seenReview := map[string]struct{}{}
 	for i := len(events) - 1; i >= 0; i-- {
 		ev := events[i]
 		if ev.ItemID == nil {
 			continue
 		}
+		tallyReview(&page.Summary, ev, seenReview)
 		section, ok := sectionOf(ev)
 		if !ok {
 			continue
@@ -190,6 +213,7 @@ func eventsInWindow(ctx context.Context, st *store.Store, startNS, endNS int64) 
 }
 
 type sectionKind int
+
 const (
 	sectionDeleted sectionKind = iota
 	sectionObserved
@@ -246,6 +270,7 @@ func entryOf(section sectionKind, item store.Item, ev store.Event) (Entry, bool)
 		entry.Reason, entry.ReasonText = reasonFromEvent(ev)
 	case sectionKept:
 		entry.Reason, entry.ReasonText, entry.ModelFailed = keepReason(ev)
+		fillReview(&entry, ev)
 	}
 	return entry, true
 }
@@ -287,6 +312,84 @@ func keepReason(ev store.Event) (code, text string, modelFailed bool) {
 		text = outcome.ReasonText(payload.Reason)
 	}
 	return payload.Reason, text, payload.ModelError != ""
+}
+
+// tallyReview counts the reviews that produced no decision.
+func tallyReview(sum *Summary, ev store.Event, seen map[string]struct{}) {
+	key := string(*ev.ItemID) + "\x00" + ev.Action
+	switch ev.Action {
+	case "review_not_started":
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		sum.NotStarted++
+		var payload struct {
+			Review struct {
+				Attempts int `json:"http_attempts"`
+			} `json:"review"`
+		}
+		if ev.ResultJSON != nil && json.Unmarshal([]byte(*ev.ResultJSON), &payload) == nil {
+			sum.Attempts += payload.Review.Attempts
+		}
+	case "review_hold":
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		sum.UnknownHeld++
+	case "review_unknown":
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		sum.CostUnknown++
+	case "keep":
+		if ev.Phase != domain.PhaseInfo || ev.ResultJSON == nil {
+			return
+		}
+		var payload struct {
+			ModelError string `json:"model_error"`
+			Review     struct {
+				Attempts   int    `json:"http_attempts"`
+				CostStatus string `json:"cost_status"`
+			} `json:"review"`
+		}
+		if json.Unmarshal([]byte(*ev.ResultJSON), &payload) != nil {
+			return
+		}
+		if payload.Review.Attempts > 0 {
+			sum.Attempts += payload.Review.Attempts
+		}
+		if payload.Review.CostStatus == "unknown" {
+			sum.CostUnknown++
+		}
+		if payload.ModelError != "" {
+			sum.ReviewFailed++
+			return
+		}
+		sum.Reviewed++
+	}
+}
+
+// fillReview copies the request facts a keep record carries.
+func fillReview(entry *Entry, ev store.Event) {
+	if ev.ResultJSON == nil {
+		return
+	}
+	var payload struct {
+		Review struct {
+			Failure    string `json:"failure"`
+			Attempts   int    `json:"http_attempts"`
+			CostStatus string `json:"cost_status"`
+		} `json:"review"`
+	}
+	if json.Unmarshal([]byte(*ev.ResultJSON), &payload) != nil {
+		return
+	}
+	entry.Failure = payload.Review.Failure
+	entry.Attempts = payload.Review.Attempts
+	entry.CostStatus = payload.Review.CostStatus
 }
 
 // sizeOf is the logical size the item recorded when it was observed.

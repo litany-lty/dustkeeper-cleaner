@@ -36,6 +36,19 @@ type Settings struct {
 	// It is settable because a slow provider turns a timeout into "the review
 	// could not complete", which skips the file rather than waiting for it.
 	TimeoutSeconds *int `json:"timeout_seconds,omitempty"`
+	// The batch allowances below bound one dispatch unit (one plan for one
+	// rule). They are separate from MaxCandidates on purpose: raising the
+	// candidate count never bought more time, and a batch that could not finish
+	// its own plan reported the shortfall as a provider outage.
+	//
+	// BatchMaxCandidates omitted means 5.
+	BatchMaxCandidates *int `json:"batch_max_candidates,omitempty"`
+	// BatchSeconds omitted means max(180, 2*timeout + reserve).
+	BatchSeconds *int `json:"batch_seconds,omitempty"`
+	// BatchMaxAttempts bounds HTTP attempts per batch; omitted means 10.
+	BatchMaxAttempts *int `json:"batch_max_attempts,omitempty"`
+	// ReserveSeconds is kept free at the end of a batch; omitted means 10.
+	ReserveSeconds *int `json:"reserve_seconds,omitempty"`
 }
 
 // Timeout reports the per-call bound these settings select.
@@ -84,6 +97,49 @@ func (s *Settings) Thresholds() (minConfidence, minAllowProbability float64) {
 	return conf, allow
 }
 
+// Limits reports the batch allowances these settings select, with the same
+// defaults NewService uses. Validation has already refused an inconsistent
+// combination, so this cannot silently shrink a batch below one review path.
+func (s *Settings) Limits() Limits {
+	l := Limits{
+		Candidates:   defaultBatchCandidates,
+		Attempts:     defaultBatchAttempts,
+		Reserve:      defaultBatchReserve,
+		PerCandidate: 2 * requestTimeout,
+	}
+	if s == nil {
+		l.Seconds = defaultBatchSeconds
+		return l
+	}
+	if s.BatchMaxCandidates != nil {
+		l.Candidates = *s.BatchMaxCandidates
+	}
+	if s.BatchMaxAttempts != nil {
+		l.Attempts = *s.BatchMaxAttempts
+	}
+	if s.ReserveSeconds != nil {
+		l.Reserve = time.Duration(*s.ReserveSeconds) * time.Second
+	}
+	l.PerCandidate = 2 * s.Timeout()
+	l.Seconds = defaultBatchSeconds
+	if s.BatchSeconds != nil {
+		l.Seconds = *s.BatchSeconds
+	}
+	out, _ := l.consistent()
+	return out
+}
+
+// consistent raises the batch window to fit one full review path plus the
+// reserve, and reports whether the input was already consistent.
+func (l Limits) consistent() (Limits, bool) {
+	need := int((l.PerCandidate + l.Reserve + time.Second - 1) / time.Second)
+	if l.Seconds >= need {
+		return l, true
+	}
+	l.Seconds = need
+	return l, false
+}
+
 func (s *Settings) Validate() error {
 	if s == nil {
 		return nil
@@ -121,6 +177,41 @@ func (s *Settings) Validate() error {
 	if !exactNonBlank(s.JEVModel) || !exactNonBlank(s.MiniMaxModel) {
 		return errs.New(errs.CodeInvalidArgument, "review model names are required without boundary whitespace")
 	}
+	// The batch allowances must be able to contain one full review path plus the
+	// reserve. Without this check a configuration could keep a 120-second batch
+	// around a 60+60 second double call, and the second half would always be
+	// abandoned after it had already been paid for.
+	for name, v := range map[string]*int{
+		"batch_max_candidates": s.BatchMaxCandidates,
+		"batch_seconds":        s.BatchSeconds,
+		"batch_max_attempts":   s.BatchMaxAttempts,
+		"reserve_seconds":      s.ReserveSeconds,
+	} {
+		if v == nil {
+			continue
+		}
+		if *v < 1 {
+			return errs.Newf(errs.CodeInvalidArgument, "review.%s must be at least 1", name)
+		}
+	}
+	if s.BatchMaxCandidates != nil && *s.BatchMaxCandidates > 50 {
+		return errs.New(errs.CodeInvalidArgument, "review.batch_max_candidates must be at most 50")
+	}
+	if s.BatchMaxAttempts != nil && *s.BatchMaxAttempts > 50 {
+		return errs.New(errs.CodeInvalidArgument, "review.batch_max_attempts must be at most 50")
+	}
+	if s.BatchSeconds != nil && *s.BatchSeconds > 3600 {
+		return errs.New(errs.CodeInvalidArgument, "review.batch_seconds must be at most 3600")
+	}
+	if s.ReserveSeconds != nil && *s.ReserveSeconds > 120 {
+		return errs.New(errs.CodeInvalidArgument, "review.reserve_seconds must be at most 120")
+	}
+	limits := s.Limits()
+	need := int((2*s.Timeout() + limits.Reserve + time.Second - 1) / time.Second)
+	if s.BatchSeconds != nil && *s.BatchSeconds < need {
+		return errs.Newf(errs.CodeInvalidArgument,
+			"review.batch_seconds (%d) cannot contain one dual review path plus reserve (%d)", *s.BatchSeconds, need)
+	}
 	return nil
 }
 
@@ -157,7 +248,7 @@ func (s *Settings) NewService() (*Service, error) {
 	if err := s.ApplyTo(judge); err != nil {
 		return nil, errs.New(errs.CodeInvalidArgument, "review thresholds are invalid")
 	}
-	return &Service{Judge: judge, MaxCandidates: s.MaxCandidates}, nil
+	return &Service{Judge: judge, MaxCandidates: s.MaxCandidates, Defaults: s.Limits()}, nil
 }
 
 func decodeCredentialKeys(b []byte, dst any) error {

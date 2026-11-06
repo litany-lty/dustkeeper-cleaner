@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -25,8 +27,17 @@ type Service struct {
 	// spend limit, not a safety limit: a candidate never reviewed is never
 	// acted on either.
 	MaxCandidates int
-	checked       int
-	started       time.Time
+	// MaxAttempts bounds HTTP attempts for the whole command. Zero derives it
+	// from MaxCandidates (two reviewers per candidate).
+	MaxAttempts int
+	// Defaults are the batch ceilings this service starts from. BeginBatch may
+	// tighten them per batch; it can never raise the task-level allowance above
+	// MaxCandidates.
+	Defaults Limits
+	checked  int
+	attempts int
+	started  time.Time
+	batch    batchState
 }
 
 func (s *Service) now() time.Time {
@@ -55,19 +66,24 @@ func (s *Service) Review(ctx context.Context, r Request) (Decision, Approval, er
 		return Decision{}, nil, errs.New(errs.CodeInvalidArgument, "incomplete candidate identity or category")
 	}
 	if s.started.IsZero() {
-		s.started = time.Now()
+		s.started = s.now()
 	}
-	if time.Since(s.started) > 120*time.Second {
-		return Decision{ModelError: "review time budget exhausted", Verdict: domain.VerdictKeep}, nil, nil
-	}
-	max := s.MaxCandidates
-	if max <= 0 {
-		max = 10
-	}
-	if s.checked >= max {
-		return Decision{ModelError: "review candidate budget exhausted", Verdict: domain.VerdictKeep}, nil, nil
+	// The allowance is checked before a candidate is counted or a request is
+	// built. A candidate that cannot be reviewed is reported as "not started"
+	// with the allowance that stopped it: it is not a provider outage and it
+	// must not be recorded as one.
+	if failure := s.CheckStart(); failure != "" {
+		return Decision{
+			ModelError: s.budgetReason(failure),
+			Verdict:    domain.VerdictKeep,
+			Failure:    failure,
+			CostStatus: CostNotSent,
+		}, nil, nil
 	}
 	s.checked++
+	s.batch.candidates++
+
+	statsBefore := statsOf(s.Judge)
 
 	facts := Facts{
 		Action:        r.Action,
@@ -83,9 +99,22 @@ func (s *Service) Review(ctx context.Context, r Request) (Decision, Approval, er
 		ContentSHA256: r.VerifiedContentSHA256,
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 120*time.Second-time.Since(s.started))
-	defer cancel()
+	// One request may never outlive its batch or its task. When both are
+	// unknown the judge's own per-call timeout still bounds it.
+	if left := s.remaining(); left > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, left)
+		defer cancel()
+	}
 	decision, err := s.Judge.Review(ctx, facts)
+	statsAfter := statsOf(s.Judge)
+	decision.Attempts = statsAfter.Attempts - statsBefore.Attempts
+	decision.JEVSent = statsAfter.JEV > statsBefore.JEV
+	decision.LLMSent = statsAfter.MiniMax > statsBefore.MiniMax
+	s.attempts += decision.Attempts
+	s.batch.attempts += decision.Attempts
+	decision.CostStatus = costStatusOf(decision)
+
 	if err != nil {
 		// The judge returns both a decision and an error for transport-level
 		// failures; the decision already says "keep" and carries the reason.
@@ -93,17 +122,75 @@ func (s *Service) Review(ctx context.Context, r Request) (Decision, Approval, er
 			decision.ModelError = err.Error()
 		}
 		decision.Verdict = domain.VerdictKeep
-		decision.LLMConsulted = false
+		decision.Failure = classify(err, decision.Attempts)
+		// LLMConsulted is left exactly as the judge set it: a MiniMax request
+		// that was sent and timed out was still consulted, and clearing the flag
+		// here is what made the log say "not called or not recorded".
 		return decision, nil, nil
 	}
 	if decision.Verdict == "" {
 		decision.Verdict = domain.VerdictKeep
 		decision.ModelError = "reviewer returned no verdict"
+		decision.Failure = FailureResponse
 		return decision, nil, nil
 	}
 
 	permit := s.permitFor(r, decision)
 	return decision, permit, nil
+}
+
+// budgetReason is the sentence recorded for a candidate that was never sent.
+// It names the allowance, never the provider.
+func (s *Service) budgetReason(failure string) string {
+	switch failure {
+	case FailureRunBudget:
+		return "review budget for this run is exhausted: no request was sent"
+	case FailureBatchBudget:
+		return "this batch has no review allowance left: no request was sent"
+	}
+	return "review did not start"
+}
+
+// costStatusOf states what is known about this candidate's provider cost from
+// the request facts alone.
+func costStatusOf(d Decision) string {
+	if d.Attempts == 0 {
+		return CostNotSent
+	}
+	if d.JEV != nil && d.JEV.Usage != nil && (!d.LLMSent || d.LLMUsage != nil) {
+		return CostUsageRecorded
+	}
+	return CostUnknown
+}
+
+// statsOf reads the judge's own attempt counters. A judge that keeps none (a
+// test fixture, a future adapter) reports zero, which is honest: this candidate
+// has no measured request count.
+func statsOf(j Judge) Attempts {
+	if s, ok := j.(interface{ Stats() Attempts }); ok {
+		return s.Stats()
+	}
+	return Attempts{}
+}
+
+// classify turns a transport error into the kind that decides control range and
+// cost certainty. Attempts is what makes the difference: a failure with zero
+// attempts cannot have been billed, one with attempts may have been.
+func classify(err error, attempts int) string {
+	var failure *RequestFailure
+	if errors.As(err, &failure) {
+		return failure.Kind
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return FailureTimeout
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return FailureTimeout
+	}
+	if attempts == 0 {
+		return FailureTransport
+	}
+	return FailureTransport
 }
 
 // ActionSupported reports whether a review may be asked about this action.
@@ -254,8 +341,8 @@ func (p *permit) CheckIntent(itemID, action string, nowNS int64) error {
 	if nowNS < p.created || nowNS >= p.expires {
 		return errs.New(errs.CodeReviewRequired, "review expired")
 	}
-	if time.Since(p.service.started) > 120*time.Second {
-		return errs.New(errs.CodeReviewRequired, "review time budget exhausted")
+	if p.service.Expired() {
+		return errs.New(errs.CodeReviewRequired, "review budget exhausted")
 	}
 	return nil
 }
