@@ -47,9 +47,46 @@ dustkeeper run            # 结尾打印一行：本次删除/待删除/保留�
 dustkeeper cleanup report # 原样打印最近一页；--json 输出页面数据
 ```
 
+Linux 服务器需要把一次真实 `run` 的磁盘前后、扫描计数、逐候选审核结论和失败原因集中到一份可读日志时，
+使用仓库自带的 Python 3.6+ 包装器。它仍由已安装的 Dustkeeper 执行清理，不修改策略、不重试，也不保存正文、
+提示词、原始模型响应或凭据；输出目录必须是清理 scope 之外的专用私有目录：
+
+```sh
+python3 scripts/run-readable-log.py \
+  --dustkeeper /absolute/path/dustkeeper \
+  --output-dir /absolute/private/readable-reports \
+  --disk-path /
+```
+
+每次自动原子更新 `latest-readable.md` / `latest-readable.json`，并按 `run_id` 保留最近 10 轮快照（只轮转
+本工具命名的 `result-*-readable.md/json`）。脚本返回原
+`dustkeeper run` 的退出码；失败时仍写本轮可确认的信息，不会拿上一轮 `latest.json` 冒充本轮结果。
+如果真实 `run --json` 已经完成且输出已原样保存，可加 `--run-json /absolute/run.json` 只格式化该轮，脚本会
+强制核对自动结果页的 `run_id`，不会再次运行清理，也不会混入上一轮页面。
+
 结果页只有三区，空区也打印（"没有"和"漏了"必须能区分），超过 200 条时显示总量与"还有 N 条未显示"。
 永久清空前的提醒只走 macOS 系统通知一种出口：**提醒没送达，这一轮就不清空**，日志写了不算通知。
 `cleanup report` 与仓库里那个只读盘点工具 `cmd/cleanup-report` 不是一回事：前者读本轮结果页，后者扫目录元数据。
+
+审核没有拿到结论的两种情况要分开看，而且都能查到：预算用完是"这一轮没发请求"（exit 9，不产生费用），
+请求发出去了但没答复是"文件没动、费用未知"（exit 8）。后者会留一条记录，**下一轮不会为同一个对象、
+同一个动作再付一次钱**，除非有人核查后放开：
+
+```sh
+dustkeeper review unknown list                    # 谁在等核查：路径、动作、尝试次数、费用状态
+dustkeeper review unknown resolve --item <item_id> --action quarantine \
+  --note "核对了供应商控制台：超时未计费" --confirm
+```
+
+要不要保留、保留哪一套，先出计划再动手。`retention plan` 读一份声明式清单（应用、发布集合、组件、
+活动引用），给出"留哪一套、为什么、其余为什么是例外"；它只出计划，候选仍要走规则与双模型门禁：
+
+```sh
+dustkeeper retention plan --manifest /srv/apps/manifest.json
+```
+
+预算分层（整次任务 / 一个批次 / 单次请求）、两种"没有结论"的处置表、清单格式，见
+[运维手册 8.2–8.4](docs/operations.md)。
 
 **哪些还没验证（别当成已验证）：**
 

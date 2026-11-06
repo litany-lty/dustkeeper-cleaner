@@ -328,7 +328,7 @@ dustkeeper events --item <item_id>
 | 6 | 需对账或安全暂停 | **人工处理**，见第 9、10 节 |
 | 7 | 存储失败 | 检查磁盘，下一轮重试 |
 | 8 | 模型不可用 | 只影响 `rule draft`，已激活规则不受影响 |
-| 9 | 计划只完成一部分 | 看 `recover inspect` |
+| 9 | 计划只完成一部分（含"批次预算用完、但前面的对象已经做完"） | 看 `recover inspect`；未开始的候选不算失败，下一轮在总预算内继续 |
 | 130 | 被信号中断 | 正常，下一轮会先对账 |
 
 用 `--json` 接监控时，`retryable` 字段直接告诉你"重试是否有意义"，不用解析 prose。
@@ -378,8 +378,10 @@ dustkeeper cleanup report   # 原样打印最近一页；--json 输出页面数�
 调低多少是风险决定，不是配置问题：同一组样本在 70/80 下四次里只有一次两方都同意。
 **调低就是扩大放行范围**——代码把两个值直接与最低门槛比较，原来被拒绝的答案会变成允许，
 所以不要把它当"适配模型量表"的中性操作，也不要拿调低后的结果去证明准确率。`timeout_seconds`
-（5..120，默认 30）控制单次模型请求的等待；实测 20s 会让 MiniMax 偶尔超时，超时会被记成"模型不可用"
-并跳过该文件，而不是等它。
+（5..120，默认 30）控制单次模型请求的等待；实测 20s 会让 MiniMax 偶尔超时。超时不会被等下去：该候选记为
+"请求已发出、结果未知"（`review_unknown`，文件原位不动、费用未知），而不是悄悄当成"没有模型意见"。
+任务与批次的时间额度见 8.2：`runtime.run_soft_seconds` 默认 300，且必须容得下 `2 × timeout_seconds +
+reserve_seconds`，写小了会在加载配置时被拒绝。
 
 **自签或内网端点：`trust_ca_file` 必须是一条全程没有符号链接的真实路径。** 凭据与 CA 都是逐段
 `O_NOFOLLOW` 打开的，路径里只要有一段是链接就直接 `MODEL_UNAVAILABLE`，而那个错误信息不会指向路径。
@@ -397,6 +399,119 @@ macOS 上 `/tmp`、`/var` 本身就是链接，Linux 上不少发行版的 `/hom
 
 仓库里另有一个独立工具 `cmd/cleanup-report`，那是**只读目录盘点**（看使用痕迹、已知引用、空间上限），
 不读状态库、不生成许可，和这里的 `cleanup report` 不是一回事。
+
+### 8.2 审核的钱花在哪里：三层预算
+
+审核一次文件要走两次外部请求（JEV，然后 MiniMax）。这两次请求可能被三种互相独立的额度截断，**每一层
+都有自己的上限，互不挪用**：
+
+| 层 | 管什么 | 参数（括号内是默认值） | 用完之后 |
+|---|---|---|---|
+| 整次任务 | 一个 `run` 里所有 scope 共用的时间与候选数 | `runtime.run_soft_seconds`（300，5..600）、`review.max_candidates`（1..50） | 剩余 scope 不开始，`run` 以 `BUDGET_EXHAUSTED`（exit 9）结束 |
+| 一个批次 | 一个 plan（一条规则的一批候选）的候选数、HTTP 尝试次数、秒数 | `review.batch_max_candidates`（5）、`review.batch_max_attempts`（10）、`review.batch_seconds`（180）、`review.reserve_seconds`（10） | 本批剩下的候选标记为**未开始**，不进入下一批 |
+| 单次请求 | 一次 HTTP 调用的等待时间 | `review.timeout_seconds`（30，5..120） | 该候选记为请求超时（已发出、结果未知） |
+
+三条必须知道的规则：
+
+1. **提高候选上限不会买来更多时间。** `max_candidates` 只决定"最多看几个"，不决定"有多少秒"。想一次多处理，
+   就得同时抬高 `batch_seconds` 与 `run_soft_seconds`，或者把候选拆成多批。
+2. **子请求不越过父截止时间。** 每个候选开始前先检查"还能不能装下一条完整的两段请求 + 收尾余量"；装不下就
+   干脆**不开始**，而不是发出去再等超时——那是花钱买一个必然会丢的答案。`reserve_seconds` 就是留给收尾的
+   那一小段。
+3. **配置自相矛盾时拒绝启动，不静默钳制。** `batch_seconds` 必须容得下 `2 × timeout_seconds + reserve_seconds`，
+   `run_soft_seconds` 同样必须容得下一条完整路径加收尾；写小了会在加载配置时直接报错（分别提示
+   `review.batch_seconds … cannot contain one dual review path plus reserve` 与
+   `runtime.run_soft_seconds … cannot contain one dual review path plus reserve`）。宁可启动失败，也不要
+   出现"第二段请求永远被丢掉、却记成供应商故障"的结果。
+
+### 8.3 四种"没有结论"，以及各自怎么处置
+
+有结论（keep / allow）的文件好办；难办的是**没有拿到结论**的那几种，它们看起来都像"保留"，但下一步完全不同。
+结果页的「本轮审核」小节、`run` 结尾那一行、以及可读日志的「审核情况」小节读的是同一份计数：
+
+| reason | 退出码 | 状态 | 含义 | 人工下一步 |
+|---|---|---|---|---|
+| `not_started_budget` | 9 `BUDGET_EXHAUSTED` | 未开始 | 预算已经用完，**这一轮没有为它发出任何请求**，因此不产生请求费用 | 下一轮在原有授权与总预算内继续；不需要重新审批 |
+| `review_unknown` | 8 `MODEL_UNAVAILABLE` | 请求已发出、结果未知 | 请求确实发出去了（`http_attempts ≥ 1`），但没拿到答复；**文件原位未动**，费用未知 | 先核查这次请求，再决定是否再问一次（见下） |
+| `awaiting_request_check` | 0 `KEPT` | 未重复请求 | 同一个对象、同一个动作，之前那次请求的结果还没人核查；本轮**故意不再问** | 同上；这是"不重复付费"的具体动作 |
+| `review_unavailable` | 8 `MODEL_UNAVAILABLE` | 模型服务失败 | 请求没有取得可用答复（未发出、被拒绝、或返回不可解析） | 修好端点/凭据/额度后正常重试即可 |
+
+`review_unknown` 与 `awaiting_request_check` 背后是同一条记录，落在状态库里（`review_unknown` 表），不是
+只写在日志里：
+
+```sh
+dustkeeper review unknown list              # 还没核查的请求（--all 连已核查的也列；--limit 1..500）
+dustkeeper review unknown resolve \
+  --item <item_id> --action quarantine \
+  --note "核对了供应商控制台：该请求超时，未计费" --confirm
+```
+
+- `list` 给出的路径、动作、尝试次数、失败类别与费用状态就是判断依据。**这条记录的唯一作用就是阻止下一轮
+  自动再花一次钱去问同一个问题**；删掉状态库能达到同样效果，但那等于销毁"付过费、没答复"的事实。
+- `resolve` 不是"删掉记录"，而是**写一条核查结论并允许再问一次**；旧的那次请求仍然留在库里。缺 `--confirm`
+  或缺 `--note` 都会被拒绝（返回 `NEEDS_INPUT`，exit 2）——没有核查说明的"确认"不是一个记录。
+- 重新扫描、改规则、重装二进制都不会清掉这条记录；只有 `resolve` 会。这是有意的：规则变化不能让一笔
+  未知费用变成"从未发生"。
+
+### 8.4 保留哪一套：`retention plan`
+
+"只留最新的一套"这句话的真实含义是"只留一套**完整可恢复**的版本集合"，而不是"留最新那个文件名"。目录列表
+回答不了这件事（客户端的版本可能比服务器旧，版本号大小也不等于先后），所以用一个**声明式清单**回答：每个
+应用登记自己的发布集合、每个集合由哪些组件组成、以及当前有哪些活动引用。
+
+```sh
+dustkeeper retention plan --manifest /srv/apps/manifest.json
+```
+
+清单必须是绝对路径、普通文件、不超过 1 MiB，`schema` 固定为 1：
+
+```json
+{
+  "schema": 1,
+  "applications": [
+    {
+      "name": "elidli-server",
+      "releases": [
+        {"id": "rel-2026-11-01", "published_at": "2026-11-01T10:00:00+08:00", "published": true,
+         "complete": true, "active": true,
+         "components": [
+           {"path": "/srv/apps/elidli/releases/rel-2026-11-01/application.jar", "sha256": "…"},
+           {"path": "/srv/apps/elidli/releases/rel-2026-11-01/application.before.jar", "sha256": "…"}
+         ]}
+      ],
+      "references": [{"path": "/srv/apps/elidli/releases/rel-2026-11-01/application.jar",
+                      "why": "systemd unit ExecStart", "active": true}],
+      "protections": [], "unresolved": []
+    }
+  ]
+}
+```
+
+判定顺序（先命中先算）：**活动引用 → 最新合格集合 → 进行中恢复 → 明确保护 → 未解决的不确定**。其余成套
+版本进入候选。两条关键行为：
+
+- **不合格的集合整套保留**，理由是 `incomplete_release_kept_for_inspection`：缺一个组件的"最新版"不能当
+  最新版用，也不能因为它新就把旧的完整集合删掉。此时 `goal_met` 为 `false`，命令仍以 0 退出——"目标没达成"
+  是一个要读的结论，不是要重试的故障。
+- 只按清单说话，不按最大版本号、也不按文件数量。客户端与服务器组件版本不同时，仍然按"这一套"整体保留。
+
+它**只出计划，不移动任何文件**：计划里的候选还要走 `rule preview` → `plan create` → 双模型与授权门禁，
+和别的候选同一条路。
+
+### 8.5 磁盘诊断、系统日志维护、应用服务变更：三件事分开记账
+
+这三件事经常被一句"清一下服务器"混在一起，混起来就没法解释"空间到底被谁放掉的"：
+
+1. **磁盘诊断**（分区为什么满、谁在写、inode 是否耗尽）是只读分析。`du` / `df` / `lsof` 的结论不能当作
+   清理效果：本程序只在已登记的 scope 内处理候选，分区可用空间的变化还包含隔离区占用、日志增长、数据库本身。
+   结果页分开写"删除的逻辑大小"和"磁盘可用空间前后"，不把前者冒充后者。
+2. **系统或应用日志维护**（`journalctl --vacuum-size`、清空应用自己的 log 目录、轮转策略）不属于清理动作：
+   本程序既不执行，也不为它记账。日志目录要清理，只能作为普通 scope 的候选，走同一套规则与审核。
+3. **应用服务变更**（`systemctl stop/disable/mask`、改配置、重启、退役服务）从不属于本程序的动作集合。
+   它没有权限模型去表达"停一个服务"，隔离与清空只在自己 scope 内做 rename。服务停不停由变更流程决定，
+   和磁盘清理分开授权、分开记录；一次清理没有停服务，不能写成"顺手把服务停了"。
+
+一句话：**能自动做的只有 scope 内的移动与删除**；诊断是读，日志维护和 service 操作是另外两件事。
 
 ---
 
