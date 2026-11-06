@@ -440,7 +440,7 @@ macOS 上 `/tmp`、`/var` 本身就是链接，Linux 上不少发行版的 `/hom
 只写在日志里：
 
 ```sh
-dustkeeper review unknown list              # 还没核查的请求（--all 连已核查的也列；--limit 1..500）
+dustkeeper review unknown list              # 还没核查的请求（--all 连已核查的也列；默认最多 200 行，上限 500）
 dustkeeper review unknown resolve \
   --item <item_id> --action quarantine \
   --note "核对了供应商控制台：该请求超时，未计费" --confirm
