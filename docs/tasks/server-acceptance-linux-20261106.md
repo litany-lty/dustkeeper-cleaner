@@ -182,6 +182,11 @@ Process: … ExecStart=/home/dkacct/dk-acceptance-20261106/bin-dustkeeper run (c
 验收完删掉 drop-in 并 `restart`，`list-timers` 回到 `Sat 2026-11-07 03:35:19 CST`，即模板原本的
 每日 03:30（含随机延迟）。**没有改动模板本身，也没有把定时改成长期两分钟。**
 
+收尾时把这个 timer 停用并把 linger 关掉，避免一台验收机器每天真实调用两次模型：
+`systemctl --user disable --now dustkeeper-real.timer`（`is-enabled=disabled`、`is-active=inactive`）、
+`loginctl disable-linger dkacct`（`Linger=no`）。单元文件、状态目录与结果页都保留，重新启用只需要
+`enable-linger` + `enable --now`。
+
 ## 6. 与停止条件的对照
 
 | 项目 | 这一轮的状态 |
@@ -244,4 +249,5 @@ systemd 用户级 timer 跑通了：缺审核不动文件、两方同意才删�
 **这台机器上未得到证据的两项**是：观察区（`observed=1`）在真实模型下的那一条腿，以及正式通知送达
 （明确选 `none`）。
 
-正式实例仍然暂停，`~/.local/bin/dustkeeper` 上的旧版本（`2cbf8cb`）没有被替换，本机也没有重启任何调度。
+正式实例仍然暂停，`~/.local/bin/dustkeeper` 上的旧版本（`2cbf8cb`）没有被替换，本机也没有重启任何调度；
+目标机上的验收 timer 已停用，不会每天自己跑。
