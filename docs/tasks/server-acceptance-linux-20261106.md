@@ -65,7 +65,7 @@ ok   scope mixed              active
 | `jev_url` / `jev_model` | `https://api.typesafe.ai/v1/systemone` / `jev-1.14.0` |
 | `minimax_url` / `minimax_model` | `https://api.minimaxi.com/anthropic/v1/messages` / `MiniMax-M3.1-Flash` |
 | `jev_proxy_url` | `http://127.0.0.1:18991`（该机已有的 mihomo） |
-| `jev_min_confidence_pct` / `jev_min_allow_probability_pct` | `70` / `80`（第 8 节的校准闸门） |
+| `jev_min_confidence_pct` / `jev_min_allow_probability_pct` | `70` / `80`（显式采用，低于默认 90/90；见下文） |
 | `max_candidates` / `timeout_seconds` | `5` / `60` |
 
 目标机的网络事实（直接影响部署）：
@@ -75,9 +75,12 @@ ok   scope mixed              active
 - `https://api.minimaxi.com/` 直连可达（根路径 404 属正常）。
 - MiniMax 不走 JEV 的代理，这是既有设计，本轮复现了它：两条链路出口不同。
 
-闸门取 70/80 是**校准值**，不是放松：默认 90/90 下按历史实测（置信度最高 0.79、允许概率最高 0.86）
-一条都过不去，删除路径永远不可达。这一轮要验证的正是"两方都同意即删除"这条路，所以显式写下校准值，
-并把它记在这里。
+**这次验收显式使用 70/80，低于程序默认的 90/90，扩大了 JEV 可以放行的答案范围。** 同一份
+0.72 / 0.81 的答案，默认门槛下被拒绝，70/80 下被允许——代码就是把这两个值直接与最低门槛比较，
+所以这不是"校准"，是**放松**。该设置用于验证模型与执行链路，**不构成准确率或误删率验收**；
+反过来，90/90 也不是正确率或零误删的保证。若正式部署沿用 70/80，应把它作为明确记录的部署参数，
+只用于业务已确认可丢弃的受限目录，不能由这次合成样例外推到混合个人资料或整机清理。
+业务用途尚不明确的目录继续保持未授权；不为了凑出更多删除继续下调阈值。
 
 配置写完先做只读的模型检查（不动文件，也不改生产状态），这是唯一能在 `run` 之前证明"两条链路都通"的方式
 （`doctor` 不含这项）：
@@ -94,9 +97,18 @@ actual deletion: 0 files / 0 bytes; production state unchanged
 （假端点只答 triage 那一套，advisory 的问答形状对不上），所以这条命令**只在真实端点上才算通过**——
 这一轮通过了。
 
-**本轮真实调用量**（按候选计，不是按轮计）：第 4 节第一次 `run` 3 个候选 = 3 次 JEV + 1 次 MiniMax；
-systemd 触发的那次 2 个候选 = 2 次 JEV（两个都被 JEV 判 `insufficient`，没有第二层）；
-只读检查 2 个候选 × 2 层 = 4 次。合计约 **8 次 JEV + 2 次 MiniMax**。这是要记账的部分。
+**本轮真实调用量**（按候选计，不是按轮计）：
+
+| 场景 | JEV | MiniMax |
+|---|---:|---:|
+| 第 4 节第一次 `run`（3 个候选，其中 1 个放行） | 3 | 1 |
+| systemd 触发的那次（2 个候选，都被 JEV 判 `insufficient`） | 2 | 0 |
+| 只读检查 `debug --advisory`（2 个候选 × 2 层） | 2 | 2 |
+| 合计 | **7** | **3** |
+
+目标机没有逐请求账本，上面是按每个候选的决策记录和"只有 JEV 放行才问第二层"的既有顺序推出来的：
+两次 `run` 的退出码都是 0，结果页"接口失败或缺依据"这一列为空，没有出现额外的失败请求或重试；
+本轮也只跑了这三组调用（两次 `run`、一次只读检查），没有其它探测。**两个服务要分开记账，不能只记合计。**
 
 ## 4. 混合批次（真实模型，一次 `run`）
 
@@ -204,6 +216,10 @@ Process: … ExecStart=/home/dkacct/dk-acceptance-20261106/bin-dustkeeper run (c
 | 主动通知 | 明确选 `none`；事件里 `channel=none`、`delivered=false`、`attempted=false`，运行摘要写"notifications are off"，没有把它记成故障 |
 | F1（恢复后授权失效） | 决策为"保留"，写入 [运维手册 9.1.1](../operations.md)；本轮没有产生隔离对象，未在 Linux 上复现 |
 
+表里的"通过"只指**链路与行为**：请求真的发出去了、第二层的顺序对、动作在磁盘上真的发生了。
+它**不是**模型判断准确性的验收——这次只有一个合成临时文件被删除，样本量不足以说明误删率，
+也不能外推到别的目录（见第 3 节对 70/80 的说明）。
+
 观察区那条腿为什么没走：`archive_unknown_contents` 需要 JEV 明确 allow 才可能进入观察区，
 真实 JEV 对这两个包都给了 `insufficient`。这不是本轮缺步骤，而是真实模型的判断。
 "同一套混合批次产生 deleted=1 / observed=1 / kept=1" 的证据目前有两处：本机 macOS（APFS，本地假端点）
@@ -214,8 +230,8 @@ ubuntu-latest）。**这台 ext4 主机上没有 observed=1**，要用真实模�
 ## 7. 本轮记录到的部署事实（不是缺陷）
 
 1. **`lsof` 必须装**：目标机初始没有，缺了它自动隔离/清空不会发生，结果是 `KEPT / facts_missing`。
-2. **JEV 直连 451**：目标机需要自己的 HTTP CONNECT 出口，填 `review.jev_proxy_url`；没有出口时整轮
-   退化为模型不可用，不动文件。
+2. **JEV 直连 451**：目标机需要自己的 HTTP CONNECT 出口，填 `review.jev_proxy_url`；没有出口时候选一律
+   被保留（调不通不会变成放行），不会因此删或移动文件。
 3. **系统 `sqlite3` 太旧**：机器自带 3.26，直接打开 `state.db` 报 `malformed database schema (meta) -
    near "STRICT": syntax error`。程序内嵌 3.53.4 不受影响；人工排查用 `status` / `events` / `cleanup report`，
    不要用旧客户端改库。已写入运维手册故障速查。
@@ -250,8 +266,10 @@ bin-dustkeeper schedule render --platform linux --output …/real/schedule
 
 `e78057e` 的 linux-amd64 制品在一台真实的 Linux 服务器上，以非特权账号、ext4、真实 JEV + MiniMax、
 systemd 用户级 timer 跑通了：缺审核不动文件、两方同意才删除、systemd 能把它叫起来并且 exit 0、结果页可查。
+**这只证明端到端链路，不证明模型判断的准确性**：门槛是显式采用的 70/80（低于默认 90/90），样本是一次
+合成的四个小文件，没有任何"不会误删"的结论可以由此成立。
 **这台机器上未得到证据的两项**是：观察区（`observed=1`）在真实模型下的那一条腿，以及正式通知送达
-（明确选 `none`）。
+（明确选 `none`，只保证结果可查，不保证有人收到提醒）。
 
 正式实例仍然暂停，`~/.local/bin/dustkeeper` 上的旧版本（`2cbf8cb`）没有被替换，本机也没有重启任何调度；
 目标机上的验收 timer 已停用，不会每天自己跑。

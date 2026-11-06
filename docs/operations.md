@@ -375,7 +375,9 @@ dustkeeper cleanup report   # 原样打印最近一页；--json 输出页面数�
 {"review": {"jev_min_confidence_pct": 70, "jev_min_allow_probability_pct": 80}}
 ```
 
-调低多少是风险决定，不是配置问题：同一组样本在 70/80 下四次里只有一次两方都同意。`timeout_seconds`
+调低多少是风险决定，不是配置问题：同一组样本在 70/80 下四次里只有一次两方都同意。
+**调低就是扩大放行范围**——代码把两个值直接与最低门槛比较，原来被拒绝的答案会变成允许，
+所以不要把它当"适配模型量表"的中性操作，也不要拿调低后的结果去证明准确率。`timeout_seconds`
 （5..120，默认 30）控制单次模型请求的等待；实测 20s 会让 MiniMax 偶尔超时，超时会被记成"模型不可用"
 并跳过该文件，而不是等它。
 
@@ -385,7 +387,8 @@ macOS 上 `/tmp`、`/var` 本身就是链接，Linux 上不少发行版的 `/hom
 写进配置。
 
 **外网 JEV 需要目标机自己有一条可用的出口。** 直连被地域策略挡住时（HTTP 451），JEV 那一路先失败，
-整轮退化成"模型不可用"、一个文件都不动。出口填 `review.jev_proxy_url`（只接受 `http://host:port`，
+本轮候选一律按"没有模型结论"保留——调不通不会变成放行；其它已经发生的动作仍以结果页为准。
+出口填 `review.jev_proxy_url`（只接受 `http://host:port`，
 不带用户名密码、query 或路径，程序不做直连回退）；MiniMax 不走这条代理。程序不会凭空提供代理出口，
 服务器上没有可用的 HTTP CONNECT 服务就得先装一个。
 
@@ -417,13 +420,16 @@ dustkeeper quarantine restore --object <item_id> --destination-relative sub/rest
 
 ### 9.1.1 恢复之后：这个 scope 的自动授权要重新确认
 
-`quarantine restore` 在写入移动的同一个事务里做两件事：给恢复的目标路径加一条保护（`source=restore`），
-并把该 scope 的 `protection_revision` 加 1——不必等到恢复真正完成。自动授权（`rule enable` 写下的 grant）
-绑定的是当时那个版本，于是：
+`quarantine restore` 在写入恢复意图的数据库事务里做两件事：给恢复的目标路径加一条保护（`source=restore`），
+并把该 scope 的 `protection_revision` 加 1——不必等到恢复真正完成。（这是数据库事务，不是横跨文件系统的
+事务；文件移动与记账的关系见 9.2。）自动授权（`rule enable` 写下的 grant）绑定的是当时那个版本，于是：
 
-- **这个 scope 的下一次 `run` 会在动作前比对失败，整轮以 `GRANT_REQUIRED`（exit 4）停下**，一个文件都不动。
-  这是"授权不再匹配"，不是"规则错了"，也不等于把 scope 写成了 paused。
-- **其它 scope 不受影响**：它们的版本没有变。
+- 恢复会让该 scope 绑定旧保护版本的自动授权失配。**检查到失配时，对应的自动动作被拒绝，并报告
+  `GRANT_REQUIRED`（exit 4）。** 这是"授权不再匹配"，不是"规则错了"，也不等于把 scope 写成了 paused。
+- **其它 scope 仍按各自授权执行**：它们的版本没有变。
+- **本轮实际移动、删除了什么，以结果页为准，不能仅凭退出码认定整轮零动作。** `run` 是按 scope、按规则
+  推进的：对账等步骤在此之前就已经发生；同一 scope 里若只重新确认了部分规则，仍有效的规则可能先执行，
+  另一条规则随后才报旧授权失配。验收时见过"整轮 0 隔离 0 清空"的那一次，是那一次的结果，不是保证。
 - 同一 scope 有多条规则时，受影响的是这个版本下的所有规则，需要逐条确认；只重新启用其中一条，
   不能宣称整个 scope 已恢复。
 
