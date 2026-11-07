@@ -37,7 +37,7 @@
 
 | 类别 | 记录 |
 |---|---|
-| 源码 | 最终 main SHA `5be1e90b99847aff85348d3422358d18fdc9e0c4`；PR：不适用（用户改选推送 main）；相对 `abd6cfc` 的比较：不适用（基线已改） |
+| 源码 | **制品对应的源码提交** `5be1e90b99847aff85348d3422358d18fdc9e0c4`；其后的 `main` 若还有提交，均为纯文档回填、不重新产出制品，部署时须重新核对；PR：不适用（用户改选推送 main）；相对 `abd6cfc` 的比较：不适用（基线已改） |
 | CI | run `42379326052`（push main）；`test (ubuntu-latest, linux-amd64)` / `test (macos-latest, darwin-arm64)` 均 success；build/vet/test/race/release/制品校验/归档全绿；`test/eval` 无真实端点时的 skip 仍属"未运行"，不解释为模型准确率验证 |
 | 制品 | `darwin-arm64`：artifact `dustkeeper-1.0.0-phase1-darwin-arm64`，manifest `commit=5be1e90`，SHA-256 `5a7312e756142e25b088ab7792ef4856a8b4ea74d90ad273cf6be8235ffb55f7`，本机 `version --json` → `1.0.0-phase1 / schema 5 / commit 5be1e90 / SQLite 3.53.4`；`linux-amd64`：artifact `dustkeeper-1.0.0-phase1-linux-amd64`，SHA-256 `0e38e493da589595c81c9b8a96781ef67dd52a42e2249133914ac44998bfd4b6`（本机不可执行，只核对清单与摘要）。**两者均未安装** |
 | 目标实例 | 主机、账号、安装路径、配置/状态目录、全部 scope 与本次范围：待执行 |
