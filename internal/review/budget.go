@@ -71,6 +71,10 @@ const (
 	defaultBatchAttempts   = 10
 	defaultBatchSeconds    = 180
 	defaultBatchReserve    = 10 * time.Second
+	// One candidate can need both reviewers, so both HTTP attempts are reserved
+	// before the first request goes out. Starting with only one attempt left
+	// would pay for a question the batch is not allowed to finish answering.
+	attemptsPerCandidate = 2
 )
 
 // batchState is the live accounting of one batch.
@@ -133,10 +137,10 @@ func (s *Service) CheckStart() string {
 	if s.batchOpen() && s.batch.candidates >= s.batch.limits.Candidates {
 		return FailureBatchBudget
 	}
-	if s.attempts >= s.attemptLimit() {
+	if s.attempts+attemptsPerCandidate > s.attemptLimit() {
 		return FailureRunBudget
 	}
-	if s.batchOpen() && s.batch.attempts >= s.batch.limits.Attempts {
+	if s.batchOpen() && s.batch.attempts+attemptsPerCandidate > s.batch.limits.Attempts {
 		return FailureBatchBudget
 	}
 	return ""

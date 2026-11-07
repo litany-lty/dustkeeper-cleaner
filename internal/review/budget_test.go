@@ -167,6 +167,66 @@ func TestAnUnansweredRequestKeepsItsAttemptsAndUnknownCost(t *testing.T) {
 	}
 }
 
+// TestACandidateNeedsTwoAttemptsBeforeItStarts pins the "reserve the whole
+// path" rule. A batch configured with one attempt is legal, but it must not
+// send the first of two calls: the second is the one that would be abandoned
+// after the first had already been paid for.
+func TestACandidateNeedsTwoAttemptsBeforeItStarts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		svc  *Service
+		want string
+	}{
+		{
+			name: "batch with one attempt",
+			svc: &Service{Judge: &blockingJudge{decision: Decision{Verdict: domain.VerdictKeep}},
+				MaxCandidates: 5,
+				Defaults: Limits{Candidates: 5, Attempts: 1, Seconds: 180,
+					Reserve: time.Second, PerCandidate: 2 * time.Second}},
+			want: FailureBatchBudget,
+		},
+		{
+			name: "task with one attempt",
+			svc: &Service{Judge: &blockingJudge{decision: Decision{Verdict: domain.VerdictKeep}},
+				MaxCandidates: 5, MaxAttempts: 1,
+				Defaults: Limits{Candidates: 5, Attempts: 10, Seconds: 180,
+					Reserve: time.Second, PerCandidate: 2 * time.Second}},
+			want: FailureRunBudget,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			judge := tc.svc.Judge.(*blockingJudge)
+			tc.svc.BeginBatch(Limits{})
+			d, _, err := tc.svc.Review(context.Background(), testRequest())
+			if err != nil {
+				t.Fatalf("a budget stop is not an error: %v", err)
+			}
+			if d.Failure != tc.want {
+				t.Fatalf("failure = %q, want %q", d.Failure, tc.want)
+			}
+			if d.Attempts != 0 || d.CostStatus != CostNotSent || judge.attempts != 0 {
+				t.Fatalf("a candidate that cannot fit sent a request: attempts=%d cost=%s judge=%d",
+					d.Attempts, d.CostStatus, judge.attempts)
+			}
+		})
+	}
+
+	// Two attempts are enough for exactly one candidate, and the next one is
+	// refused without another call.
+	judge := &blockingJudge{decision: Decision{Verdict: domain.VerdictKeep, Reason: "model_says_keep"}}
+	svc := &Service{Judge: judge, MaxCandidates: 5,
+		Defaults: Limits{Candidates: 5, Attempts: 2, Seconds: 180,
+			Reserve: time.Second, PerCandidate: 2 * time.Second}}
+	svc.BeginBatch(Limits{})
+	if d, _, _ := svc.Review(context.Background(), testRequest()); d.Failure != "" || d.Attempts != 2 {
+		t.Fatalf("one full path did not fit in two attempts: %+v", d)
+	}
+	d, _, _ := svc.Review(context.Background(), testRequest())
+	if d.Failure != FailureBatchBudget || d.Attempts != 0 || judge.attempts != 1 {
+		t.Fatalf("the next candidate started with no attempt left: %+v (judge %d)", d, judge.attempts)
+	}
+}
+
 // TestFailureKindsMatchTheOutcomePackage keeps the duplicated spellings equal.
 // outcome imports only domain on purpose, so the two packages name the same
 // failure; a silent drift would map a budget stop to a provider outage.

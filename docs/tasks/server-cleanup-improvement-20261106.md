@@ -159,3 +159,51 @@
 - 没有新增定时任务、没有做长期运行验证、没有做批量付费评测。
 - 没有跑全量回归之外的额外压测；验证是 `go vet ./...`、`go test ./...` 与
   `python3 scripts/test_run_readable_log.py`。
+
+---
+
+## 6. 本轮实现与本地验证范围（接手核对用）
+
+这一节给 [后续执行计划](dustkeeper-next-steps-20261106.md) §12 用：它引用的"本轮实现与本地验证范围"
+就是这里。**本工作区的基线是 `8e46da5`（schema 4），不是计划里那个 `abd6cfc`（schema 5）候选**；两份
+工作不是同一批提交，下面的清单只描述本工作区真实存在的东西。
+
+### 6.1 实现入口
+
+| 层次 | 文件 |
+|---|---|
+| 预算与批次 | `internal/review/budget.go`、`settings.go`、`facts.go`；`internal/config/config.go` |
+| 请求事实与失败分类 | `internal/review/clients.go`、`types.go`、`outcome/outcome.go` |
+| 未答复请求持久化 | `migrations/004.sql`、`internal/store/review_unknown.go` |
+| 执行与停止范围 | `internal/execute/{apply,keep,purge,quarantine,review,protect}.go`、`internal/run/runner.go` |
+| 两条新命令 | `cmd/dustkeeper/cmd_review.go`、`cmd_retention.go`、`review.go`、`main.go` |
+| 保留策略 | `internal/retention/plan.go` |
+| 结果页与可读日志 | `internal/report/{collect,render}.go`、`scripts/run-readable-log.py` |
+| 运维说明 | `docs/operations.md` §3.1、§8.2–8.6、§9.1.1、§11 |
+
+### 6.2 本地验证（可执行、可复现）
+
+- `go build ./...`、`go vet ./...`、`go test ./...`（含 `cmd/dustkeeper`、`internal/review`、
+  `internal/retention`、`test/integration`）通过。
+- `python3 scripts/test_run_readable_log.py` 通过；`README` 里的包装器调用方式与实际参数一致。
+- 定向反证：`internal/review/budget_test.go`（预算分两层、两次尝试预留、超时保留已调用事实）、
+  `test/integration/review_budget_test.go`（部分完成、跨轮不重问、预算耗尽不发送请求）、
+  `internal/retention/plan_test.go`（不完整最新集、跨版本恢复集）。
+- 本工作区 `main` 的 push CI（run `42214748312`）在 `linux-amd64` 与 `darwin-arm64` 两个 job 均为
+  success。**这是 8e46da5 的门禁结果，不是 `abd6cfc` 候选的**；候选从未推送，也没有 PR。
+
+### 6.3 接手时发现的真实缺陷（本工作区已修）
+
+1. `review unknown list` / `resolve` 从未调用 `a.openStore()`，真实二进制上会 nil pointer panic。
+   现由 `cmd/dustkeeper/cmd_review.go` 显式打开状态库，并加 `cmd_review_test.go` 覆盖：无实例时返回
+   `INVALID_ARGUMENT`、有实例时列出行、`--confirm` 与 `--note` 缺一返回 `NEEDS_INPUT`、resolve 后
+   `--all` 仍能看到历史行。
+2. `CheckStart` 允许只剩 1 次 HTTP 尝试就启动候选，双模型路径的第二段必然被丢弃。现按计划 §5.3
+   预留 2 次尝试额度，`batch_max_attempts: 1` 合法但不启动任何审核；`budget_test.go` 有定向反证。
+
+### 6.4 本工作区不具备、不能照抄的能力
+
+`migrations/005.sql` / `internal/store/upgrade.go`（schema 3/4 → 5 显式升级）、
+`cmd/dustkeeper/review_diag.go`（关联 ID 与诊断字段）、`scripts/collect-run-data.py`（只读 ZIP 采集）、
+请求前 `dispatch_pending` 准备记录与结算事务、到期清空复用未知请求检查——这些都属于计划 §2.2 描述的
+**另一份候选**，本工作区没有对应代码。升级、部署、采集步骤在拿到那份候选前都不执行。

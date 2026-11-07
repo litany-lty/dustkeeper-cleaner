@@ -91,6 +91,28 @@ jq -c 'select(.phase=="run" or .phase=="scope") | {phase,run_id,scope_id,control
 注册时还会在 `$HOME` 下创建 `.dustkeeper-registry.lock`（注册锁）。它故意放在 home 而不是状态目录：
 换状态目录不该造出两把互不相干的锁去抢同一棵树。
 
+### 3.1 升级已有实例：先确认手里是哪一版
+
+状态库带 `PRAGMA user_version`。**本工作区这一版是 schema 4，只打开版本完全一致的库**：`init` 会拒绝
+旧版本，`status` / `run` 更不会替你迁移。"换上新二进制再跑一次 `init` 就自动升级"在本版不成立。
+
+交接计划 [dustkeeper-next-steps-20261106.md](tasks/dustkeeper-next-steps-20261106.md) §5.3 写的
+"schema 3/4 → 5 经显式 `init` 升级"，属于另一份**尚未推送的候选**（`abd6cfc`）的能力；那份代码、
+`migrations/005.sql` 与 `internal/store/upgrade.go` 都不在本工作区。拿到那个候选之前不要照抄它的升级
+命令：目标机仍是旧库时，停在"未升级"，按 §11 把旧二进制、状态库与隔离区一起备份，等候选制品与它的
+升级说明到位再动。
+
+无论哪一版，升级前都遵守：
+
+- 非空 `-journal` / `-wal` / `-shm` 先保留现场，用**旧二进制**打开并正常关闭；不删 sidecar、不改
+  版本号、不重建库绕过核对。系统自带 `sqlite3` 可能不认识本项目的 STRICT 表，别把它写成通用步骤。
+- 升级后核对 `instance_id`、scope、规则授权、保护、隔离对象、pending 与 `review unknown list` 的未解决
+  行是否都还在；`init` 退出 0 只说明它自己跑完了，不说明历史状态被保住。
+- 升级不调用模型、不移动对象、不自动启用调度。先核对完，再单独决定是否 `resume`——`resume` 只清全局
+  暂停标记，不恢复 scope 状态，也不补发授权。
+- **状态库副本不是沙箱**（见 §11）。库里记着原 scope 的绝对路径；对副本跑 `run` / `restore` 仍会动真实
+  文件。演练要用独立测试目录与独立实例。
+
 ---
 
 ## 4. 注册第一个范围
@@ -423,6 +445,9 @@ macOS 上 `/tmp`、`/var` 本身就是链接，Linux 上不少发行版的 `/hom
    `review.batch_seconds … cannot contain one dual review path plus reserve` 与
    `runtime.run_soft_seconds … cannot contain one dual review path plus reserve`）。宁可启动失败，也不要
    出现"第二段请求永远被丢掉、却记成供应商故障"的结果。
+4. **新候选必须预留两个 HTTP 尝试额度。** 一条完整路径可能要问两次，所以在第一个请求发出之前，任务与批次
+   都必须还剩下 2 次。`batch_max_attempts: 1` 是合法配置（校验只要求 ≥1），但结果是**一个候选都不会开始**：
+   结果页写 `not_started_budget`，不会发出半条路径。想让审核真的开始，把该值调到 ≥2。
 
 ### 8.3 四种"没有结论"，以及各自怎么处置
 
@@ -512,6 +537,22 @@ dustkeeper retention plan --manifest /srv/apps/manifest.json
    和磁盘清理分开授权、分开记录；一次清理没有停服务，不能写成"顺手把服务停了"。
 
 一句话：**能自动做的只有 scope 内的移动与删除**；诊断是读，日志维护和 service 操作是另外两件事。
+
+### 8.6 运行数据与采集：一个事实来源，两类视图，ZIP 不是备份
+
+- **事实来源是结果页** `<state>/reports/latest.md` / `latest.json`（`cleanup setup --result-dir` 可改）。
+  它写"已删除 / 待删除 / 保留"三区，另有「本轮审核」六个计数与每条候选的请求事实；数字只有这一套，
+  `run` 的摘要和可读日志都从这里取，不各算一遍。
+- **可读日志**是 `scripts/run-readable-log.py` 生成的一份人读文件：`latest-readable.md` 每次原子更新，
+  按 `run_id` 留最近 10 轮快照，目录上限 20 MiB、每轮最多展示 200 条并写明总数与省略数，
+  `schema_version=2`。旧页面缺字段时写"旧制品未记录"，不补 0；用 `--run-json` 只格式化某一轮时会
+  强制核对 `run_id`，不会拿上一轮冒充本轮。
+- **诊断 ZIP**：本工作区**没有** `scripts/collect-run-data.py`，那是未推送候选里的脚本。取得该候选后按
+  它的白名单与大小上限使用，并记住三件事：ZIP 只用于分析，**不是一致性恢复备份**（备份见 §11 的四件套），
+  也不是供应商账本；自定义 `result-dir` 不在白名单里，要另外保存实际结果页并标注来源与 `run_id`；采集
+  期间程序若仍在运行，清单只能说明"观察到过变化"，不能保证整个包属于同一时刻。
+- 结果页含业务文件名与路径，按实际分享对象处理。HTTP 尝试次数不证明供应商收到或计费；缺账单就写
+  "费用未知"，不要填 0。
 
 ---
 

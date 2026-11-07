@@ -86,7 +86,9 @@ dustkeeper retention plan --manifest /srv/apps/manifest.json
 ```
 
 预算分层（整次任务 / 一个批次 / 单次请求）、两种"没有结论"的处置表、清单格式，见
-[运维手册 8.2–8.4](docs/operations.md)。
+[运维手册 8.2–8.4](docs/operations.md)。发布、升级、真实运行与调度验收的六步执行计划见
+[后续执行计划](docs/tasks/dustkeeper-next-steps-20261106.md)；接手核对记录与尚未执行的
+[验收记录模板](docs/tasks/acceptance.md) 如实标注了当前停留在哪一步。
 
 **哪些还没验证（别当成已验证）：**
 

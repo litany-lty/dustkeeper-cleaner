@@ -27,8 +27,18 @@ func cmdReview(ctx context.Context, a *app, args []string) (output, error) {
 	}
 	switch args[1] {
 	case "list":
+		// Both branches read or write the same state database. withInstance only
+		// takes the instance lock and opens the operational log; it does not open
+		// the store. Without this call the command dereferences a nil store and
+		// crashes instead of reporting a missing or damaged instance.
+		if err := a.openStore(); err != nil {
+			return output{}, err
+		}
 		return reviewUnknownList(ctx, a, args[2:])
 	case "resolve":
+		if err := a.openStore(); err != nil {
+			return output{}, err
+		}
 		return reviewUnknownResolve(ctx, a, args[2:])
 	}
 	return output{}, errs.Newf(errs.CodeInvalidArgument, "unknown review unknown subcommand %q", args[1])
