@@ -1,7 +1,8 @@
-# 验收记录（模板，尚未执行）
+# 验收记录（制品门禁已完成；真实运行未执行）
 
-对应 [后续执行计划](dustkeeper-next-steps-20261106.md) §10–§11。**本文件是待填写的模板，不是验收结论**：
-所有字段保留"待执行 / 未观察到"，不得留空后默认为通过，也不得用本工作区 `main` 的 CI 结果替未部署的真实运行背书。
+对应 [后续执行计划](dustkeeper-next-steps-20261106.md) §10–§11。**本文件仍不是验收结论**：
+源码推送、双平台 CI 与制品事实已填写，其余字段保留"待执行 / 未观察到"，不得留空后默认为通过，
+也不得用 CI 结果替未部署的真实运行背书。CI 里的隔离/恢复与混合批次冒烟用的是假模型，不算真实模型调用。
 
 **基线说明（重要）**：接手文档写的是 `abd6cfc`（`fix/closeout-review-observability`），那三次提交在本工作区
 与远端都不存在。用户后续明确授权「以 8e46da5 重做」「推送 main」，因此本轮的实际基线是
@@ -11,10 +12,15 @@
 
 ---
 
-## 1. 收口检查表（§10.1，全部未勾选）
+## 1. 收口检查表（§10.1）
 
-- [ ] 本轮主线提交已推送到 `main`、通过双平台原生 CI（用户改选"推送 main"，不另建 PR）。
-- [ ] 最终 main 的制品、commit、SHA-256、version 有完整对应关系。
+**第 1、2 项已完成并有证据；第 3–8 项仍未勾选。** 勾选制品门禁不等于"已安装"或"已真实运行"。
+
+- [x] 本轮主线提交已推送到 `main`、通过双平台原生 CI（用户改选"推送 main"，不另建 PR）。
+      证据：`8e46da5..5be1e90`；CI run `42379326052`，`linux-amd64` / `darwin-arm64` 两 job 均 success。
+- [x] 最终 main 的制品、commit、SHA-256、version 有完整对应关系。
+      证据：两份 CI manifest 均 `commit=5be1e90` / `version=1.0.0-phase1`，SHA-256 与 `SHA256SUMS`
+      及实测一致；darwin 制品 `version --json` 得 `schema=5`。**制品未安装到任何主机。**
 - [ ] 一个明确范围的目标实例完成备份、显式升级和状态核对。
 - [ ] 一次小范围真实运行有有效候选、结果可解释、现场与记录一致。
 - [ ] 正式路径的调度至少真实触发一次，后续 3 次预定触发均有记录。
@@ -31,9 +37,9 @@
 
 | 类别 | 记录 |
 |---|---|
-| 源码 | 最终 main SHA：待执行；PR：不适用（用户改选推送 main）；相对 `abd6cfc` 的比较：不适用（基线已改） |
-| CI | 两平台 run/job：待执行；结果：待执行；必要的 skip 说明：待执行 |
-| 制品 | target / artifact / manifest commit / binary SHA-256 / `version` 实际输出：均待执行 |
+| 源码 | 最终 main SHA `5be1e90b99847aff85348d3422358d18fdc9e0c4`；PR：不适用（用户改选推送 main）；相对 `abd6cfc` 的比较：不适用（基线已改） |
+| CI | run `42379326052`（push main）；`test (ubuntu-latest, linux-amd64)` / `test (macos-latest, darwin-arm64)` 均 success；build/vet/test/race/release/制品校验/归档全绿；`test/eval` 无真实端点时的 skip 仍属"未运行"，不解释为模型准确率验证 |
+| 制品 | `darwin-arm64`：artifact `dustkeeper-1.0.0-phase1-darwin-arm64`，manifest `commit=5be1e90`，SHA-256 `5a7312e756142e25b088ab7792ef4856a8b4ea74d90ad273cf6be8235ffb55f7`，本机 `version --json` → `1.0.0-phase1 / schema 5 / commit 5be1e90 / SQLite 3.53.4`；`linux-amd64`：artifact `dustkeeper-1.0.0-phase1-linux-amd64`，SHA-256 `0e38e493da589595c81c9b8a96781ef67dd52a42e2249133914ac44998bfd4b6`（本机不可执行，只核对清单与摘要）。**两者均未安装** |
 | 目标实例 | 主机、账号、安装路径、配置/状态目录、全部 scope 与本次范围：待执行 |
 | 升级 | 旧 schema / 新 schema / 备份停机点 / 实例与历史状态核对：待执行 |
 | 配置 | 实际阈值、任务/批次/请求预算、代理与通知选择：待执行（凭据值不写进文档） |

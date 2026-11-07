@@ -203,8 +203,10 @@
 - 真实二进制冒烟（临时实例，无模型/无文件动作）：`version --json` schema 5、`init` 不重复升级、
   `review dispatch list` / `review unknown list` / `status` 均结构化返回；`retention plan` 输出共享路径
   "保留"优先；`run` 生成日志与结果页后，`collect-run-data.py` 产出 0600 ZIP 且拒绝覆盖现有文件。
-- `8e46da5` 的历史 push CI（run `42214748312`）两平台 success，属**旧基线**；本轮重建后的原生 CI
-  结果必须看新推送对应的运行，不能用旧结果背书。
+- `8e46da5` 的历史 push CI（run `42214748312`）两平台 success，属**旧基线**。本轮 `5be1e90` 推送后的
+  原生 CI（run `42379326052`）`linux-amd64` / `darwin-arm64` 两 job 均 success；已下载两份制品核对
+  manifest `commit=5be1e90`、SHA-256 与 `SHA256SUMS`，darwin 制品的 `version --json` 报 `schema=5`。
+  本机 `./build/build.sh --release` 也通过（`smoke_qr=ok`，混合批次 `deleted=1 observed=1 kept=1`）。
 
 ### 6.3 接手与重建过程中修的真实缺陷
 
@@ -220,6 +222,7 @@
 ### 6.4 仍未做的事（不得冒充已完成）
 
 本轮**没有**部署到目标实例、没有替换服务器二进制、没有改服务器配置、没有启用调度、没有产生真实模型调用、
-没有真实恢复（V11）、没有长期运行验收、没有核对真实供应商账单，也没有下载或核验最终 CI 发布制品。
-原生 CI 之外的六步收口状态见 [handover-20261107.md](handover-20261107.md) B.2，
+没有真实恢复（V11）、没有长期运行验收、没有核对真实供应商账单。CI 发布制品已下载并核对摘要与
+`version`，但**没有用它安装到任何主机**；CI 内的隔离/恢复冒烟用的是假模型。
+六步收口状态见 [handover-20261107.md](handover-20261107.md) B.2，
 验收记录 [acceptance.md](acceptance.md) 仍全部"待执行 / 未观察到"。

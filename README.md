@@ -109,7 +109,9 @@ dustkeeper retention plan --manifest /srv/apps/manifest.json
 四种"没有结论"的处置表、清单格式与采集边界，见 [运维手册 8.2–8.6](docs/operations.md)。
 发布、升级、真实运行与调度验收的六步执行计划见
 [后续执行计划](docs/tasks/dustkeeper-next-steps-20261106.md)；[接手核对记录](docs/tasks/handover-20261107.md)
-与 [验收记录模板](docs/tasks/acceptance.md) 如实标注了当前停留在哪一步。
+与 [验收记录](docs/tasks/acceptance.md) 如实标注了当前停留在哪一步：代码已推送 `main` 并通过两个平台的
+原生 CI（run `42379326052`）、制品摘要与 `version` 已核对，**但没有部署、没有真实模型调用、
+没有真实调度验收**。
 
 **`run` 不支持 `--scope`**：它处理整个实例可能触达的所有范围。首跑前必须核对整个实例的 scope、pending、
 到期清空队列与授权范围，不能靠加参数缩小首跑范围。
