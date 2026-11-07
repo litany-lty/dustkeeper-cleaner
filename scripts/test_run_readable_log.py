@@ -27,11 +27,12 @@ class ReadableRunLogTest(unittest.TestCase):
                     if args[:2] == ["cleanup", "report"]:
                         page = {
                             "run_id": "run_fixture", "window_start_ns": 100, "window_end_ns": 200,
-                            "deleted": {"total": 2, "entries": [{"item_id": "del", "path": "old/releases/a.zip", "size_bytes": 18, "reason": "dual_review_agrees", "reason_text": "双模型同意永久删除", "http_attempts": 2, "cost_status": "usage_recorded"}]},
+                            "deleted": {"total": 2, "entries": [{"item_id": "del", "path": "old/releases/a.zip", "size_bytes": 18, "reason": "dual_review_agrees", "reason_text": "双模型同意永久删除", "http_attempts": 2, "cost_status": "usage_recorded", "review_id": "rev_del"}]},
                             "to_be_deleted": {"total": 1, "entries": [{"item_id": "q1", "path": "releases/old/application.jar", "size_bytes": 4096, "reason": "dual_review_agrees", "reason_text": "双模型同意进入观察区", "purge_after_ns": 1762000000000000000, "http_attempts": 2, "cost_status": "usage_recorded"}]},
                             "kept": {"total": 1, "entries": [{"item_id": "keep", "path": "logs/messages", "size_bytes": 19, "reason": "not_started_budget", "reason_text": "审核预算已用完，本轮未开始审核", "http_attempts": 0, "cost_status": "not_sent", "review_state": "not_started_budget"}]},
                             "review_summary": {"reviewed": 1, "review_not_started": 1, "review_unknown_held": 1,
-                                               "review_failed_kept": 1, "http_attempts": 3, "cost_unknown": 1},
+                                               "review_failed_kept": 1, "http_attempts": 3, "cost_unknown": 1,
+                                               "review_facts_unknown": 1},
                         }
                         if os.environ.get("DUSTKEEPER_FAKE_FAIL"):
                             page["run_id"] = "run_failed"
@@ -100,7 +101,9 @@ class ReadableRunLogTest(unittest.TestCase):
                 "审批预算用完，本轮未发起请求；该对象不产生请求费用",
                 "## 审核情况",
                 "已取得判断：1 个",
-                "未开始（预算用完，未发出请求）：1 个，不产生请求费用",
+                "未开始（本轮未发出请求）：1 个，不产生请求费用",
+                "请求事实未记录：1 个，未计入 HTTP 尝试数，也不能按 0 理解",
+                "关联审核：`rev_del`",
                 "请求未取得结果（文件未动）：1 个",
                 "上次请求结果未知、本轮未重复请求：1 个",
                 "费用未知（不能按 0 计）：1 个",

@@ -93,14 +93,16 @@ jq -c 'select(.phase=="run" or .phase=="scope") | {phase,run_id,scope_id,control
 
 ### 3.1 升级已有实例：先确认手里是哪一版
 
-状态库带 `PRAGMA user_version`。**本工作区这一版是 schema 4，只打开版本完全一致的库**：`init` 会拒绝
-旧版本，`status` / `run` 更不会替你迁移。"换上新二进制再跑一次 `init` 就自动升级"在本版不成立。
+状态库带 `PRAGMA user_version`。**本工作区这一版是 schema 5**。已知的旧库（schema 3 或 4）**只能由显式
+`init` 升到 5**；`status` / `run` / 其它普通命令一律通过 `OpenExisting` 拒绝版本不一致的库，不改一个字节。
+也就是说，"换上新二进制再跑一次 `run` 就自动升级"不成立，但"备份之后跑一次 `init`"会升级，并且会在
+`init --json` 的 `schema_upgrade` 里如实写出 `from` / `to` / `upgraded`。
 
-交接计划 [dustkeeper-next-steps-20261106.md](tasks/dustkeeper-next-steps-20261106.md) §5.3 写的
-"schema 3/4 → 5 经显式 `init` 升级"，属于另一份**尚未推送的候选**（`abd6cfc`）的能力；那份代码、
-`migrations/005.sql` 与 `internal/store/upgrade.go` 都不在本工作区。拿到那个候选之前不要照抄它的升级
-命令：目标机仍是旧库时，停在"未升级"，按 §11 把旧二进制、状态库与隔离区一起备份，等候选制品与它的
-升级说明到位再动。
+`init` 的升级不是无条件的：`internal/store/upgrade.go` 会先核对文件是普通文件（不是 symlink）、文件头与
+`PRAGMA user_version` 一致、`meta/instance_id` 存在、核心表齐全、sidecar 为空；`headerVersion` 与
+`user_version` 不一致、版本比 3 更旧或比 5 更新、以及库里没有实例身份时都拒绝并保持版本不变。逐 step 在
+事务里执行，同时写 `meta('schema_version')`。这一步是交接计划
+[dustkeeper-next-steps-20261106.md](tasks/dustkeeper-next-steps-20261106.md) §5.3 要求的显式升级边界。
 
 无论哪一版，升级前都遵守：
 
@@ -335,6 +337,11 @@ dustkeeper events --item <item_id>
 `recover reconcile` 处理。垃圾候选的预览不在这个命令里——先 `scan` 把目录扫进观察表，再用 `rule preview`
 （或 `rule enable` 不带 `--digest` 时的提案）看这条规则会选中哪些文件。
 
+**`run` 不支持 `--scope`。** 它处理的是整个实例当前可能触达的所有 scope，不是某一个目录。首跑之前必须核对
+整个实例登记了哪些 scope、pending / 到期清空队列里有什么、以及确认过的清理范围与授权覆盖了哪些目录；
+不要以为加一个 `--scope` 就能把首跑限制在一个小目录里。想缩小范围，要在**注册与授权**层面做到，而不是在
+`run` 命令上加参数。
+
 `run` 的顺序是有意的：先把上次没结束的事说清楚，再考虑新工作。任何一步遇到 `held` / `unknown` /
 时钟异常 / 预算耗尽，都会在本轮停在这里，不会带着不确定继续下一个文件。
 
@@ -469,7 +476,15 @@ dustkeeper review unknown list              # 还没核查的请求（--all 连�
 dustkeeper review unknown resolve \
   --item <item_id> --action quarantine \
   --note "核对了供应商控制台：该请求超时，未计费" --confirm
+dustkeeper review dispatch list             # 已准备但未结算的请求（pending）
+dustkeeper review dispatch list --all       # 连 settled / refused 的历史一起列
 ```
+
+请求发出**之前**会先写一条 `review_dispatch` 的 `pending` 准备记录，审核结果与 decision event 在同一事务里
+结算为 `settled`；本地在发请求前就拒绝的写成 `refused`（`cost_status=not_sent`），不会留下一个假问题挡住下一轮。
+进程在"已发请求、未落结论"之间崩溃留下的 `pending` 会像未知请求一样阻止自动再问——用
+`review dispatch list` 找出它，人工核查后再决定怎么收口。`--all` 可以核对某次 `review_id` 是否真的结算过；
+`review_id` 同时出现在结果页、可读日志、decision event 和运行日志里，是这四处的关联键。
 
 - `list` 给出的路径、动作、尝试次数、失败类别与费用状态就是判断依据。**这条记录的唯一作用就是阻止下一轮
   自动再花一次钱去问同一个问题**；删掉状态库能达到同样效果，但那等于销毁"付过费、没答复"的事实。
@@ -519,6 +534,10 @@ dustkeeper retention plan --manifest /srv/apps/manifest.json
   最新版用，也不能因为它新就把旧的完整集合删掉。此时 `goal_met` 为 `false`，命令仍以 0 退出——"目标没达成"
   是一个要读的结论，不是要重试的故障。
 - 只按清单说话，不按最大版本号、也不按文件数量。客户端与服务器组件版本不同时，仍然按"这一套"整体保留。
+- **共享路径的「保留」结论优先。** 同一个路径可以被两个应用声明（例如共用的 jar）。清单不再因为共享而整体
+  拒绝：只要任何一个应用判定它要保留，其它应用就不会把它列为清理候选，并且各自在自己的 `keep` 里记下
+  `shared_path_kept_by_another_application` 与保留方。`shared_paths` 会列出所有共享路径。没有任何一方保留
+  时，候选仍在，但计划会写明"共享归属未澄清"，不会假装这是一个普通候选。`goal_met` 因此会诚实地为 `false`。
 
 它**只出计划，不移动任何文件**：计划里的候选还要走 `rule preview` → `plan create` → 双模型与授权门禁，
 和别的候选同一条路。
@@ -541,16 +560,32 @@ dustkeeper retention plan --manifest /srv/apps/manifest.json
 ### 8.6 运行数据与采集：一个事实来源，两类视图，ZIP 不是备份
 
 - **事实来源是结果页** `<state>/reports/latest.md` / `latest.json`（`cleanup setup --result-dir` 可改）。
-  它写"已删除 / 待删除 / 保留"三区，另有「本轮审核」六个计数与每条候选的请求事实；数字只有这一套，
-  `run` 的摘要和可读日志都从这里取，不各算一遍。
+  它写"已删除 / 待删除 / 保留"三区，另有「本轮审核」计数与每条候选的请求事实；数字只有这一套，
+  `run` 的摘要和可读日志都从这里取，不各算一遍。成功与失败的审核都进汇总，按 `review_id` 去重；
+  请求事实没记录下来的审核单独计 `review_facts_unknown`，**不按 0 补进 HTTP 尝试数**。
+- **运行日志** `<state>/logs/dustkeeper.jsonl`（含 `.1`～`.3` 轮转）每次审核写一条无载荷记录：
+  版本、commit、schema、`run_id` / `item_id` / `review_id`、`state`（pending / settled / refused /
+  not_started / awaiting_request_check）、预算摘要、耗时、HTTP 状态、返回 token 用量与失败类别。
+  不写 prompt、响应体、凭据或文件路径；`cmd/dustkeeper/review_diag.go` 是这份字段的唯一入口。
 - **可读日志**是 `scripts/run-readable-log.py` 生成的一份人读文件：`latest-readable.md` 每次原子更新，
   按 `run_id` 留最近 10 轮快照，目录上限 20 MiB、每轮最多展示 200 条并写明总数与省略数，
-  `schema_version=2`。旧页面缺字段时写"旧制品未记录"，不补 0；用 `--run-json` 只格式化某一轮时会
-  强制核对 `run_id`，不会拿上一轮冒充本轮。
-- **诊断 ZIP**：本工作区**没有** `scripts/collect-run-data.py`，那是未推送候选里的脚本。取得该候选后按
-  它的白名单与大小上限使用，并记住三件事：ZIP 只用于分析，**不是一致性恢复备份**（备份见 §11 的四件套），
-  也不是供应商账本；自定义 `result-dir` 不在白名单里，要另外保存实际结果页并标注来源与 `run_id`；采集
-  期间程序若仍在运行，清单只能说明"观察到过变化"，不能保证整个包属于同一时刻。
+  `schema_version=2`。旧页面缺字段时写"旧制品未记录"，不补 0；现在也会逐条写出关联 `review_id` 与
+  "请求事实未记录"的审核数。用 `--run-json` 只格式化某一轮时会强制核对 `run_id`，不会拿上一轮冒充本轮。
+- **诊断 ZIP** 用 `scripts/collect-run-data.py`（与二进制同一提交）：
+
+  ```sh
+  python3 /absolute/scripts/collect-run-data.py \
+    --state-dir /absolute/confirmed/state \
+    --output /absolute/private/dustkeeper-run-YYYYMMDD-HHMMSS.zip
+  ```
+
+  白名单只有标准位置的四份 JSONL 日志（当前 + `.1`～`.3`，每份最多 2 MiB + 64 KiB）与
+  `reports/latest.json`（最多 4 MiB），源文件总上限约 12.25 MiB。输出是**新建的 0600 ZIP，绝不覆盖已有文件**；
+  清单记录采集时间、每个文件的状态、大小、SHA-256 与"读取期间是否变化"。缺失、拒绝（symlink / 非常规文件）、
+  不可读、超限都明确标成缺项，不冒充完整。脚本不运行 Dustkeeper、不调用模型、不上传、不改源文件。
+  记住三件事：ZIP 只用于分析，**不是一致性恢复备份**（备份见 §11 的四件套），也不是供应商账本；自定义
+  `result-dir` 不在白名单里，要另外保存实际结果页并标注来源与 `run_id`；采集期间程序若仍在运行，清单只能
+  说明"观察到过变化"，不能保证整个包属于同一时刻。
 - 结果页含业务文件名与路径，按实际分享对象处理。HTTP 尝试次数不证明供应商收到或计费；缺账单就写
   "费用未知"，不要填 0。
 
@@ -684,9 +719,10 @@ dustkeeper resume     # 清除标记
 | 配置目录（`<config>/config.json` 等） | 规则额度、时钟设置、保留期默认值在这里 |
 | `<state>/state.db`，连同 `state.db-journal`（存在时） | 库用的是 `journal_mode=DELETE`，没有 `-wal`/`-shm`；漏掉日志文件会得到一个"差最后一步"的库 |
 | 每个 scope 下的 `.dustkeeper/`（`owner.json`、`objects/`、`manifests/`、`durability.anchor`） | 隔离区里是原文件本身；清单记录移动前的身份 |
-| 当前运行的二进制 | 旧库只有对应版本的二进制解释得动；升级后回退需要它 |
+| 当前运行的二进制，以及它的 `version --json` 输出与 SHA-256 摘要 | 旧库只有对应版本的二进制解释得动；升级后回退要能核对拿回来的确实是同一份 |
 
-只备份数据库会得到一堆指向不存在对象的记录；只备份隔离区则失去身份与保留期信息。
+只备份数据库会得到一堆指向不存在对象的记录；只备份隔离区则失去身份与保留期信息。**诊断 ZIP
+（`scripts/collect-run-data.py` 的输出）不属于这四件套**：它只有日志与结果页，用于分析，不能用来恢复一致性状态。
 
 ```sh
 # 1) 先停调度，再等进程走完。pause 只阻止新的 intent，不阻止定时任务再拉一次 run。

@@ -17,31 +17,70 @@ import (
 // history-erasing move this build forbids.
 func cmdReview(ctx context.Context, a *app, args []string) (output, error) {
 	if len(args) == 0 {
-		return output{}, errs.New(errs.CodeInvalidArgument, "review requires a subcommand: unknown list | unknown resolve")
+		return output{}, errs.New(errs.CodeInvalidArgument,
+			"review requires a subcommand: unknown list | unknown resolve | dispatch list")
 	}
-	if args[0] != "unknown" {
-		return output{}, errs.Newf(errs.CodeInvalidArgument, "unknown review subcommand %q", args[0])
-	}
-	if len(args) == 1 {
-		return output{}, errs.New(errs.CodeInvalidArgument, "review unknown requires list or resolve")
-	}
-	switch args[1] {
-	case "list":
-		// Both branches read or write the same state database. withInstance only
-		// takes the instance lock and opens the operational log; it does not open
-		// the store. Without this call the command dereferences a nil store and
-		// crashes instead of reporting a missing or damaged instance.
+	switch args[0] {
+	case "unknown":
+		if len(args) == 1 {
+			return output{}, errs.New(errs.CodeInvalidArgument, "review unknown requires list or resolve")
+		}
+		switch args[1] {
+		case "list":
+			// Both branches read or write the same state database. withInstance only
+			// takes the instance lock and opens the operational log; it does not open
+			// the store. Without this call the command dereferences a nil store and
+			// crashes instead of reporting a missing or damaged instance.
+			if err := a.openStore(); err != nil {
+				return output{}, err
+			}
+			return reviewUnknownList(ctx, a, args[2:])
+		case "resolve":
+			if err := a.openStore(); err != nil {
+				return output{}, err
+			}
+			return reviewUnknownResolve(ctx, a, args[2:])
+		}
+		return output{}, errs.Newf(errs.CodeInvalidArgument, "unknown review unknown subcommand %q", args[1])
+	case "dispatch":
+		if len(args) < 2 || args[1] != "list" {
+			return output{}, errs.New(errs.CodeInvalidArgument, "review dispatch requires list")
+		}
 		if err := a.openStore(); err != nil {
 			return output{}, err
 		}
-		return reviewUnknownList(ctx, a, args[2:])
-	case "resolve":
-		if err := a.openStore(); err != nil {
-			return output{}, err
-		}
-		return reviewUnknownResolve(ctx, a, args[2:])
+		return reviewDispatchList(ctx, a, args[2:])
 	}
-	return output{}, errs.Newf(errs.CodeInvalidArgument, "unknown review unknown subcommand %q", args[1])
+	return output{}, errs.Newf(errs.CodeInvalidArgument, "unknown review subcommand %q", args[0])
+}
+
+// reviewDispatchList shows prepared requests that were never settled. A pending
+// row is a reason to inspect, not a request to retry automatically.
+func reviewDispatchList(ctx context.Context, a *app, args []string) (output, error) {
+	fs := flagset("review dispatch list", io.Discard)
+	all := fs.Bool("all", false, "include settled and refused rows")
+	limit := fs.Int("limit", 200, "maximum rows to show")
+	if err := parseFlags(fs, args); err != nil {
+		return output{}, err
+	}
+	rows, err := a.store.ListReviewDispatch(ctx, *all, *limit)
+	if err != nil {
+		return output{}, err
+	}
+	out := ok()
+	out.Data = map[string]any{"requests": rows, "count": len(rows)}
+	if len(rows) == 0 {
+		out.Human = []string{"no pending review dispatches"}
+		return out, nil
+	}
+	out.Human = append(out.Human, fmt.Sprintf("%d review dispatch(es):", len(rows)))
+	for _, r := range rows {
+		out.Human = append(out.Human, fmt.Sprintf(
+			"  %s  %s  action=%s state=%s attempts=%d failure=%s cost=%s run=%s",
+			r.ReviewID, r.ItemID, r.Action, r.State, r.Attempts, r.Failure, r.CostStatus, r.RunID))
+	}
+	out.Next = []string{"dustkeeper events --item <item_id>"}
+	return out, nil
 }
 
 func reviewUnknownList(ctx context.Context, a *app, args []string) (output, error) {

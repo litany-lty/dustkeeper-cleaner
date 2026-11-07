@@ -76,7 +76,25 @@ python3 scripts/run-readable-log.py \
 dustkeeper review unknown list                    # 谁在等核查：路径、动作、尝试次数、费用状态
 dustkeeper review unknown resolve --item <item_id> --action quarantine \
   --note "核对了供应商控制台：超时未计费" --confirm
+dustkeeper review dispatch list                   # 已准备但未结算的请求，带 review_id
+dustkeeper review dispatch list --all             # 连同已结算/本地拒绝的历史
 ```
+
+请求发出**之前**会先写一条 `pending` 准备记录，结算与 decision event 在同一事务里提交；`review_id` 把结果页、
+结果事件、运行日志与 `review_dispatch` 行关联起来。运行日志每次审核写一条无载荷记录（版本、`run_id` /
+`item_id` / `review_id`、预算、耗时、HTTP 状态、返回 token 用量）。结果页的成功与失败审核都进汇总、按
+`review_id` 去重，请求事实没记录下来的单独计数，不按 0 补进 HTTP 尝试数。
+
+每轮结束后可以用同一提交的脚本采集诊断数据（**ZIP 只用于分析，不是一致性恢复备份**）：
+
+```sh
+python3 /absolute/scripts/collect-run-data.py \
+  --state-dir /absolute/confirmed/state \
+  --output /absolute/private/dustkeeper-run-YYYYMMDD-HHMMSS.zip
+```
+
+白名单只有四份标准 JSONL 日志与 `reports/latest.json`，新建 0600 ZIP、不覆盖已有文件，清单逐一记录
+状态/大小/SHA-256/读取期间变化，缺失或超限明确标成缺项。
 
 要不要保留、保留哪一套，先出计划再动手。`retention plan` 读一份声明式清单（应用、发布集合、组件、
 活动引用），给出"留哪一套、为什么、其余为什么是例外"；它只出计划，候选仍要走规则与双模型门禁：
@@ -85,10 +103,16 @@ dustkeeper review unknown resolve --item <item_id> --action quarantine \
 dustkeeper retention plan --manifest /srv/apps/manifest.json
 ```
 
-预算分层（整次任务 / 一个批次 / 单次请求）、两种"没有结论"的处置表、清单格式，见
-[运维手册 8.2–8.4](docs/operations.md)。发布、升级、真实运行与调度验收的六步执行计划见
-[后续执行计划](docs/tasks/dustkeeper-next-steps-20261106.md)；接手核对记录与尚未执行的
-[验收记录模板](docs/tasks/acceptance.md) 如实标注了当前停留在哪一步。
+共享路径被两个应用声明时，任何一方的「保留」结论优先，另一方不再把它列为候选；清单会列出
+`shared_paths`。状态库从 schema 3/4 升到 5 只能由显式 `init` 完成，`status` / `run` 不会自动迁移，
+升级前按运维手册 §3.1 与 §11 备份并核对旧配置。预算分层（整次任务 / 一个批次 / 单次请求）、
+四种"没有结论"的处置表、清单格式与采集边界，见 [运维手册 8.2–8.6](docs/operations.md)。
+发布、升级、真实运行与调度验收的六步执行计划见
+[后续执行计划](docs/tasks/dustkeeper-next-steps-20261106.md)；[接手核对记录](docs/tasks/handover-20261107.md)
+与 [验收记录模板](docs/tasks/acceptance.md) 如实标注了当前停留在哪一步。
+
+**`run` 不支持 `--scope`**：它处理整个实例可能触达的所有范围。首跑前必须核对整个实例的 scope、pending、
+到期清空队列与授权范围，不能靠加参数缩小首跑范围。
 
 **哪些还没验证（别当成已验证）：**
 
@@ -121,6 +145,10 @@ Dustkeeper 无法撤销；恢复不会覆盖已存在的目标**；删不干净�
 > 审核表或任何模型调用链。因此不能把本版本描述成"已完成 JEV 判定 + LLM 二次确认"。
 >
 > 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
+
+以上是 **2026-10-30 的历史收口说明**。本工作区后续已实现双模型审核链与 schema 3/4 → 5 的显式 `init`
+升级（独立的最小升级路径，不等于二期设计整体落地）；当前范围见上文「日常操作」与
+[运维手册 §3.1](docs/operations.md)。
 
 **收口清单（2026-10-30）**
 
@@ -308,7 +336,7 @@ checksum、这份制品实际跑过哪些动作。发布清单来自这些事实
 - [`docs/operations.md`](docs/operations.md)：安装、定时任务、恢复流程、故障处理、备份与卸载。
 - [`docs/architecture.md`](docs/architecture.md)：模块边界、状态机、对账矩阵、跨平台文件操作。
 - [`docs/compliance.md`](docs/compliance.md)：FINAL 状态表（A01–A12）与证据；旧清单已标为历史。
-- [`docs/phase2-design.md`](docs/phase2-design.md)：二期设计（模型复核约束新隔离、schema 4 升级、失败矩阵、验收语料）。**已暂缓，非本次发布范围，当前不实施。**
+- [`docs/phase2-design.md`](docs/phase2-design.md)：二期设计（模型复核约束新隔离、schema 4 升级、失败矩阵、验收语料）。**该设计文档整体仍暂缓**；本工作区的 schema 5 显式升级是另一条独立的最小路径，见 [运维手册 §3.1](docs/operations.md)。
 - [`docs/evidence/`](docs/evidence/)：扫描/资源实测的原始 JSON 与摘要；`deployment-*.md` 是目标机器的有限部署记录。
 - [`packaging/`](packaging/)：`install.sh` / `uninstall.sh`，在目标机器上渲染并安装定时任务模板。
 

@@ -130,16 +130,78 @@ func TestAClientReferencedByAnOldPointerIsNotACandidate(t *testing.T) {
 	}
 }
 
-// TestAPathDeclaredByTwoApplicationsIsRefused keeps "may this be dropped"
-// answerable: one file, two owners, and neither can answer for the other.
-func TestAPathDeclaredByTwoApplicationsIsRefused(t *testing.T) {
+// A shared path is not a reason to refuse the whole manifest. It is a reason to
+// let one application's keep conclusion outrank another's proposal: one file,
+// two owners, and the one that still runs it decides for both.
+func TestASharedPathIsKeptWhenEitherApplicationKeepsIt(t *testing.T) {
 	raw := []byte(`{"schema":1,"applications":[
-	  {"name":"a","releases":[{"id":"1","published_at":"2026-01-01T00:00:00Z","published":true,"complete":true,
-	    "components":[{"path":"/srv/shared.jar","sha256":"x"}]}]},
-	  {"name":"b","releases":[{"id":"1","published_at":"2026-01-01T00:00:00Z","published":true,"complete":true,
-	    "components":[{"path":"/srv/shared.jar","sha256":"x"}]}]}]}`)
-	if _, err := Parse(raw); err == nil {
-		t.Fatal("a path declared by two applications was accepted")
+	  {"name":"a","releases":[
+	    {"id":"old","published_at":"2026-01-01T00:00:00Z","published":true,"complete":true,
+	      "components":[{"path":"/srv/shared.jar","sha256":"x"}]},
+	    {"id":"new","published_at":"2026-02-01T00:00:00Z","published":true,"complete":true,
+	      "components":[{"path":"/srv/a-new.jar","sha256":"y"}]}],
+	   "references":[{"path":"/srv/shared.jar","why":"a.service is running it","active":true}]},
+	  {"name":"b","releases":[
+	    {"id":"old","published_at":"2026-01-01T00:00:00Z","published":true,"complete":true,
+	      "components":[{"path":"/srv/shared.jar","sha256":"x"}]},
+	    {"id":"new","published_at":"2026-03-01T00:00:00Z","published":true,"complete":true,
+	      "components":[{"path":"/srv/b-new.jar","sha256":"z"}]}]}]}`)
+	m, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("a shared path made the whole manifest unusable: %v", err)
+	}
+	plan := Build(m)
+	if len(plan.SharedPaths) != 1 || plan.SharedPaths[0] != "/srv/shared.jar" {
+		t.Fatalf("the shared path was not reported: %v", plan.SharedPaths)
+	}
+	for _, ap := range plan.Apps {
+		for _, c := range ap.Candidates {
+			if c.Path == "/srv/shared.jar" {
+				t.Fatalf("application %s offered a shared path that another application keeps", ap.App)
+			}
+		}
+		found := false
+		for _, k := range ap.Keep {
+			if k.Path == "/srv/shared.jar" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("application %s did not record the shared path as kept", ap.App)
+		}
+		if ap.GoalMet {
+			t.Fatalf("application %s claims exactly one set while a shared file keeps another", ap.App)
+		}
+	}
+	// The application that proposed it now says why it was withdrawn.
+	b := plan.Apps[1]
+	if !strings.Contains(strings.Join(b.Notes, "\n"), "kept by application a") {
+		t.Fatalf("the withdrawn proposal was not explained: %v", b.Notes)
+	}
+}
+
+// With no keep conclusion anywhere, the ambiguity is stated rather than hidden
+// and the proposal remains a proposal (all the existing gates still apply).
+func TestASharedPathNobodyKeepsIsCalledOut(t *testing.T) {
+	m := Manifest{Schema: 1, Applications: []App{
+		{Name: "a", Releases: []Release{
+			{ID: "old", PublishedAt: "2026-01-01T00:00:00Z", Published: true, Complete: true,
+				Components: []Component{{Path: "/srv/shared.jar", SHA256: "x"}}},
+			{ID: "new", PublishedAt: "2026-02-01T00:00:00Z", Published: true, Complete: true,
+				Components: []Component{{Path: "/srv/a-new.jar", SHA256: "y"}}},
+		}},
+		{Name: "b", Releases: []Release{
+			{ID: "old", PublishedAt: "2026-01-01T00:00:00Z", Published: true, Complete: true,
+				Components: []Component{{Path: "/srv/shared.jar", SHA256: "x"}}},
+			{ID: "new", PublishedAt: "2026-03-01T00:00:00Z", Published: true, Complete: true,
+				Components: []Component{{Path: "/srv/b-new.jar", SHA256: "z"}}},
+		}},
+	}}
+	plan := Build(m)
+	for _, ap := range plan.Apps {
+		if !strings.Contains(strings.Join(ap.Notes, "\n"), "clarify ownership before cleaning") {
+			t.Fatalf("application %s hid the shared-path ambiguity: %v", ap.App, ap.Notes)
+		}
 	}
 }
 

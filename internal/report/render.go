@@ -152,6 +152,11 @@ func Render(page Page) string {
 		for _, e := range page.Kept.Entries {
 			why := mdCell(reasonOf(e))
 			flag := reviewFlag(e)
+			if e.ReviewID != "" {
+				// The same id joins the dispatch row, the decision event and the
+				// operational log. It is an identifier, not a file path.
+				flag = strings.TrimSpace(flag + " · 关联审核 " + mdCell(e.ReviewID))
+			}
 			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n",
 				mdCode(e.Path), humanBytes(e.SizeBytes),
 				time.Unix(0, e.AtNS).Format("2006-01-02 15:04:05"), why, flag)
@@ -164,13 +169,14 @@ func Render(page Page) string {
 // writeReviewSummary states the reviews that produced no decision. Without it a
 // page of keeps reads as "the models said no" even when nothing was ever asked.
 func writeReviewSummary(b *strings.Builder, s Summary) {
-	if s.NotStarted == 0 && s.UnknownHeld == 0 && s.ReviewFailed == 0 && s.CostUnknown == 0 {
+	if s.Reviewed == 0 && s.NotStarted == 0 && s.UnknownHeld == 0 &&
+		s.ReviewFailed == 0 && s.CostUnknown == 0 && s.FactsUnknown == 0 {
 		return
 	}
 	b.WriteString("## 本轮审核\n\n")
 	fmt.Fprintf(b, "- 已取得判断：%d\n", s.Reviewed)
 	if s.NotStarted > 0 {
-		fmt.Fprintf(b, "- 未开始（预算用完，未发出请求）：%d\n", s.NotStarted)
+		fmt.Fprintf(b, "- 未开始（本轮未发出请求）：%d\n", s.NotStarted)
 	}
 	if s.ReviewFailed > 0 {
 		fmt.Fprintf(b, "- 请求未取得结果（文件未动）：%d\n", s.ReviewFailed)
@@ -180,6 +186,9 @@ func writeReviewSummary(b *strings.Builder, s Summary) {
 	}
 	if s.CostUnknown > 0 {
 		fmt.Fprintf(b, "- 费用未知（不能按 0 计）：%d\n", s.CostUnknown)
+	}
+	if s.FactsUnknown > 0 {
+		fmt.Fprintf(b, "- 请求事实未记录：%d（未计入下方的 HTTP 尝试数，也不能按 0 理解）\n", s.FactsUnknown)
 	}
 	fmt.Fprintf(b, "- 本窗口 HTTP 尝试：%d 次\n\n", s.Attempts)
 }

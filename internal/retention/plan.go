@@ -83,6 +83,7 @@ const (
 	ReasonIncomplete     = "incomplete_release_kept_for_inspection"
 	ReasonSuperseded     = "superseded_release"
 	ReasonComponentInUse = "component_still_referenced"
+	ReasonSharedKeep     = "shared_path_kept_by_another_application"
 )
 
 // Kept is one path the plan keeps, with the reason that decides it.
@@ -121,13 +122,20 @@ type Plan struct {
 	Apps           []AppPlan `json:"apps"`
 	KeptFiles      int       `json:"kept_files"`
 	CandidateFiles int       `json:"candidate_files"`
+	// SharedPaths are paths declared by more than one application. They are
+	// reported rather than hidden: Build makes one application's keep conclusion
+	// outrank every other application's proposal to clean the same file.
+	SharedPaths []string `json:"shared_paths,omitempty"`
 	// GoalMet is true only when every application met its goal.
 	GoalMet bool `json:"goal_met"`
 }
 
-// Parse reads and validates a manifest. Every path must be absolute and unique
-// across applications: the same file belonging to two applications makes "may
-// this set be dropped" unanswerable.
+// Parse reads and validates a manifest. Every path must be absolute and clean.
+//
+// A path may legitimately be declared by more than one application - a shared
+// library is the ordinary case. Refusing the whole manifest for that used to
+// leave no plan at all, which is worse than a conservative plan: keep wins for
+// shared paths in Build, and the declaration is still fully validated here.
 func Parse(raw []byte) (Manifest, error) {
 	if len(raw) > MaxManifestBytes {
 		return Manifest{}, fmt.Errorf("manifest exceeds %d bytes", MaxManifestBytes)
@@ -145,7 +153,6 @@ func Parse(raw []byte) (Manifest, error) {
 	if len(m.Applications) == 0 {
 		return Manifest{}, errors.New("manifest declares no applications")
 	}
-	owner := map[string]string{}
 	names := map[string]bool{}
 	for i := range m.Applications {
 		app := &m.Applications[i]
@@ -179,10 +186,6 @@ func Parse(raw []byte) (Manifest, error) {
 				if err := checkPath(c.Path); err != nil {
 					return Manifest{}, fmt.Errorf("release %s/%s: %w", app.Name, rel.ID, err)
 				}
-				if other, ok := owner[c.Path]; ok && other != app.Name {
-					return Manifest{}, fmt.Errorf("path %s is declared by both %q and %q", c.Path, other, app.Name)
-				}
-				owner[c.Path] = app.Name
 			}
 		}
 		for _, group := range [][]Reference{app.References, app.Protections, app.Unresolved} {
@@ -206,19 +209,111 @@ func checkPath(p string) error {
 	return nil
 }
 
-// Plan computes what each application must keep.
+// Build computes what each application must keep.
+//
+// Plans are computed per application first, then reconciled once across the
+// whole manifest. The second step exists for one specific case: the same path
+// belongs to two applications, one keeps it, and the other would offer it as a
+// superseded component. "Keep" wins. A shared file that one service still runs
+// is not a cleaning candidate for any other service, and a plan that quietly
+// listed it on both sides would be unanswerable from the page.
 func Build(m Manifest) Plan {
 	out := Plan{GoalMet: true}
+	apps := make([]AppPlan, 0, len(m.Applications))
 	for _, app := range m.Applications {
-		ap := planApp(app)
+		apps = append(apps, planApp(app))
+	}
+
+	shared := sharedPaths(m)
+	for path := range shared {
+		out.SharedPaths = append(out.SharedPaths, path)
+	}
+	sort.Strings(out.SharedPaths)
+
+	// path -> the application whose keep decision outranks the other proposals.
+	keepWinner := map[string]string{}
+	for _, ap := range apps {
+		for _, k := range ap.Keep {
+			if _, ok := shared[k.Path]; ok && keepWinner[k.Path] == "" {
+				keepWinner[k.Path] = ap.App
+			}
+		}
+	}
+	for i := range apps {
+		ap := &apps[i]
+		var remaining []Candidate
+		for _, c := range ap.Candidates {
+			owner, kept := keepWinner[c.Path]
+			if !kept || owner == ap.App {
+				remaining = append(remaining, c)
+				continue
+			}
+			// The same path is kept in this application's list too, so "what is
+			// on this host" and "what may be proposed" cannot disagree.
+			ap.Keep = append(ap.Keep, Kept{Path: c.Path, Release: c.Release,
+				Reason: ReasonSharedKeep, Detail: "kept by application " + owner})
+			ap.GoalMet = false
+			ap.Notes = append(ap.Notes, fmt.Sprintf(
+				"shared path %s is kept by application %s; it is not offered for cleaning here", c.Path, owner))
+		}
+		ap.Candidates = remaining
+		ap.Keep = sortedKeptSlice(ap.Keep)
+		for _, c := range ap.Candidates {
+			if owners, ok := shared[c.Path]; ok && keepWinner[c.Path] == "" {
+				ap.Notes = append(ap.Notes, fmt.Sprintf(
+					"shared path %s is declared by %d applications and no application keeps it; clarify ownership before cleaning",
+					c.Path, len(owners)))
+			}
+		}
+	}
+	for _, ap := range apps {
 		if !ap.GoalMet {
 			out.GoalMet = false
 		}
 		out.KeptFiles += len(ap.Keep)
 		out.CandidateFiles += len(ap.Candidates)
-		out.Apps = append(out.Apps, ap)
+	}
+	out.Apps = apps
+	return out
+}
+
+// sharedPaths finds paths declared by more than one application. A path named
+// twice by the same application is not shared; counting an application once per
+// path keeps the result about ownership, not about how many releases list it.
+func sharedPaths(m Manifest) map[string][]string {
+	owners := map[string][]string{}
+	for _, app := range m.Applications {
+		seen := map[string]bool{}
+		add := func(p string) {
+			if seen[p] {
+				return
+			}
+			seen[p] = true
+			owners[p] = append(owners[p], app.Name)
+		}
+		for _, rel := range app.Releases {
+			for _, c := range rel.Components {
+				add(c.Path)
+			}
+		}
+		for _, group := range [][]Reference{app.References, app.Protections, app.Unresolved} {
+			for _, r := range group {
+				add(r.Path)
+			}
+		}
+	}
+	out := map[string][]string{}
+	for p, names := range owners {
+		if len(names) > 1 {
+			out[p] = names
+		}
 	}
 	return out
+}
+
+func sortedKeptSlice(in []Kept) []Kept {
+	sort.SliceStable(in, func(i, j int) bool { return in[i].Path < in[j].Path })
+	return in
 }
 
 func planApp(app App) AppPlan {

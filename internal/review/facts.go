@@ -123,6 +123,10 @@ func (s *Service) Review(ctx context.Context, r Request) (Decision, Approval, er
 		}
 		decision.Verdict = domain.VerdictKeep
 		decision.Failure = classify(err, decision.Attempts)
+		var rf *RequestFailure
+		if errors.As(err, &rf) && rf != nil {
+			decision.HTTPStatus = rf.Status
+		}
 		// LLMConsulted is left exactly as the judge set it: a MiniMax request
 		// that was sent and timed out was still consulted, and clearing the flag
 		// here is what made the log say "not called or not recorded".

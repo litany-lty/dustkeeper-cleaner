@@ -53,6 +53,15 @@ func cmdInit(ctx context.Context, a *app, args []string) (output, error) {
 		return output{}, errs.Wrap(errs.CodeAccessDenied, err)
 	}
 
+	// `init` is the only command allowed to move a known older schema forward.
+	// Every other command opens the database with OpenExisting, which refuses a
+	// version mismatch without changing a byte. The operator has to stop the
+	// schedule, check sidecars and take a backup before running this.
+	upgrade, err := store.UpgradeExplicit(a.paths.DBFile)
+	if err != nil {
+		return output{}, err
+	}
+
 	st, err := store.Open(a.paths.DBFile)
 	if err != nil {
 		return output{}, err
@@ -92,6 +101,7 @@ func cmdInit(ctx context.Context, a *app, args []string) (output, error) {
 		"log_dir":        a.paths.LogDir,
 		"instance_id":    instID,
 		"config_created": createdConfig,
+		"schema_upgrade": upgrade,
 		"stats":          stats,
 	}
 	out.Human = []string{
@@ -99,10 +109,15 @@ func cmdInit(ctx context.Context, a *app, args []string) (output, error) {
 		"  database: " + a.paths.DBFile,
 		"  config:   " + a.paths.ConfigFile,
 		"  instance: " + instID,
+	}
+	if upgrade.Upgraded {
+		out.Human = append(out.Human, fmt.Sprintf("  upgraded state schema %d -> %d explicitly", upgrade.From, upgrade.To))
+	}
+	out.Human = append(out.Human,
 		"",
 		"Nothing is monitored yet. Register a directory you own:",
 		"  dustkeeper scope add --path <dir> --kind observe --name <id>",
-	}
+	)
 	out.Next = []string{"dustkeeper scope add --path <dir> --kind observe --name <id>"}
 	return out, nil
 }
@@ -955,6 +970,8 @@ func (a *app) executor() *execute.Executor {
 	return &execute.Executor{
 		Review:       rev.reviewerFunc(),
 		ReviewBudget: rev,
+		RunID:        a.runID,
+		Diag:         a.reviewDiag(),
 		Store:        a.store,
 		Clock:        a.clock,
 		Config: execute.ConfigView{

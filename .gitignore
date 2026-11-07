@@ -13,6 +13,10 @@ coverage.*
 # macOS metadata.
 .DS_Store
 
+# Python bytecode from the diagnostic scripts' own test runs.
+__pycache__/
+*.pyc
+
 # Stray binaries from `go build ./build/<cmd>` run at the repo root.
 /verify-artifact
 /review-eval

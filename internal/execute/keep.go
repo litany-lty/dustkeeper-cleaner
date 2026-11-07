@@ -120,7 +120,8 @@ func reviewFactsJSON(d review.Decision) string {
 // It is written before the keep record so a crash between the two loses the
 // decision but not the possibility that the request was billed. The next run
 // reads this row and does not ask again until a person resolves it.
-func (e *Executor) noteUnknownRequest(ctx context.Context, sc *ScopeCtx, it store.Item, action string, d review.Decision) error {
+func (e *Executor) noteUnknownRequest(ctx context.Context, sc *ScopeCtx, it store.Item, action string,
+	d review.Decision, identity, token string) error {
 	if d.Attempts <= 0 {
 		return nil
 	}
@@ -129,8 +130,8 @@ func (e *Executor) noteUnknownRequest(ctx context.Context, sc *ScopeCtx, it stor
 		Action:       action,
 		ScopeID:      string(sc.Scope.ID),
 		PathB64:      plan.B64(it.RawRelative),
-		IdentityJSON: it.PreIdentityJSON,
-		TokenJSON:    it.PreTokenJSON,
+		IdentityJSON: identity,
+		TokenJSON:    token,
 		CreatedNS:    e.Clock.Wall().UnixNano(),
 		Attempts:     d.Attempts,
 		Failure:      d.Failure,
@@ -139,24 +140,32 @@ func (e *Executor) noteUnknownRequest(ctx context.Context, sc *ScopeCtx, it stor
 }
 
 // heldUnknownRequest reports whether an unresolved request exists for exactly
-// these bytes. A file that has changed since is a different question, so the old
-// row does not suppress a new one - it stays on record either way.
-func (e *Executor) heldUnknownRequest(ctx context.Context, sc *ScopeCtx, it store.Item, action string) (bool, error) {
+// these bytes. It checks both the unanswered-request table and a dispatch row
+// that was prepared but never settled - a process that died between sending the
+// first request and recording its answer leaves the second kind behind.
+// A file that has changed since is a different question, so the old row does
+// not suppress a new one - it stays on record either way.
+func (e *Executor) heldUnknownRequest(ctx context.Context, sc *ScopeCtx, it store.Item,
+	action, identity, token string) (bool, error) {
 	rows, err := e.Store.OpenReviewUnknown(ctx, string(sc.Scope.ID), plan.B64(it.RawRelative), action)
 	if err != nil {
 		return false, err
 	}
 	for _, u := range rows {
-		if u.IdentityJSON == it.PreIdentityJSON && u.TokenJSON == it.PreTokenJSON {
+		if u.IdentityJSON == identity && u.TokenJSON == token {
 			return true, nil
 		}
 	}
-	return false, nil
+	pending, err := e.Store.OpenDispatchFor(ctx, string(it.ID), action, identity, token)
+	if err != nil {
+		return false, err
+	}
+	return len(pending) > 0, nil
 }
 
 // recordReviewInfo writes an item-scoped review fact that is neither a decision
 // nor an action: a batch that never started, or a standing unresolved request.
-func (e *Executor) recordReviewInfo(ctx context.Context, sc *ScopeCtx, p store.Plan, it store.Item,
+func (e *Executor) recordReviewInfo(ctx context.Context, sc *ScopeCtx, planID *domain.PlanID, it store.Item,
 	action, eventAction, reason string, d review.Decision) error {
 	ruleDigest := ""
 	if binding, err := PlanBindingOf(it); err == nil && binding.RuleDigest != nil {
@@ -170,7 +179,7 @@ func (e *Executor) recordReviewInfo(ctx context.Context, sc *ScopeCtx, p store.P
 	return e.Store.AppendEvent(ctx, store.Event{
 		EventID:         domain.NewID("ev"),
 		ItemID:          &it.ID,
-		ExecutionPlanID: &p.ID,
+		ExecutionPlanID: planID,
 		Action:          eventAction,
 		Phase:           domain.PhaseInfo,
 		OccurredAtNS:    e.Clock.Wall().UnixNano(),
@@ -184,12 +193,19 @@ func (e *Executor) recordReviewInfo(ctx context.Context, sc *ScopeCtx, p store.P
 // keepRecord is the payload of a keep, kept in one place so a new field cannot
 // be added to one branch and forgotten in the other.
 func reviewPayload(reviewed review.Outcome, it store.Item) string {
+	// The correlation id is present only when a request was actually prepared.
+	// A local refusal or a standing hold has no review to join, and writing an
+	// invented id there would let a result page claim a request that never was.
+	correlation := ""
+	if reviewed.ReviewID != "" {
+		correlation = `,"review_id":` + quoteJSON(reviewed.ReviewID)
+	}
 	return `{"source":"decision","disposition":` + quoteJSON(domain.DispositionKeep) +
 		`,"reason":` + quoteJSON(reviewed.Reason) +
 		`,"reason_text":` + quoteJSON(outcome.ReasonText(reviewed.Reason)) +
 		`,"verdict":` + quoteJSON(reviewed.Decision.Verdict) +
 		`,"model_error":` + quoteJSON(reviewed.Decision.ModelError) +
-		`,"review":` + reviewFactsJSON(reviewed.Decision) +
+		`,"review":` + reviewFactsJSON(reviewed.Decision) + correlation +
 		// The version this decision was about. Without it a later run can only
 		// ask "was this path kept", which would also silence a different file
 		// that has since been created at the same place.

@@ -132,6 +132,10 @@ type Decision struct {
 	// not_sent, unknown, or usage_recorded (token counts arrived; the amount
 	// still depends on billing evidence).
 	CostStatus string `json:"cost_status"`
+	// HTTPStatus is the last provider status the transport saw, or 0 when the
+	// failure happened before an HTTP response arrived. It is diagnostic, not
+	// proof of billing or receipt.
+	HTTPStatus int `json:"http_status,omitempty"`
 }
 
 // Attempted reports whether any provider request was made for this candidate.
@@ -182,6 +186,10 @@ type Outcome struct {
 	Approval    Approval
 	Disposition string
 	Reason      string
+	// ReviewID correlates one review with the prepared dispatch row, the
+	// decision event and the result-page entry. Empty on debug paths that do
+	// not open a state database.
+	ReviewID string
 }
 
 // Approval is checked outside the critical section (Verify), then checked again

@@ -242,6 +242,7 @@ def collect_entries(executable, page, timeout):
                 recorded["attempts"] = None
             recorded["page_cost_status"] = str(entry.get("cost_status", ""))
             recorded["page_review_state"] = str(entry.get("review_state", ""))
+            recorded["page_review_id"] = str(entry.get("review_id", ""))
             rows.append(
                 {
                     "outcome": outcome,
@@ -340,6 +341,7 @@ def build_receipt(
                 "review_failed": int(review_summary.get("review_failed_kept", 0) or 0) if review_summary else None,
                 "http_attempts": int(review_summary.get("http_attempts", 0) or 0) if review_summary else None,
                 "cost_unknown": int(review_summary.get("cost_unknown", 0) or 0) if review_summary else None,
+                "facts_unknown": int(review_summary.get("review_facts_unknown", 0) or 0) if review_summary else None,
                 "run_not_started": int(run.get("review_not_started_total", 0) or 0) if "review_not_started_total" in run else None,
                 "run_unknown_held": int(run.get("review_unknown_held_total", 0) or 0) if "review_unknown_held_total" in run else None,
             },
@@ -413,18 +415,21 @@ def render(receipt):
         )
     review = summary.get("review") or {}
     if review and (review.get("not_started") or review.get("unknown_held")
-                   or review.get("review_failed") or review.get("cost_unknown")):
+                   or review.get("review_failed") or review.get("cost_unknown")
+                   or review.get("facts_unknown") or review.get("reviewed")):
         lines.extend(["", "## 审核情况", ""])
         if review.get("reviewed") is not None:
             lines.append(f"已取得判断：{review['reviewed']} 个")
         if review.get("not_started"):
-            lines.append(f"未开始（预算用完，未发出请求）：{review['not_started']} 个，不产生请求费用")
+            lines.append(f"未开始（本轮未发出请求）：{review['not_started']} 个，不产生请求费用")
         if review.get("review_failed"):
             lines.append(f"请求未取得结果（文件未动）：{review['review_failed']} 个")
         if review.get("unknown_held"):
             lines.append(f"上次请求结果未知、本轮未重复请求：{review['unknown_held']} 个")
         if review.get("cost_unknown"):
             lines.append(f"费用未知（不能按 0 计）：{review['cost_unknown']} 个")
+        if review.get("facts_unknown"):
+            lines.append(f"请求事实未记录：{review['facts_unknown']} 个，未计入 HTTP 尝试数，也不能按 0 理解")
         if review.get("http_attempts") is not None:
             lines.append(f"本窗口 HTTP 尝试：{review['http_attempts']} 次")
         if review.get("not_started") is None and review.get("review_failed") is None:
@@ -462,6 +467,9 @@ def render(receipt):
                 f"- 依据：{entry['reason_text'] or entry['reason'] or '当前制品未记录'}",
             ]
         )
+        if review.get("page_review_id"):
+            lines.append("- 关联审核：" + md_code(review["page_review_id"])
+                         + "（`review dispatch list` 可核对请求结算）")
         # One line per outcome stating what was done to the file, so "waiting to
         # be deleted" is never read as "deleted", and the observation section
         # carries the two things a reader needs next: until when it stays, and

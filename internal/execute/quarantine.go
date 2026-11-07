@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -42,6 +43,12 @@ type Executor struct {
 	// ReviewBudget is the batch allowance the reviewer applies. A nil field
 	// means the reviewer owns its own limits (debug commands).
 	ReviewBudget ReviewBudget
+	// RunID correlates every prepared review of one invocation with the
+	// operational log and the dispatch records. Empty on debug paths.
+	RunID string
+	// Diag writes one bounded review record per request. Nil drops the record,
+	// which is what a debug command without a state directory does.
+	Diag func(ReviewDiag)
 }
 
 // ConfigView is the subset of configuration the executor needs.
@@ -214,6 +221,7 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 	if action == domain.DispositionDelete {
 		spend = pBudget
 	}
+	budgetJSON := dispatchBudgetJSON(action, spend)
 	if spend != nil && (spend.TimeUp(e.Clock) || !spend.CanReserve(preTok.Size) || spend.RemainingRead() < preTok.Size*2) {
 		return res, errs.New(errs.CodeBudgetExhausted, "action budget unavailable before review")
 	}
@@ -221,13 +229,15 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 	// An earlier request for this exact object and action may still be
 	// unanswered. Asking again would be a second payment for the same question,
 	// and nothing about a new process, a restart or a re-scan settles it.
-	if held, herr := e.heldUnknownRequest(ctx, sc, it, action); herr != nil {
+	if held, herr := e.heldUnknownRequest(ctx, sc, it, action, it.PreIdentityJSON, it.PreTokenJSON); herr != nil {
 		return res, herr
 	} else if held {
+		e.diagNoRequest(it, action, "awaiting_request_check",
+			dkoutcome.ReasonRequestCheckHold, budgetJSON)
 		out := review.Outcome{Reason: dkoutcome.ReasonRequestCheckHold,
 			Decision: review.Decision{Verdict: domain.VerdictKeep, CostStatus: review.CostUnknown,
 				ModelError: "an earlier request for this object is still unresolved"}}
-		if err := e.recordReviewInfo(ctx, sc, p, it, action, "review_hold",
+		if err := e.recordReviewInfo(ctx, sc, &p.ID, it, action, "review_hold",
 			dkoutcome.ReasonRequestCheckHold, out.Decision); err != nil {
 			return res, err
 		}
@@ -256,7 +266,8 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 	if failure := e.reviewAllowance(); failure != "" {
 		d := review.Decision{Verdict: domain.VerdictKeep, Failure: failure, CostStatus: review.CostNotSent,
 			ModelError: "review was not started: this batch has no allowance left"}
-		if err := e.recordReviewInfo(ctx, sc, p, it, action, "review_not_started",
+		e.diagNoRequest(it, action, "not_started", failure, budgetJSON)
+		if err := e.recordReviewInfo(ctx, sc, &p.ID, it, action, "review_not_started",
 			dkoutcome.ReasonNotStartedBudget, d); err != nil {
 			return res, err
 		}
@@ -291,15 +302,33 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 		res.Message = facts.Why
 	}
 
+	// The request is recorded before it is sent. If the record cannot be
+	// written, no question is asked and no approval is used.
+	reviewID := domain.NewID("rev")
+	if err := e.prepareReview(ctx, it, string(sc.Scope.ID), action, reviewID,
+		budgetJSON, it.PreIdentityJSON, it.PreTokenJSON); err != nil {
+		return res, err
+	}
+	started := time.Now()
 	outcome, err := e.reviewItem(ctx, req)
 	if err != nil {
+		if rerr := e.refuseReview(ctx, it, &p.ID, reviewID, action, e.Clock.Wall().UnixNano(),
+			err.Error(), budgetJSON); rerr != nil {
+			return res, rerr
+		}
+		return res, err
+	}
+	outcome.ReviewID = reviewID
+	// Settlement and the decision event are one transaction. A failure here
+	// must not let an approval reach a file action.
+	if err := e.settleReview(ctx, it, &p.ID, reviewID, action, started, outcome, budgetJSON); err != nil {
 		return res, err
 	}
 	// The request was sent and no answer came back: record that fact before the
 	// keep, so a crash between the two loses the decision but never the
 	// possibility that the request was billed.
 	if outcome.Reason == dkoutcome.ReasonReviewUnknown {
-		if uerr := e.noteUnknownRequest(ctx, sc, it, action, outcome.Decision); uerr != nil {
+		if uerr := e.noteUnknownRequest(ctx, sc, it, action, outcome.Decision, it.PreIdentityJSON, it.PreTokenJSON); uerr != nil {
 			return res, uerr
 		}
 	}

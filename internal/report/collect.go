@@ -54,6 +54,10 @@ type Entry struct {
 	// Operation is the intent that produced this line, so a reader can trace one
 	// row back to its record.
 	Operation string `json:"operation,omitempty"`
+	// ReviewID is the correlation id of the one prepared request behind this
+	// line. It is the key that joins the result page, the review_dispatch row,
+	// the decision event and the operational log.
+	ReviewID string `json:"review_id,omitempty"`
 	// Review facts, copied from the record. A line that says "kept" without
 	// saying whether anything was asked is the ambiguity this field removes.
 	Failure     string `json:"review_failure,omitempty"`
@@ -65,12 +69,19 @@ type Entry struct {
 // Summary counts what the three sections cannot: reviews that produced no
 // decision. They are not keeps and they are not failures of a file action.
 type Summary struct {
-	Reviewed     int `json:"reviewed"`
+	Reviewed int `json:"reviewed"`
+	// NotStarted counts reviews that never sent a request: a spent allowance or
+	// a local refusal before the first provider call.
 	NotStarted   int `json:"review_not_started"`
 	UnknownHeld  int `json:"review_unknown_held"`
 	ReviewFailed int `json:"review_failed_kept"`
 	Attempts     int `json:"http_attempts"`
 	CostUnknown  int `json:"cost_unknown"`
+	// FactsUnknown counts review records whose request facts are not measured.
+	// They are excluded from Attempts rather than added as zero: a zero would
+	// read as "we measured and nothing was sent", which is exactly what cannot
+	// be claimed for these records.
+	FactsUnknown int `json:"review_facts_unknown"`
 }
 
 // Section is one of the three lists, with what did not fit.
@@ -131,20 +142,21 @@ func Collect(ctx context.Context, st *store.Store, w Window) (Page, error) {
 	if err != nil {
 		return page, err
 	}
+	// The review summary is computed over the whole window before the sections
+	// are built. Successful and failed reviews both count, even when the answer
+	// led to a move or a deletion rather than a keep; the settlement event is
+	// the one authoritative record of each prepared request, keyed by review id.
+	tallyReviews(&page.Summary, events)
+
 	// One entry per item per section: several events can describe the same object
 	// (a retry, a reconciliation), and a page that lists a file twice reads like
 	// two files were deleted.
 	seen := map[sectionKey]struct{}{}
-	// The review-state facts are counted once per item, in the same window as
-	// the sections, so "three reviews not started" cannot be three events about
-	// one file.
-	seenReview := map[string]struct{}{}
 	for i := len(events) - 1; i >= 0; i-- {
 		ev := events[i]
 		if ev.ItemID == nil {
 			continue
 		}
-		tallyReview(&page.Summary, ev, seenReview)
 		section, ok := sectionOf(ev)
 		if !ok {
 			continue
@@ -270,7 +282,13 @@ func entryOf(section sectionKind, item store.Item, ev store.Event) (Entry, bool)
 		entry.Reason, entry.ReasonText = reasonFromEvent(ev)
 	case sectionKept:
 		entry.Reason, entry.ReasonText, entry.ModelFailed = keepReason(ev)
+		entry.ReviewState = reviewStateOf(entry.Reason)
 		fillReview(&entry, ev)
+	}
+	// A completed action also carries the review it was approved under when the
+	// record says so, so the same id can be followed from any section.
+	if entry.ReviewID == "" {
+		entry.ReviewID = reviewIDOf(ev)
 	}
 	return entry, true
 }
@@ -314,66 +332,185 @@ func keepReason(ev store.Event) (code, text string, modelFailed bool) {
 	return payload.Reason, text, payload.ModelError != ""
 }
 
-// tallyReview counts the reviews that produced no decision.
-func tallyReview(sum *Summary, ev store.Event, seen map[string]struct{}) {
-	key := string(*ev.ItemID) + "\x00" + ev.Action
-	switch ev.Action {
-	case "review_not_started":
-		if _, dup := seen[key]; dup {
-			return
+// reviewFacts is the settlement record of one prepared request. It is written
+// in the same transaction as the decision event, so one row here is one review,
+// whether the answer was a keep, a move, a deletion or a failure.
+type reviewFacts struct {
+	ReviewID   string `json:"review_id"`
+	Verdict    string `json:"verdict"`
+	Failure    string `json:"failure"`
+	Attempts   int    `json:"attempts"`
+	CostStatus string `json:"cost_status"`
+}
+
+// reviewIDOf finds the correlation id in either half of an event. Old records
+// have none; they are de-duplicated by item and action instead of being dropped
+// or, worse, merged into one invented review.
+func reviewIDOf(ev store.Event) string {
+	var body struct {
+		ReviewID string `json:"review_id"`
+	}
+	if ev.ResultJSON != nil && json.Unmarshal([]byte(*ev.ResultJSON), &body) == nil && body.ReviewID != "" {
+		return body.ReviewID
+	}
+	if ev.ContractJSON != "" && json.Unmarshal([]byte(ev.ContractJSON), &body) == nil {
+		return body.ReviewID
+	}
+	return ""
+}
+
+// tallyReviews counts every review of the window once.
+//
+// Pass one reads settlement events ("review"/info), which cover successful and
+// failed reviews alike and are keyed by review_id. Pass two reads the older
+// per-item state events so a page built from an older database still says
+// something true. A keep whose review_id was already counted in pass one is
+// skipped, otherwise one review would be reported twice.
+func tallyReviews(sum *Summary, events []store.Event) {
+	byReviewID := map[string]struct{}{}
+
+	for _, ev := range events {
+		if ev.Action != "review" || ev.Phase != domain.PhaseInfo {
+			continue
 		}
-		seen[key] = struct{}{}
-		sum.NotStarted++
-		var payload struct {
-			Review struct {
-				Attempts int `json:"http_attempts"`
-			} `json:"review"`
+		id := reviewIDOf(ev)
+		key := id
+		if key == "" {
+			// A settlement without a correlation id is still one record. Its
+			// event id keeps it distinct without merging it into another review.
+			key = "event:" + ev.EventID
 		}
-		if ev.ResultJSON != nil && json.Unmarshal([]byte(*ev.ResultJSON), &payload) == nil {
-			sum.Attempts += payload.Review.Attempts
+		if _, dup := byReviewID[key]; dup {
+			continue
 		}
-	case "review_hold":
-		if _, dup := seen[key]; dup {
-			return
+		byReviewID[key] = struct{}{}
+
+		var f reviewFacts
+		if ev.ResultJSON != nil {
+			_ = json.Unmarshal([]byte(*ev.ResultJSON), &f)
 		}
-		seen[key] = struct{}{}
-		sum.UnknownHeld++
-	case "review_unknown":
-		if _, dup := seen[key]; dup {
-			return
-		}
-		seen[key] = struct{}{}
-		sum.CostUnknown++
-	case "keep":
-		if ev.Phase != domain.PhaseInfo || ev.ResultJSON == nil {
-			return
-		}
-		var payload struct {
-			ModelError string `json:"model_error"`
-			Review     struct {
-				Attempts   int    `json:"http_attempts"`
-				CostStatus string `json:"cost_status"`
-			} `json:"review"`
-		}
-		if json.Unmarshal([]byte(*ev.ResultJSON), &payload) != nil {
-			return
-		}
-		if payload.Review.Attempts > 0 {
-			sum.Attempts += payload.Review.Attempts
-		}
-		if payload.Review.CostStatus == "unknown" {
-			sum.CostUnknown++
-		}
-		if payload.ModelError != "" {
+		switch {
+		case f.Verdict == "not_started" || (f.CostStatus == "" && f.Attempts == 0 && f.Failure == ""):
+			// A local refusal before any provider call, or a settlement whose
+			// request facts were never recorded. Nothing was sent, so this is
+			// not a provider failure and must not be counted as a judgment.
+			sum.NotStarted++
+		case f.CostStatus == "" && f.Attempts == 0:
+			// A failed review whose request facts are missing. Adding zero to
+			// the attempt total would turn "unknown" into "measured as none".
+			sum.FactsUnknown++
 			sum.ReviewFailed++
-			return
+		default:
+			if f.Attempts > 0 {
+				sum.Attempts += f.Attempts
+			}
+			if f.CostStatus == "unknown" {
+				sum.CostUnknown++
+			}
+			if f.Failure != "" {
+				sum.ReviewFailed++
+			} else {
+				sum.Reviewed++
+			}
 		}
-		sum.Reviewed++
+	}
+
+	seenLegacy := map[string]struct{}{}
+	for _, ev := range events {
+		if ev.ItemID == nil {
+			continue
+		}
+		key := string(*ev.ItemID) + "\x00" + ev.Action
+		switch ev.Action {
+		case "review":
+			continue // settled in pass one
+		case "review_not_started", "review_hold", "review_unknown":
+			if _, dup := seenLegacy[key]; dup {
+				continue
+			}
+			seenLegacy[key] = struct{}{}
+			switch ev.Action {
+			case "review_not_started":
+				sum.NotStarted++
+				var payload struct {
+					Review struct {
+						Attempts int `json:"http_attempts"`
+					} `json:"review"`
+				}
+				if ev.ResultJSON != nil && json.Unmarshal([]byte(*ev.ResultJSON), &payload) == nil && payload.Review.Attempts > 0 {
+					sum.Attempts += payload.Review.Attempts
+				}
+			case "review_hold":
+				sum.UnknownHeld++
+			case "review_unknown":
+				sum.CostUnknown++
+			}
+		case "keep":
+			if ev.Phase != domain.PhaseInfo || ev.ResultJSON == nil {
+				continue
+			}
+			if id := reviewIDOf(ev); id != "" {
+				if _, counted := byReviewID[id]; counted {
+					continue
+				}
+				if _, dup := byReviewID["keep:"+id]; dup {
+					continue
+				}
+				byReviewID["keep:"+id] = struct{}{}
+			} else {
+				if _, dup := seenLegacy[key]; dup {
+					continue
+				}
+				seenLegacy[key] = struct{}{}
+			}
+			var payload struct {
+				ModelError string `json:"model_error"`
+				Review     struct {
+					Attempts   int    `json:"http_attempts"`
+					CostStatus string `json:"cost_status"`
+				} `json:"review"`
+			}
+			if json.Unmarshal([]byte(*ev.ResultJSON), &payload) != nil {
+				continue
+			}
+			if payload.Review.Attempts > 0 {
+				sum.Attempts += payload.Review.Attempts
+			} else if payload.Review.CostStatus == "unknown" {
+				// Cost is unknown but the attempt count was not recorded. Do not
+				// pad the measured total with a zero.
+				sum.FactsUnknown++
+			}
+			if payload.Review.CostStatus == "unknown" {
+				sum.CostUnknown++
+			}
+			if payload.ModelError != "" {
+				sum.ReviewFailed++
+			} else {
+				sum.Reviewed++
+			}
+		}
 	}
 }
 
-// fillReview copies the request facts a keep record carries.
+// reviewStateOf names the three "no conclusion" outcomes from the reason the
+// keep record itself states. It is a rendering of a recorded reason, not an
+// inference from a verdict.
+func reviewStateOf(reason string) string {
+	switch reason {
+	case "not_started_budget":
+		return domain.ReviewNotStartedBudget
+	case "review_unknown":
+		return domain.ReviewUnknownResult
+	case "awaiting_request_check":
+		return domain.ReviewUnknownHold
+	}
+	return ""
+}
+
+// fillReview copies the request facts and the correlation id a keep record
+// carries.
 func fillReview(entry *Entry, ev store.Event) {
+	entry.ReviewID = reviewIDOf(ev)
 	if ev.ResultJSON == nil {
 		return
 	}

@@ -352,9 +352,6 @@ func (e *Executor) ApplyPurgePlan(ctx context.Context, sc *ScopeCtx, planID doma
 	if out.Code == string(errs.CodeBudgetExhausted) && out.Completed > 0 {
 		out.Code = string(errs.CodePartial)
 	}
-	if out.Code == string(errs.CodeBudgetExhausted) && out.Completed > 0 {
-		out.Code = string(errs.CodePartial)
-	}
 	// A specific stop code (PAUSED, HELD, PLAN_STALE, ...) is more useful than
 	// the generic PARTIAL: the caller's exit status depends on which condition
 	// actually stopped the batch.

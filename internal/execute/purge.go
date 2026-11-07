@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -12,6 +13,7 @@ import (
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/fsops"
+	dkoutcome "dustkeeper/internal/outcome"
 	"dustkeeper/internal/plan"
 	"dustkeeper/internal/policy"
 	"dustkeeper/internal/review"
@@ -139,10 +141,44 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		return res, errs.New(errs.CodeBudgetExhausted, "action budget unavailable before review")
 	}
 
-	// The expiry review asks the irreversible question and nothing else. An
-	// answer short of an explicit agreement leaves the object where it is: there
-	// is nothing reversible left to do with it, so "insufficient" here means
-	// "keep observing", not "move it somewhere quieter".
+	// The expiry review asks the irreversible question and nothing else. It uses
+	// the same gates as a first review: an unanswered earlier request must not
+	// be paid for again, and a candidate that has no allowance left is recorded
+	// as "not started" rather than as a provider outage.
+	planID := planIDOf(opt.Plan)
+	purgeIdentity, purgeToken := *it.CapturedIdentityJSON, *it.CapturedTokenJSON
+	budgetJSON := dispatchBudgetJSON(domain.ActionPurge, opt.Budget)
+	if held, herr := e.heldUnknownRequest(ctx, sc, it, domain.ActionPurge, purgeIdentity, purgeToken); herr != nil {
+		return res, herr
+	} else if held {
+		e.diagNoRequest(it, domain.ActionPurge, "awaiting_request_check",
+			dkoutcome.ReasonRequestCheckHold, budgetJSON)
+		if err := e.recordReviewInfo(ctx, sc, planID, it, domain.ActionPurge, "review_hold",
+			dkoutcome.ReasonRequestCheckHold, review.Decision{Verdict: domain.VerdictKeep,
+				CostStatus: review.CostUnknown, ModelError: "an earlier request for this object is still unresolved"}); err != nil {
+			return res, err
+		}
+		return e.recordKeep(ctx, sc, it, planID, review.Outcome{Reason: dkoutcome.ReasonRequestCheckHold,
+			Decision: review.Decision{Verdict: domain.VerdictKeep, CostStatus: review.CostUnknown,
+				ModelError: "an earlier request for this object is still unresolved"}})
+	}
+	if failure := e.reviewAllowance(); failure != "" {
+		d := review.Decision{Verdict: domain.VerdictKeep, Failure: failure, CostStatus: review.CostNotSent,
+			ModelError: "review was not started: this batch has no allowance left"}
+		e.diagNoRequest(it, domain.ActionPurge, "not_started", failure, budgetJSON)
+		if err := e.recordReviewInfo(ctx, sc, planID, it, domain.ActionPurge, "review_not_started",
+			dkoutcome.ReasonNotStartedBudget, d); err != nil {
+			return res, err
+		}
+		return e.recordKeep(ctx, sc, it, planID, review.Outcome{Reason: dkoutcome.ReasonNotStartedBudget, Decision: d})
+	}
+
+	reviewID := domain.NewID("rev")
+	if err := e.prepareReview(ctx, it, string(sc.Scope.ID), domain.ActionPurge, reviewID,
+		budgetJSON, purgeIdentity, purgeToken); err != nil {
+		return res, err
+	}
+	started := time.Now()
 	reviewed, err := e.reviewItem(ctx, review.Request{
 		Action:        domain.ActionPurge,
 		ScopeID:       string(sc.Scope.ID),
@@ -157,10 +193,25 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		Authorized:    true,
 	})
 	if err != nil {
+		if rerr := e.refuseReview(ctx, it, planID, reviewID, domain.ActionPurge,
+			e.Clock.Wall().UnixNano(), err.Error(), budgetJSON); rerr != nil {
+			return res, rerr
+		}
 		return res, err
 	}
+	reviewed.ReviewID = reviewID
+	// A settlement failure leaves the request pending; the approval must not
+	// reach the irreversible action below.
+	if err := e.settleReview(ctx, it, planID, reviewID, domain.ActionPurge, started, reviewed, budgetJSON); err != nil {
+		return res, err
+	}
+	if reviewed.Reason == dkoutcome.ReasonReviewUnknown {
+		if uerr := e.noteUnknownRequest(ctx, sc, it, domain.ActionPurge, reviewed.Decision, purgeIdentity, purgeToken); uerr != nil {
+			return res, uerr
+		}
+	}
 	if reviewed.Disposition != domain.DispositionDelete {
-		return e.recordKeep(ctx, sc, it, planIDOf(opt.Plan), reviewed)
+		return e.recordKeep(ctx, sc, it, planID, reviewed)
 	}
 	approval := reviewed.Approval
 	if approval == nil {

@@ -67,6 +67,12 @@ func renderRetention(plan retention.Plan, manifest string) []string {
 		"retention plan from " + manifest,
 		fmt.Sprintf("  %d application(s); kept files %d; candidate files %d", len(plan.Apps), plan.KeptFiles, plan.CandidateFiles),
 	}
+	if len(plan.SharedPaths) > 0 {
+		lines = append(lines, fmt.Sprintf("  shared path(s) %d; a keep conclusion outranks any proposal to clean them", len(plan.SharedPaths)))
+		for _, p := range plan.SharedPaths {
+			lines = append(lines, "  shared  "+p)
+		}
+	}
 	for _, ap := range plan.Apps {
 		lines = append(lines, "")
 		lines = append(lines, fmt.Sprintf("%s: latest qualified set %s, kept sets %d, goal met %v",

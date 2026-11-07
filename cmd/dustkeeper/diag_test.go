@@ -31,6 +31,12 @@ var recordKeys = map[string]bool{
 	"deep_scan_required": true, "due_not_authorised": true,
 	"purge_skipped": true, "quarantine_skipped": true,
 	"op_id": true, "item_id": true, "action": true, "outcome": true, "detail": true,
+	// One bounded review record per prepared request. The set stays closed so a
+	// future prompt or response body cannot quietly become a log field.
+	"version": true, "commit": true, "schema": true, "review_id": true,
+	"state": true, "journal": true, "attempts": true, "failure": true,
+	"cost_status": true, "elapsed_ms": true, "http_status": true,
+	"input_tokens": true, "output_tokens": true, "budget": true, "note": true,
 }
 
 func readRecords(t *testing.T, dir string) []map[string]any {

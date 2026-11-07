@@ -1,16 +1,19 @@
 # 验收记录（模板，尚未执行）
 
 对应 [后续执行计划](dustkeeper-next-steps-20261106.md) §10–§11。**本文件是待填写的模板，不是验收结论**：
-所有字段保留"待执行 / 未观察到"，不得留空后默认为通过，也不得用本工作区 `main` 的 CI 结果替未推送候选背书。
+所有字段保留"待执行 / 未观察到"，不得留空后默认为通过，也不得用本工作区 `main` 的 CI 结果替未部署的真实运行背书。
 
-计划基线：`abd6cfc`（`fix/closeout-review-observability`）。本工作区当前为 `8e46da5`（`main`，schema 4），
-两者不是同一批提交；差异见 [接手核对记录](handover-20261107.md)。
+**基线说明（重要）**：接手文档写的是 `abd6cfc`（`fix/closeout-review-observability`），那三次提交在本工作区
+与远端都不存在。用户后续明确授权「以 8e46da5 重做」「推送 main」，因此本轮的实际基线是
+`8e46da5` → `9aa6c4c` 主线，**不再是 `abd6cfc`**；文档 §2.2 的八条能力已在这条基线上重建，schema 已到 5。
+差异与逐条实现见 [接手核对与重建记录](handover-20261107.md) B 段。验收记录中的"是否相对 `abd6cfc` 又有修复"
+一栏不再适用，改为记录本轮主线提交。
 
 ---
 
 ## 1. 收口检查表（§10.1，全部未勾选）
 
-- [ ] 本轮候选已推送、创建 PR、通过双平台原生 CI 并合并。
+- [ ] 本轮主线提交已推送到 `main`、通过双平台原生 CI（用户改选"推送 main"，不另建 PR）。
 - [ ] 最终 main 的制品、commit、SHA-256、version 有完整对应关系。
 - [ ] 一个明确范围的目标实例完成备份、显式升级和状态核对。
 - [ ] 一次小范围真实运行有有效候选、结果可解释、现场与记录一致。
@@ -28,7 +31,7 @@
 
 | 类别 | 记录 |
 |---|---|
-| 源码 | PR：待执行；最终 main SHA：待执行；是否相对 `abd6cfc` 又有修复：待执行 |
+| 源码 | 最终 main SHA：待执行；PR：不适用（用户改选推送 main）；相对 `abd6cfc` 的比较：不适用（基线已改） |
 | CI | 两平台 run/job：待执行；结果：待执行；必要的 skip 说明：待执行 |
 | 制品 | target / artifact / manifest commit / binary SHA-256 / `version` 实际输出：均待执行 |
 | 目标实例 | 主机、账号、安装路径、配置/状态目录、全部 scope 与本次范围：待执行 |
@@ -59,9 +62,12 @@ python3 /absolute/scripts/collect-run-data.py \
   --output /absolute/private/dustkeeper-run-YYYYMMDD-HHMMSS.zip
 ```
 
-> 该脚本在本工作区不存在，属于未推送候选。取得候选后从**同一提交**取脚本，并把来源 commit 写进记录。
-> ZIP 只用于分析，不是一致性恢复备份，也不是供应商账本；自定义 `result-dir` 不在白名单时，另存实际
-> 结果页并标注来源与 run ID。
+> 脚本现在已在本工作区 `scripts/collect-run-data.py`（与二进制同一提交）。白名单只有四份标准 JSONL 日志与
+> `reports/latest.json`，每份日志最多 2 MiB + 64 KiB、结果页最多 4 MiB，源文件总上限约 12.25 MiB；
+> 输出为新建的 0600 ZIP，不覆盖已有文件；清单记录状态/大小/SHA-256/读取期间变化，缺失、拒绝、不可读、
+> 超限都明确标成缺项。**ZIP 只用于分析，不是一致性恢复备份（备份见 `operations.md` §11 的四件套），
+> 也不是供应商账本**；自定义 `result-dir` 不在白名单时，另存实际结果页并标注来源与 run ID。
+> `run` 不支持 `--scope`，首跑前必须核对整个实例可能触达的 scope、pending、到期清空与授权范围。
 
 同一私有目录保留：`acceptance.md`、`version.txt`、`release-manifest.txt`、`build-facts.txt`、
 `SHA256SUMS`、`run-<run_id>.json`、`run-<run_id>.stderr.txt`、`run-<run_id>.exit.txt`、

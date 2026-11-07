@@ -165,8 +165,10 @@
 ## 6. 本轮实现与本地验证范围（接手核对用）
 
 这一节给 [后续执行计划](dustkeeper-next-steps-20261106.md) §12 用：它引用的"本轮实现与本地验证范围"
-就是这里。**本工作区的基线是 `8e46da5`（schema 4），不是计划里那个 `abd6cfc`（schema 5）候选**；两份
-工作不是同一批提交，下面的清单只描述本工作区真实存在的东西。
+就是这里。**接手文档写的是 `abd6cfc`（schema 5）候选，那三次提交在本工作区与远端都不存在**；用户后续
+明确授权「以 8e46da5 重做」「推送 main」，所以本轮基线是 `8e46da5` → `9aa6c4c` 主线，schema 已到 5，
+文档 §2.2 的八条能力已在这条基线上重建。逐条落实与差异见
+[接手核对与重建记录](handover-20261107.md) B 段。
 
 ### 6.1 实现入口
 
@@ -175,35 +177,49 @@
 | 预算与批次 | `internal/review/budget.go`、`settings.go`、`facts.go`；`internal/config/config.go` |
 | 请求事实与失败分类 | `internal/review/clients.go`、`types.go`、`outcome/outcome.go` |
 | 未答复请求持久化 | `migrations/004.sql`、`internal/store/review_unknown.go` |
+| schema 5 显式升级 | `migrations/005.sql`、`migrations/embed.go`、`internal/store/upgrade.go`、`cmd/dustkeeper/commands.go` 的 `cmdInit` |
+| 请求前准备 / 结算 / 本地拒绝 | `internal/store/review_dispatch.go`、`internal/execute/dispatch.go`、`internal/execute/{quarantine,purge}.go` |
+| 审核诊断字段 | `cmd/dustkeeper/review_diag.go`、`internal/execute/dispatch.go` 的 `ReviewDiag` |
 | 执行与停止范围 | `internal/execute/{apply,keep,purge,quarantine,review,protect}.go`、`internal/run/runner.go` |
-| 两条新命令 | `cmd/dustkeeper/cmd_review.go`、`cmd_retention.go`、`review.go`、`main.go` |
-| 保留策略 | `internal/retention/plan.go` |
-| 结果页与可读日志 | `internal/report/{collect,render}.go`、`scripts/run-readable-log.py` |
+| 命令 | `cmd/dustkeeper/cmd_review.go`（`unknown list/resolve`、`dispatch list`）、`cmd_retention.go`、`review.go`、`main.go` |
+| 保留策略 | `internal/retention/plan.go`（共享路径"保留"优先） |
+| 结果页、可读日志与采集 | `internal/report/{collect,render}.go`、`scripts/run-readable-log.py`、`scripts/collect-run-data.py` |
 | 运维说明 | `docs/operations.md` §3.1、§8.2–8.6、§9.1.1、§11 |
 
 ### 6.2 本地验证（可执行、可复现）
 
-- `go build ./...`、`go vet ./...`、`go test ./...`（含 `cmd/dustkeeper`、`internal/review`、
-  `internal/retention`、`test/integration`）通过。
-- `python3 scripts/test_run_readable_log.py` 通过；`README` 里的包装器调用方式与实际参数一致。
-- 定向反证：`internal/review/budget_test.go`（预算分两层、两次尝试预留、超时保留已调用事实）、
-  `test/integration/review_budget_test.go`（部分完成、跨轮不重问、预算耗尽不发送请求）、
-  `internal/retention/plan_test.go`（不完整最新集、跨版本恢复集）。
-- 本工作区 `main` 的 push CI（run `42214748312`）在 `linux-amd64` 与 `darwin-arm64` 两个 job 均为
-  success。**这是 8e46da5 的门禁结果，不是 `abd6cfc` 候选的**；候选从未推送，也没有 PR。
+- `go build ./...`、`go vet ./...`、`go test ./... -count=1` 全部包通过；`go test -race ./... -count=1`
+  （CI 同款命令）全部包通过。
+- `python3 -m unittest discover -s scripts -p 'test_*.py'`：24 项通过，含新增
+  `scripts/test_collect_run_data.py` 的 10 项（白名单、大小上限、0600、不覆盖、symlink 拒绝、
+  超限、缺失标记、读取期间变化）。本机补装 PyYAML 后 `import-review-config` 的 10 项方可运行，属环境依赖。
+- 定向反证：`internal/store/upgrade_test.go`（schema 3/4 升级与四类拒绝）、
+  `cmd/dustkeeper/cmd_init_upgrade_test.go`（`status` 拒绝旧库而 `init` 升级）、
+  `internal/store/review_dispatch_test.go`（准备/结算同事务、本地拒绝、回滚）、
+  `cmd/dustkeeper/review_diag_test.go`（关联字段与无载荷）、
+  `internal/report/report_test.go`（成功/失败审核按 review ID 去重、未知不补零）、
+  `internal/retention/plan_test.go`（共享路径保留优先）、
+  `internal/review/budget_test.go` 与 `test/integration/review_budget_test.go`（预算与跨轮不重问）。
+- 真实二进制冒烟（临时实例，无模型/无文件动作）：`version --json` schema 5、`init` 不重复升级、
+  `review dispatch list` / `review unknown list` / `status` 均结构化返回；`retention plan` 输出共享路径
+  "保留"优先；`run` 生成日志与结果页后，`collect-run-data.py` 产出 0600 ZIP 且拒绝覆盖现有文件。
+- `8e46da5` 的历史 push CI（run `42214748312`）两平台 success，属**旧基线**；本轮重建后的原生 CI
+  结果必须看新推送对应的运行，不能用旧结果背书。
 
-### 6.3 接手时发现的真实缺陷（本工作区已修）
+### 6.3 接手与重建过程中修的真实缺陷
 
 1. `review unknown list` / `resolve` 从未调用 `a.openStore()`，真实二进制上会 nil pointer panic。
-   现由 `cmd/dustkeeper/cmd_review.go` 显式打开状态库，并加 `cmd_review_test.go` 覆盖：无实例时返回
-   `INVALID_ARGUMENT`、有实例时列出行、`--confirm` 与 `--note` 缺一返回 `NEEDS_INPUT`、resolve 后
-   `--all` 仍能看到历史行。
+   现由 `cmd/dustkeeper/cmd_review.go` 显式打开状态库，并加 `cmd_review_test.go` 覆盖。
 2. `CheckStart` 允许只剩 1 次 HTTP 尝试就启动候选，双模型路径的第二段必然被丢弃。现按计划 §5.3
-   预留 2 次尝试额度，`batch_max_attempts: 1` 合法但不启动任何审核；`budget_test.go` 有定向反证。
+   预留 2 次尝试额度。
+3. 请求前准备记录在本地拒绝后会留下 `pending`，让下一轮误判为"未答复请求"。现由
+   `RefuseReviewDispatch` 写成 `refused` / `cost_status=not_sent`；两个 partial resume 集成用例由失败转通过。
+4. `scanReviewDispatch` 用裸 `string` 扫描可为 NULL 的 `note`，导致 Scan 报错；改用 `sql.NullString`。
+5. `apply.go` 清空计划里一处重复的部分完成判断已清理。
 
-### 6.4 本工作区不具备、不能照抄的能力
+### 6.4 仍未做的事（不得冒充已完成）
 
-`migrations/005.sql` / `internal/store/upgrade.go`（schema 3/4 → 5 显式升级）、
-`cmd/dustkeeper/review_diag.go`（关联 ID 与诊断字段）、`scripts/collect-run-data.py`（只读 ZIP 采集）、
-请求前 `dispatch_pending` 准备记录与结算事务、到期清空复用未知请求检查——这些都属于计划 §2.2 描述的
-**另一份候选**，本工作区没有对应代码。升级、部署、采集步骤在拿到那份候选前都不执行。
+本轮**没有**部署到目标实例、没有替换服务器二进制、没有改服务器配置、没有启用调度、没有产生真实模型调用、
+没有真实恢复（V11）、没有长期运行验收、没有核对真实供应商账单，也没有下载或核验最终 CI 发布制品。
+原生 CI 之外的六步收口状态见 [handover-20261107.md](handover-20261107.md) B.2，
+验收记录 [acceptance.md](acceptance.md) 仍全部"待执行 / 未观察到"。

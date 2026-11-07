@@ -105,6 +105,46 @@ func TestReviewUnknownOpensTheStateDatabase(t *testing.T) {
 	}
 }
 
+func TestReviewDispatchListShowsPendingRequests(t *testing.T) {
+	newScopeWithQueue(t, []queueItem{{
+		objectName: "release",
+		reason:     "lifecycle",
+		state:      "quarantined",
+	}})
+	empty := cli(t, "review", "dispatch", "list", "--json")
+	if empty.code != 0 || dataOf(t, empty)["count"] != float64(0) {
+		t.Fatalf("empty dispatch list: exit %d %s", empty.code, empty.stdout)
+	}
+
+	st := openStateStore(t)
+	err := st.PrepareReviewDispatch(context.Background(), store.ReviewDispatch{
+		DispatchID: "disp-1", ReviewID: "rev-1", RunID: "run-1",
+		ItemID: "item-00", ScopeID: "scope-dispatch", Action: "purge",
+		IdentityJSON: `{"size":1}`, TokenJSON: `{"mtime":1}`, BudgetJSON: "{}",
+		CreatedNS: time.Now().UnixNano(), State: "pending", CostStatus: "not_sent",
+	})
+	st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := cli(t, "review", "dispatch", "list", "--json")
+	if listed.code != 0 {
+		t.Fatalf("dispatch list exited %d\n%s", listed.code, listed.stdout)
+	}
+	data := dataOf(t, listed)
+	if data["count"] != float64(1) {
+		t.Fatalf("count = %v, want 1", data["count"])
+	}
+	rows, _ := data["requests"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("requests = %v", data["requests"])
+	}
+	row, _ := rows[0].(map[string]any)
+	if row["review_id"] != "rev-1" || row["state"] != "pending" || row["cost_status"] != "not_sent" {
+		t.Errorf("pending request was not described honestly: %v", row)
+	}
+}
+
 func TestReviewUnknownWithoutAnInstanceReportsItInsteadOfCrashing(t *testing.T) {
 	newHome(t)
 	r := cli(t, "review", "unknown", "list", "--json")
