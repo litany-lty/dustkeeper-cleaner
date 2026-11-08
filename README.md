@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Go](https://img.shields.io/badge/go-1.26.1-00ADD8)
 
-## 当前状态（2026-11-08，四种状态分开看）
+## 当前状态（2026-11-09，四种状态分开看）
 
 > 本文其余段落混杂了 2026-10-30 的 FINAL-1.0 历史收口、11-07 的制品门禁与后续开发说明。
 > **只有本节是当前事实**；标题带日期、写「历史」或「FINAL-1.0」的段落是当时快照，不与本节并列。
@@ -11,15 +11,17 @@
 
 | 状态 | 当前事实 | 证据 / 边界 |
 |---|---|---|
-| **源码** | 本工作区已实现 P0 目录身份重绑定（`scope rebind`）、P1 未结算请求人工核查（`review dispatch resolve`）、P2 正式运行分模型分阶段耗时；schema 目标版本 **6**（`006.sql`，显式支持 3/4/5 → 6）。受影响包的定向测试与本轮夹具测试通过。 | 未提交、未推送；旧 CI 只证明旧代码，不为本轮新代码背书。 |
-| **制品** | **本轮没有新制品**。已有双平台原生制品对应 `5be1e90` / schema 5，`1.0.0-phase1`，均未安装。 | 见 [`docs/tasks/acceptance.md`](docs/tasks/acceptance.md) §2 的 commit / CI / SHA-256 对照；不能拿旧制品给新代码背书。 |
-| **安装** | **未安装**。本机 `Dustkeeper-Managed` 仍是 `1.0.0-phase1` / `2cbf8cb` / schema 3，全局暂停，scope `downloads` 为 `held`，6 个隔离对象完好。 | 未停止调度、未备份、未 `init` 迁移、未重绑定；重绑定不能在真实实例上直接执行。 |
-| **运行** | **没有实际清理**。11-07/11-08 的定时触发均因 `scope is held` 跳过（exit 0、`scanned=0`）；退出 0 不等于扫描或清理成功。 | 真实模型调用、手动首跑、自然调度观察均未执行，也不在本次授权范围内。 |
+| **源码** | P0 目录身份重绑定（`scope rebind`）、P1 未结算请求人工核查（`review dispatch resolve`）、P2 正式运行分模型分阶段耗时均已提交 `88097e4` 并推送 `main`；schema **6**（`006.sql`，显式支持 3/4/5 → 6）。全量 `go test ./...`、`-race`、25 项 Python 用例、原生 release 冒烟通过。 | CI run `42507420327`，`linux-amd64` / `darwin-arm64` 两 job success；其后若有纯文档回填触发新的 CI，也不改变最终安装候选，本机仍是这份 `88097e4` 制品。 |
+| **制品** | 新候选对应 `88097e4` / `1.0.0-phase1` / schema 6：darwin-arm64 SHA-256 `6c556e5aa6b8ee01aad207367b736c17c699d66162e4b9bb31c76d52e4e9f0fd`，linux-amd64 `9e0521ea12eb7cbc72da014a4ec30756d0a146966ba71d5dfb673aa13d8a9cdf`，与同次 manifest / `SHA256SUMS` 一致。 | 旧 `5be1e90` / schema 5 制品不再用于安装；本机安装的是 CI 原生制品，不是本地临时构建。 |
+| **安装** | **已安装并升级**：停 `com.dustkeeper.managed`、一致备份、替换 `~/.local/bin/dustkeeper`、显式 `init --json` 得 `from=3 to=6 upgraded=true`；升级前后所有计数、scope 身份、授权、items 行一致。`scope rebind` 确认后 generation `1 → 2`、6 个隔离 payload 与备份字节一致，旧 grant 收窄为 `needs_reapproval`。 | 备份与证据保存在本机私有目录；旧二进制另留副本；调度**仍卸载**、全局暂停**已恢复**。 |
+| **运行** | 一次真实 `run --json` 已执行：`exit=6` / `REVIEW_REQUIRED` / `control=stop_scope`，扫描 1390 个文件，`quarantined=0` / `purged=0`、HTTP 尝试 0、无费用、无重复请求。 | 本机缺 `review` 双模型审核配置与凭据，所有候选保留；**本轮未验证清理动作**，不能算清理验收通过。自然调度观察**未执行**。 |
 
-本轮整改只交付「**代码修复完成**」这一层：可审阅差异、独立临时夹具的最小验证与文档。
-「新版本已安装 / 身份恢复完成 / 手动清理可用 / 有限范围自动运行通过」四层**均未达成**，
-分别需要停止调度、一致备份、显式升级、重绑定确认、真实运行与自然日历触发的具体批准和证据；
-缺项与所需授权列在验收记录中，不以「测试通过」「退出码 0」「定时任务已加载」代替。
+已交付「**代码修复完成 / 新版本已安装 / 身份恢复完成**」三层；「**手动清理可用 / 有限范围自动运行通过**」两层**未达成**。
+阻塞不在授权，而在客观配置：本机 `config.json` 没有 `review` 段（`model.enabled=false`、模型名与端点为占位值），
+`NewService()` 因此对每个候选返回 `REVIEW_REQUIRED: retained: configure dual review before any quarantine or deletion`。
+按执行文档 §1.2 不擅自更改模型配置、不降低双模型门禁。需要用户先补齐 `review` 段（JEV / MiniMax 端点、模型名、
+阈值）、相应凭据，并确认模型外发字段与费用额度，才能完成有效首跑；首跑满足要求后才谈恢复 19:30 调度与
+1 + 3 次自然触发观察。不以「测试通过」「退出码 0」「定时任务已加载」代替后两层。
 
 本轮新增的运维入口：`dustkeeper scope rebind --id <scope>`（不带 `--digest` 为只读预览）、
 `dustkeeper review dispatch resolve --dispatch <id> … --confirm`，以及结果页/可读报告中的
