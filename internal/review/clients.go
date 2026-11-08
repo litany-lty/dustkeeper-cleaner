@@ -303,11 +303,15 @@ func isLoopbackHost(host string) bool {
 // (ModelError, verdict keep) from "the service said no" (verdict keep, no
 // error) without guessing from the error string.
 func (j *HTTPJudge) Review(ctx context.Context, facts Facts) (decision Decision, retErr error) {
-	if j.ReviewBoth {
-		batch := &timingBatch{}
-		ctx = context.WithValue(ctx, timingKey{}, batch)
-		defer func() { decision.RequestTimings = batch.snapshot() }()
-	}
+	// Timing collection is independent of ReviewBoth: the production path also
+	// records the requests it actually sends. ReviewBoth remains a debug
+	// second-opinion flag and must never be switched on just to obtain timings,
+	// because that would call MiniMax even after a final JEV keep. Only requests
+	// that were dispatched reach the batch, so an unsent request never becomes
+	// a fabricated "0ms" row.
+	batch := &timingBatch{}
+	ctx = context.WithValue(ctx, timingKey{}, batch)
+	defer func() { decision.RequestTimings = batch.snapshot() }()
 	action, err := describeAction(facts.Action)
 	if err != nil {
 		return Decision{ModelError: err.Error(), Verdict: domain.VerdictKeep}, err

@@ -42,7 +42,11 @@ class ReadableRunLogTest(unittest.TestCase):
                         item = args[args.index("--item") + 1]
                         if item == "del":
                             old = {"decision":{"verdict":"keep", "jev":{"choice":"keep"}}}
-                            audit = {"decision":{"verdict":"allow", "reason":"dual_review_agrees", "jev_model":"jev-test", "llm_model":"mm-test", "llm_consulted":True, "llm_decision":"allow", "llm_reason":"disposable", "llm_explanation":"Measured temporary package is replaceable.", "missing_evidence":["current_use"], "jev":{"choice":"allow_review", "confidence":0.95, "min_confidence":0.9, "min_allow_probability":0.9, "probabilities":{"allow_review":0.96}, "gate_passed":True, "blockers":["none"]}, "request_timings":[{"provider":"jev", "outcome":"ok", "elapsed_ms":120}]}}
+                            audit = {"decision":{"verdict":"allow", "reason":"dual_review_agrees", "jev_model":"jev-test", "llm_model":"mm-test", "llm_consulted":True, "llm_decision":"allow", "llm_reason":"disposable", "llm_explanation":"Measured temporary package is replaceable.", "missing_evidence":["current_use"], "jev":{"choice":"allow_review", "confidence":0.95, "min_confidence":0.9, "min_allow_probability":0.9, "probabilities":{"allow_review":0.96}, "gate_passed":True, "blockers":["none"]}, "request_timings":[
+                            {"provider":"jev", "outcome":"ok", "phase":"response_body", "elapsed_ms":120, "stages_ms":{"dns_start":1, "dns_done":6, "connect_start":7, "connect_done":12, "tls_start":13, "tls_done":21, "connection_ready":22, "first_byte":100}, "url":"https://proxy.internal/secret", "authorization":"Bearer topsecret", "body":"private-payload"},
+                            {"provider":"minimax", "outcome":"ok", "phase":"response_body", "elapsed_ms":210, "stages_ms":{"connection_ready":5, "first_byte":150}},
+                            {"provider":"jev", "outcome":"ok", "elapsed_ms":90},
+                            ]}}
                             future = {"decision":{"verdict":"keep", "jev":{"choice":"keep"}}}
                             events = [{"Action":"delete", "Phase":"intent", "OccurredAtNS":50, "ResultJSON":json.dumps(old)}, {"Action":"delete", "Phase":"intent", "OccurredAtNS":150, "ResultJSON":json.dumps(audit)}, {"Action":"delete", "Phase":"intent", "OccurredAtNS":250, "ResultJSON":json.dumps(future)}]
                         else:
@@ -121,11 +125,35 @@ class ReadableRunLogTest(unittest.TestCase):
                 # V10: an isolation is not a release; the deleted logical size
                 # stays what the run actually purged.
                 "删除逻辑大小：18 B",
+                # V11: stages_ms survives event -> JSON -> readable report.
+                # Stage durations are differences of comparable event points;
+                # a reused connection (no DNS/connect/TLS) is 未采集/不适用.
+                "DNS 5 ms",
+                "连接 5 ms",
+                "TLS 8 ms",
+                "首字节 78 ms",
+                "首字节 145 ms",
+                "DNS 未采集/不适用",
+                "最后观测阶段",
+                "阶段耗时未记录",
             ):
                 self.assertIn(expected, latest)
             self.assertNotIn("raw_response", latest)
             self.assertNotIn("prompt", latest)
-            receipt = json.loads((out / "latest-readable.json").read_text(encoding="utf-8"))
+            # The injected URL, header and body fields must not reach either
+            # the markdown or the machine-readable receipt.
+            machine = (out / "latest-readable.json").read_text(encoding="utf-8")
+            for leaked in ("proxy.internal", "Bearer topsecret", "private-payload", "authorization"):
+                self.assertNotIn(leaked, latest)
+                self.assertNotIn(leaked, machine)
+            # Old rows without stages_ms are reported as 未记录, never 0 ms.
+            self.assertNotIn(" 0 ms", latest)
+            receipt = json.loads(machine)
+            del_review = [e for e in receipt["entries"] if e["outcome"] == "已删除"][0]["review"]
+            stages = del_review["timings"][0]["stages_ms"]
+            self.assertEqual(stages["dns_start"], 1)
+            self.assertEqual(stages["first_byte"], 100)
+            self.assertIsNone(del_review["timings"][2]["stages_ms"])
             self.assertEqual(receipt["schema_version"], 2)
             self.assertEqual(receipt["summary"]["review"]["not_started"], 1)
             self.assertEqual(receipt["summary"]["review"]["http_attempts"], 3)
@@ -180,6 +208,46 @@ class ReadableRunLogTest(unittest.TestCase):
             )
             self.assertNotEqual(invalid.returncode, 0)
             self.assertIn("INVALID_OUTPUT", (invalid_out / "latest-readable.md").read_text(encoding="utf-8"))
+
+    def test_timing_helpers_and_uncalled_model(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("readable_log", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # stages_ms are event points: a duration exists only when both points
+        # were recorded. Missing events are 未采集/不适用, never 0 ms.
+        self.assertEqual(mod.stage_durations(None), "阶段耗时未记录")
+        reused = {"connection_ready": 1, "first_byte": 30}
+        self.assertIn("DNS 未采集/不适用", mod.stage_durations(reused))
+        self.assertIn("首字节 29 ms", mod.stage_durations(reused))
+
+        # Old rows without stages_ms keep None, and a missing elapsed_ms is
+        # None rather than an invented zero. Only restricted fields survive.
+        old = mod.normalize_timings([{"provider": "jev", "outcome": "ok", "url": "https://proxy/secret"}])
+        self.assertIsNone(old[0]["elapsed_ms"])
+        self.assertIsNone(old[0]["stages_ms"])
+        self.assertNotIn("url", old[0])
+
+        # A review whose only recorded request is JEV says the second model
+        # was not called, instead of inventing a 0 ms MiniMax row.
+        review = mod.review_summary(
+            {"verdict": "keep"}, "keep", True,
+            [{"provider": "jev", "outcome": "ok", "phase": "response_body",
+              "elapsed_ms": 50, "stages_ms": reused}],
+        )
+        receipt = mod.build_receipt(
+            0, {"status": "ok", "code": "OK", "message": "", "data": {}}, {},
+            [{"outcome": "保留", "path": "a.txt", "size_bytes": 1, "reason": "keep",
+              "reason_text": "保留", "item_id": "i", "purge_after": "", "review": review}],
+            "start", "end", "/", 0, 0, "",
+        )
+        md = mod.render(receipt)
+        self.assertIn("MiniMax 未调用", md)
+        self.assertIn("首字节 29 ms", md)
+        self.assertIn("DNS 未采集/不适用", md)
+        self.assertNotIn(" 0 ms", md)
 
 
 if __name__ == "__main__":

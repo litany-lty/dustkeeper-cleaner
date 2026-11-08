@@ -22,6 +22,17 @@ MAX_REPORT_DIR_BYTES = 20 << 20
 MAX_LISTED_ENTRIES = 200
 SCHEMA_VERSION = 2
 
+# stages_ms holds event points relative to the start of a request, not
+# per-stage durations. A stage duration is only meaningful as the difference of
+# two points that both actually fired; a reused connection or a skipped DNS
+# lookup leaves those points absent.
+STAGE_PAIRS = (
+    ("DNS", "dns_start", "dns_done"),
+    ("连接", "connect_start", "connect_done"),
+    ("TLS", "tls_start", "tls_done"),
+    ("首字节", "connection_ready", "first_byte"),
+)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -118,6 +129,7 @@ def review_for(executable, item_id, reason, timeout, window_start_ns, window_end
         return review_summary({}, reason, False)
     events = envelope.get("data", {}).get("events", [])
     decision = {}
+    timings = []
     if isinstance(events, list):
         for event in reversed(events):
             if not isinstance(event, dict):
@@ -129,12 +141,75 @@ def review_for(executable, item_id, reason, timeout, window_start_ns, window_end
             payload = event_payload(event.get("ResultJSON", event.get("result_json")))
             candidate = payload.get("decision", payload if phase == "info" else {})
             if isinstance(candidate, dict) and candidate:
-                decision = candidate
+                if not decision:
+                    decision = candidate
+                if not timings:
+                    timings = candidate.get("request_timings") or []
+            # A settlement event carries timings at its top level, with no
+            # "decision" wrapper. Keep scanning so a later keep/completion
+            # event (which stores only counts and cost) cannot hide the
+            # timings that an earlier event already recorded.
+            if not timings and isinstance(payload, dict):
+                timings = payload.get("request_timings") or []
+            if decision and timings:
                 break
-    return review_summary(decision, reason, bool(decision))
+    return review_summary(decision, reason, bool(decision), timings)
 
 
-def review_summary(decision, reason, recorded):
+def optional_ms(value):
+    """Return a recorded millisecond value, or None when it was not recorded."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_timings(rows):
+    """Keep only the restricted timing fields, including the raw stages_ms
+    event points. A missing elapsed_ms or stages_ms stays None/未记录; it is
+    never padded with a zero or an empty dict."""
+    out = []
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stages = row.get("stages_ms")
+        clean = {}
+        if isinstance(stages, dict):
+            for key, value in stages.items():
+                ms = optional_ms(value)
+                if ms is not None and ms >= 0:
+                    clean[str(key)] = ms
+        out.append({
+            "provider": str(row.get("provider", "unknown")),
+            "outcome": str(row.get("outcome", "unknown")),
+            "phase": str(row.get("phase", "")),
+            "elapsed_ms": optional_ms(row.get("elapsed_ms")),
+            "stages_ms": clean or None,
+        })
+    return out
+
+
+def stage_durations(stages):
+    """Show a stage duration only as the difference of two event points that
+    both really exist. A reused connection or skipped DNS leaves those points
+    missing: say 未采集/不适用, never subtract from nothing or pad 0."""
+    if stages is None:
+        return "阶段耗时未记录"
+    parts = []
+    for label, start, end in STAGE_PAIRS:
+        a, b = stages.get(start), stages.get(end)
+        if a is None or b is None or b < a:
+            parts.append(label + " 未采集/不适用")
+        else:
+            parts.append(f"{label} {b - a} ms")
+    return "；".join(parts)
+
+
+def review_summary(decision, reason, recorded, timings=None):
     jev = decision.get("jev") if isinstance(decision.get("jev"), dict) else {}
     jev_choice = jev.get("choice", "")
     minimax = decision.get("llm_decision", "")
@@ -143,18 +218,7 @@ def review_summary(decision, reason, recorded):
         jev_choice = jev_choice or "allow_review"
         minimax = minimax or "allow"
         consulted = True
-    timings = []
-    for row in decision.get("request_timings", []):
-        if not isinstance(row, dict):
-            continue
-        timings.append(
-            {
-                "provider": str(row.get("provider", "unknown")),
-                "outcome": str(row.get("outcome", "unknown")),
-                "phase": str(row.get("phase", "")),
-                "elapsed_ms": int(row.get("elapsed_ms", 0) or 0),
-            }
-        )
+    rows = timings if isinstance(timings, list) else decision.get("request_timings", [])
     return {
         "verdict": str(decision.get("verdict", "")),
         "reason": str(decision.get("reason", "")),
@@ -174,7 +238,7 @@ def review_summary(decision, reason, recorded):
         "minimax_explanation": safe_text(decision.get("llm_explanation", ""), 300),
         "missing_evidence": safe_list(decision.get("missing_evidence"), 8, 80),
         "current_run_recorded": recorded,
-        "timings": timings,
+        "timings": normalize_timings(rows),
         "jev_usage": safe_usage(jev.get("usage")),
         "minimax_usage": safe_usage(decision.get("llm_usage")),
     }
@@ -243,6 +307,13 @@ def collect_entries(executable, page, timeout):
             recorded["page_cost_status"] = str(entry.get("cost_status", ""))
             recorded["page_review_state"] = str(entry.get("review_state", ""))
             recorded["page_review_id"] = str(entry.get("review_id", ""))
+            # The result page (latest.json) also carries the timings. Use them
+            # when the event lookup found none, so stages_ms survives the
+            # event -> JSON -> readable report path.
+            if not recorded["timings"]:
+                page_timings = normalize_timings(entry.get("request_timings"))
+                if page_timings:
+                    recorded["timings"] = page_timings
             rows.append(
                 {
                     "outcome": outcome,
@@ -535,11 +606,22 @@ def render(receipt):
         if attempts:
             cost = review.get("page_cost_status") or "unknown"
             lines.append(f"- 请求事实：发出 {attempts} 次；费用状态 {md_code(cost)}（未知不等于 0）")
-        if review["timings"]:
-            timing = "；".join(
-                f"{row['provider']} {row['elapsed_ms']} ms ({row['outcome']})" for row in review["timings"]
-            )
-            lines.append(f"- 网络耗时：{timing}")
+        timings = review["timings"]
+        if timings:
+            for row in timings:
+                elapsed = row["elapsed_ms"]
+                elapsed_text = f"{elapsed} ms" if elapsed is not None else "耗时未记录"
+                phase = row["phase"] or "未记录"
+                lines.append(
+                    f"- 网络耗时：{row['provider']} {elapsed_text} ({row['outcome']})"
+                    f"；最后观测阶段 {md_code(phase)}；{stage_durations(row['stages_ms'])}"
+                )
+            # Say explicitly when a model was not called at all. The only rows
+            # here are requests that actually happened, so a missing provider
+            # is "not called", not "0 ms".
+            providers = {row["provider"] for row in timings}
+            if "minimax" not in providers:
+                lines.append("- MiniMax 未调用：这条审核没有 MiniMax 请求时序")
         else:
             lines.append("- 网络耗时：旧制品或正式模式未记录分段时序")
         lines.append("")

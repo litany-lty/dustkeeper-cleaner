@@ -87,7 +87,9 @@ func TestInitHumanOutputNamesTheUpgrade(t *testing.T) {
 	if init.code != 0 {
 		t.Fatalf("init exited %d\n%s\n%s", init.code, init.stdout, init.stderr)
 	}
-	if !strings.Contains(init.stdout, "upgraded state schema 4 -> 5 explicitly") {
-		t.Errorf("human output does not name the upgrade:\n%s", init.stdout)
+	want := fmt.Sprintf("upgraded state schema %d -> %d explicitly",
+		migrations.CurrentVersion-1, migrations.CurrentVersion)
+	if !strings.Contains(init.stdout, want) {
+		t.Errorf("human output does not name the upgrade %q:\n%s", want, init.stdout)
 	}
 }

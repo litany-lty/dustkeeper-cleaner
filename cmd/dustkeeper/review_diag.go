@@ -13,6 +13,8 @@ package main
 // a bounded local error. The logger caps every string value anyway.
 
 import (
+	"encoding/json"
+
 	"dustkeeper/internal/execute"
 	"dustkeeper/migrations"
 )
@@ -29,7 +31,7 @@ func (a *app) reviewDiag() func(execute.ReviewDiag) {
 		if runID == "" {
 			runID = a.runID
 		}
-		a.log.Log("review",
+		kv := []any{
 			"phase", "review",
 			"version", version,
 			"commit", commit,
@@ -51,6 +53,15 @@ func (a *app) reviewDiag() func(execute.ReviewDiag) {
 			"output_tokens", d.OutputTokens,
 			"budget", d.Budget,
 			"note", d.Note,
-		)
+		}
+		// Timings are emitted only when requests actually happened and as a
+		// bounded JSON string of the restricted RequestTiming fields. The line
+		// keeps its no-payload rule: no URL, proxy, header, body or credential.
+		if len(d.RequestTimings) > 0 {
+			if raw, err := json.Marshal(d.RequestTimings); err == nil {
+				kv = append(kv, "request_timings", string(raw))
+			}
+		}
+		a.log.Log("review", kv...)
 	}
 }

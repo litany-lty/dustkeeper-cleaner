@@ -3,6 +3,28 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Go](https://img.shields.io/badge/go-1.26.1-00ADD8)
 
+## 当前状态（2026-11-08，四种状态分开看）
+
+> 本文其余段落混杂了 2026-10-30 的 FINAL-1.0 历史收口、11-07 的制品门禁与后续开发说明。
+> **只有本节是当前事实**；标题带日期、写「历史」或「FINAL-1.0」的段落是当时快照，不与本节并列。
+> 唯一继续维护的验收入口是 [`docs/tasks/acceptance.md`](docs/tasks/acceptance.md)。
+
+| 状态 | 当前事实 | 证据 / 边界 |
+|---|---|---|
+| **源码** | 本工作区已实现 P0 目录身份重绑定（`scope rebind`）、P1 未结算请求人工核查（`review dispatch resolve`）、P2 正式运行分模型分阶段耗时；schema 目标版本 **6**（`006.sql`，显式支持 3/4/5 → 6）。受影响包的定向测试与本轮夹具测试通过。 | 未提交、未推送；旧 CI 只证明旧代码，不为本轮新代码背书。 |
+| **制品** | **本轮没有新制品**。已有双平台原生制品对应 `5be1e90` / schema 5，`1.0.0-phase1`，均未安装。 | 见 [`docs/tasks/acceptance.md`](docs/tasks/acceptance.md) §2 的 commit / CI / SHA-256 对照；不能拿旧制品给新代码背书。 |
+| **安装** | **未安装**。本机 `Dustkeeper-Managed` 仍是 `1.0.0-phase1` / `2cbf8cb` / schema 3，全局暂停，scope `downloads` 为 `held`，6 个隔离对象完好。 | 未停止调度、未备份、未 `init` 迁移、未重绑定；重绑定不能在真实实例上直接执行。 |
+| **运行** | **没有实际清理**。11-07/11-08 的定时触发均因 `scope is held` 跳过（exit 0、`scanned=0`）；退出 0 不等于扫描或清理成功。 | 真实模型调用、手动首跑、自然调度观察均未执行，也不在本次授权范围内。 |
+
+本轮整改只交付「**代码修复完成**」这一层：可审阅差异、独立临时夹具的最小验证与文档。
+「新版本已安装 / 身份恢复完成 / 手动清理可用 / 有限范围自动运行通过」四层**均未达成**，
+分别需要停止调度、一致备份、显式升级、重绑定确认、真实运行与自然日历触发的具体批准和证据；
+缺项与所需授权列在验收记录中，不以「测试通过」「退出码 0」「定时任务已加载」代替。
+
+本轮新增的运维入口：`dustkeeper scope rebind --id <scope>`（不带 `--digest` 为只读预览）、
+`dustkeeper review dispatch resolve --dispatch <id> … --confirm`，以及结果页/可读报告中的
+`request_timings`。说明见 [运维手册 §3.2 / §8.3 / §8.7](docs/operations.md)。
+
 ## 本地开发中的安全审核（未发布）
 
 只读真实模型调试入口与逐项说明见 [Debug 模式](docs/debug-mode.md)。真实文件外发需覆盖相应文件、字段和服务的授权；debug 始终不删除。
@@ -76,9 +98,17 @@ python3 scripts/run-readable-log.py \
 dustkeeper review unknown list                    # 谁在等核查：路径、动作、尝试次数、费用状态
 dustkeeper review unknown resolve --item <item_id> --action quarantine \
   --note "核对了供应商控制台：超时未计费" --confirm
-dustkeeper review dispatch list                   # 已准备但未结算的请求，带 review_id
-dustkeeper review dispatch list --all             # 连同已结算/本地拒绝的历史
+dustkeeper review dispatch list                   # 仍未解决的请求：pending 且没有人工核查结论
+dustkeeper review dispatch list --all             # 连同已结算/本地拒绝的历史与独立人工结论
+dustkeeper review dispatch resolve --dispatch <dispatch_id> \
+  --request-status not_sent --billing-status not_charged \
+  --note "核查了供应商控制台：该请求未发出、未计费" --confirm
 ```
+
+`dispatch resolve` 只给**指定主键**写一条追加式人工核查结论，解除这一条旧请求的阻塞；不调用模型、
+不移动文件、不增加额度，也不把人工结论伪装成 `settled` / `refused`。原请求行的 `cost_status`、
+`attempts` 与 token 用量保持原样，重复确认不会覆写第一份记录。缺 `--confirm` / `--note`、
+状态值非法、`unknown` 或 `not_sent + charged` 的组合一律拒绝。
 
 请求发出**之前**会先写一条 `pending` 准备记录，结算与 decision event 在同一事务里提交；`review_id` 把结果页、
 结果事件、运行日志与 `review_dispatch` 行关联起来。运行日志每次审核写一条无载荷记录（版本、`run_id` /
@@ -104,7 +134,7 @@ dustkeeper retention plan --manifest /srv/apps/manifest.json
 ```
 
 共享路径被两个应用声明时，任何一方的「保留」结论优先，另一方不再把它列为候选；清单会列出
-`shared_paths`。状态库从 schema 3/4 升到 5 只能由显式 `init` 完成，`status` / `run` 不会自动迁移，
+`shared_paths`。状态库从 schema 3/4/5 升到 6 只能由显式 `init` 完成，`status` / `run` 不会自动迁移，
 升级前按运维手册 §3.1 与 §11 备份并核对旧配置。预算分层（整次任务 / 一个批次 / 单次请求）、
 四种"没有结论"的处置表、清单格式与采集边界，见 [运维手册 8.2–8.6](docs/operations.md)。
 发布、升级、真实运行与调度验收的六步执行计划见
@@ -148,9 +178,10 @@ Dustkeeper 无法撤销；恢复不会覆盖已存在的目标**；删不干净�
 >
 > 所有证据只用结果说话：命令、commit、checksum、原始输出；不用"功能结构齐全"代替验收。
 
-以上是 **2026-10-30 的历史收口说明**。本工作区后续已实现双模型审核链与 schema 3/4 → 5 的显式 `init`
-升级（独立的最小升级路径，不等于二期设计整体落地）；当前范围见上文「日常操作」与
-[运维手册 §3.1](docs/operations.md)。
+以上是 **2026-10-30 的历史收口说明**，其中的发布、CI、验收清单均属当时快照，不代表 2026-11-08 的当前状态。
+本工作区后续已实现双模型审核链与 schema 3/4/5 → 6 的显式 `init` 升级（独立的最小升级路径，
+不等于二期设计整体落地）；当前四种状态见本文顶部，升级与重绑定步骤见
+[运维手册 §3.1 / §3.2](docs/operations.md)。
 
 **收口清单（2026-10-30）**
 
@@ -338,7 +369,7 @@ checksum、这份制品实际跑过哪些动作。发布清单来自这些事实
 - [`docs/operations.md`](docs/operations.md)：安装、定时任务、恢复流程、故障处理、备份与卸载。
 - [`docs/architecture.md`](docs/architecture.md)：模块边界、状态机、对账矩阵、跨平台文件操作。
 - [`docs/compliance.md`](docs/compliance.md)：FINAL 状态表（A01–A12）与证据；旧清单已标为历史。
-- [`docs/phase2-design.md`](docs/phase2-design.md)：二期设计（模型复核约束新隔离、schema 4 升级、失败矩阵、验收语料）。**该设计文档整体仍暂缓**；本工作区的 schema 5 显式升级是另一条独立的最小路径，见 [运维手册 §3.1](docs/operations.md)。
+- [`docs/phase2-design.md`](docs/phase2-design.md)：二期设计（模型复核约束新隔离、schema 4 升级、失败矩阵、验收语料）。**该设计文档整体仍暂缓**；本工作区的 schema 6 显式升级是另一条独立的最小路径，见 [运维手册 §3.1](docs/operations.md)。
 - [`docs/evidence/`](docs/evidence/)：扫描/资源实测的原始 JSON 与摘要；`deployment-*.md` 是目标机器的有限部署记录。
 - [`packaging/`](packaging/)：`install.sh` / `uninstall.sh`，在目标机器上渲染并安装定时任务模板。
 

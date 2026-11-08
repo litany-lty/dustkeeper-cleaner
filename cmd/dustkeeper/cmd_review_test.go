@@ -162,3 +162,194 @@ func TestReviewUnknownWithoutAnInstanceReportsItInsteadOfCrashing(t *testing.T) 
 		t.Fatalf("refusal is not a JSON envelope: %v", err)
 	}
 }
+
+// seedPendingDispatch puts one prepared request into the test instance without
+// going through a model, so a resolve command has a real pending row to act on.
+func seedPendingDispatch(t *testing.T, id string) {
+	t.Helper()
+	st := openStateStore(t)
+	err := st.PrepareReviewDispatch(context.Background(), store.ReviewDispatch{
+		DispatchID: id, ReviewID: "rev-" + id, RunID: "run-1",
+		ItemID: "item-00", ScopeID: "scope-dispatch", Action: "purge",
+		IdentityJSON: `{"size":1}`, TokenJSON: `{"mtime":1}`, BudgetJSON: "{}",
+		CreatedNS: time.Now().UnixNano(), State: "pending", CostStatus: "not_sent",
+	})
+	st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func anyDispatchResolution(t *testing.T) bool {
+	t.Helper()
+	st := openStateStore(t)
+	defer st.Close()
+	rows, err := st.ListReviewDispatch(context.Background(), true, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.Resolution != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// Missing confirmation/note, unchecked (unknown) statuses, a contradictory
+// combination and an over-long note are all refused without changing the DB.
+func TestReviewDispatchResolveRejectsUncheckedInputWithoutWriting(t *testing.T) {
+	newScopeWithQueue(t, []queueItem{{objectName: "release", reason: "lifecycle", state: "quarantined"}})
+	seedPendingDispatch(t, "disp-1")
+
+	bad := [][]string{
+		{"review", "dispatch", "resolve", "--dispatch", "disp-1", "--request-status", "completed", "--billing-status", "charged", "--note", "checked"},                                                           // no --confirm
+		{"review", "dispatch", "resolve", "--dispatch", "disp-1", "--request-status", "completed", "--billing-status", "charged", "--confirm"},                                                                   // no note
+		{"review", "dispatch", "resolve", "--dispatch", "disp-1", "--request-status", "completed", "--billing-status", "charged", "--note", "", "--confirm"},                                                     // empty note
+		{"review", "dispatch", "resolve", "--dispatch", "disp-1", "--request-status", "unknown", "--billing-status", "charged", "--note", "checked", "--confirm"},                                                // unknown result
+		{"review", "dispatch", "resolve", "--dispatch", "disp-1", "--request-status", "completed", "--billing-status", "unknown", "--note", "checked", "--confirm"},                                              // unknown cost
+		{"review", "dispatch", "resolve", "--dispatch", "disp-1", "--request-status", "not_sent", "--billing-status", "charged", "--note", "checked", "--confirm"},                                               // contradiction
+		{"review", "dispatch", "resolve", "--dispatch", "disp-1", "--request-status", "completed", "--billing-status", "charged", "--note", strings.Repeat("x", store.MaxDispatchResolutionNote+1), "--confirm"}, // too long
+		{"review", "dispatch", "resolve", "--request-status", "completed", "--billing-status", "charged", "--note", "checked", "--confirm"},                                                                      // missing dispatch
+	}
+	for _, args := range bad {
+		withJSON := append(append([]string{}, args...), "--json")
+		r := cli(t, withJSON...)
+		if r.code == 0 {
+			t.Errorf("%v exited 0; want a refusal", args)
+		}
+	}
+	if anyDispatchResolution(t) {
+		t.Fatal("a refused resolve still wrote a resolution (database changed)")
+	}
+	// The unresolved row is still listed, with a copyable dispatch id.
+	list := cli(t, "review", "dispatch", "list")
+	if list.code != 0 || !strings.Contains(list.stdout, "dispatch_id=disp-1") {
+		t.Fatalf("unresolved list lost the copyable dispatch id: exit %d\n%s", list.code, list.stdout)
+	}
+}
+
+// The human output must state the gates, the new-id rule and the operator's own
+// checks, and resolving the only pending row empties the default (unresolved) view.
+func TestReviewDispatchResolveHumanOutputStatesTheGates(t *testing.T) {
+	newScopeWithQueue(t, []queueItem{{objectName: "release", reason: "lifecycle", state: "quarantined"}})
+	seedPendingDispatch(t, "disp-1")
+
+	r := cli(t, "review", "dispatch", "resolve",
+		"--dispatch", "disp-1", "--request-status", "completed",
+		"--billing-status", "charged", "--note", "supplier console: billed once", "--confirm")
+	if r.code != 0 {
+		t.Fatalf("resolve exited %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	for _, want := range []string{
+		"does NOT call a model",
+		"normal budget, identity, protection, rule and model gates",
+		"new request/review ID",
+		"verify the approval",
+		"remaining allowance",
+	} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("human output missing %q:\n%s", want, r.stdout)
+		}
+	}
+	def := cli(t, "review", "dispatch", "list", "--json")
+	if got, _ := dataOf(t, def)["count"].(float64); got != 0 {
+		t.Errorf("default unresolved count = %v, want 0", got)
+	}
+	all := cli(t, "review", "dispatch", "list", "--all", "--json")
+	if got, _ := dataOf(t, all)["count"].(float64); got != 1 {
+		t.Errorf("--all lost the resolved row: count = %v, want 1", got)
+	}
+}
+
+// A resolve lifts exactly one request; the JSON output carries the same
+// constraints; --all keeps the history with the original facts unchanged and
+// the manual conclusion separate; a repeat cannot overwrite the first record.
+func TestReviewDispatchResolveLiftsOnlyOneAndKeepsHistory(t *testing.T) {
+	newScopeWithQueue(t, []queueItem{{objectName: "release", reason: "lifecycle", state: "quarantined"}})
+	seedPendingDispatch(t, "disp-1")
+	seedPendingDispatch(t, "disp-2")
+
+	resolve := cli(t, "review", "dispatch", "resolve",
+		"--dispatch", "disp-1", "--request-status", "completed",
+		"--billing-status", "charged", "--note", "supplier console: billed once", "--confirm", "--json")
+	if resolve.code != 0 {
+		t.Fatalf("resolve exited %d\n%s\n%s", resolve.code, resolve.stdout, resolve.stderr)
+	}
+	// data.notice must carry the same constraints in JSON mode.
+	notice, _ := dataOf(t, resolve)["notice"].([]any)
+	joined := ""
+	for _, n := range notice {
+		if s, ok := n.(string); ok {
+			joined += s + "\n"
+		}
+	}
+	for _, want := range []string{
+		"does NOT call a model", "model gates", "new request/review ID",
+		"verify the approval", "remaining allowance", "other unresolved requests",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("data.notice missing %q:\n%s", want, joined)
+		}
+	}
+
+	// Default list: only the other unresolved row remains.
+	def := cli(t, "review", "dispatch", "list", "--json")
+	if got, _ := dataOf(t, def)["count"].(float64); got != 1 {
+		t.Fatalf("default unresolved count = %v, want 1", got)
+	}
+	rows, _ := dataOf(t, def)["requests"].([]any)
+	if len(rows) != 1 || rows[0].(map[string]any)["dispatch_id"] != "disp-2" {
+		t.Errorf("default list should show only disp-2: %v", rows)
+	}
+
+	// --all: both rows, original facts unchanged, independent conclusion visible.
+	allJSON := cli(t, "review", "dispatch", "list", "--all", "--json")
+	allRows, _ := dataOf(t, allJSON)["requests"].([]any)
+	if len(allRows) != 2 {
+		t.Fatalf("--all count = %v, want 2", allRows)
+	}
+	var resolvedRow map[string]any
+	for _, raw := range allRows {
+		row := raw.(map[string]any)
+		if row["dispatch_id"] == "disp-1" {
+			resolvedRow = row
+		}
+	}
+	if resolvedRow == nil {
+		t.Fatal("the resolved request disappeared from --all")
+	}
+	if resolvedRow["state"] != "pending" || resolvedRow["cost_status"] != "not_sent" {
+		t.Errorf("original facts rewritten: %v", resolvedRow)
+	}
+	resMap, ok := resolvedRow["resolution"].(map[string]any)
+	if !ok || resMap["request_status"] != "completed" {
+		t.Errorf("independent resolution missing: %v", resolvedRow)
+	}
+
+	// Human --all separates preparation-time facts from the manual conclusion.
+	allHuman := cli(t, "review", "dispatch", "list", "--all")
+	for _, want := range []string{"recorded when prepared", "checked by a person later", "request_status=completed"} {
+		if !strings.Contains(allHuman.stdout, want) {
+			t.Errorf("--all human output missing %q:\n%s", want, allHuman.stdout)
+		}
+	}
+
+	// Repeating does not overwrite the first record.
+	again := cli(t, "review", "dispatch", "resolve",
+		"--dispatch", "disp-1", "--request-status", "not_sent",
+		"--billing-status", "not_charged", "--note", "a different story", "--confirm", "--json")
+	if again.code == 0 {
+		t.Fatal("a second confirmation was accepted")
+	}
+	after := cli(t, "review", "dispatch", "list", "--all", "--json")
+	for _, raw := range dataOf(t, after)["requests"].([]any) {
+		row := raw.(map[string]any)
+		if row["dispatch_id"] == "disp-1" {
+			res := row["resolution"].(map[string]any)
+			if res["note"] != "supplier console: billed once" {
+				t.Errorf("first record overwritten: %v", res)
+			}
+		}
+	}
+}

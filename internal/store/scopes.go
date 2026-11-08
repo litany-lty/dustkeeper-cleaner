@@ -218,5 +218,108 @@ func (s *Store) ScopeExists(ctx context.Context, id domain.ScopeID) (bool, error
 	return n > 0, nil
 }
 
+// TestHookBeforeRebindEvent is the commit boundary of a `scope rebind`: it runs
+// inside the transaction after every row was updated but before the audit event
+// is appended. Returning an error rolls the whole transaction back, which is how
+// a test proves an interruption cannot leave a partially rebound scope that a
+// run could act on. It does not clear itself.
+var TestHookBeforeRebindEvent func() error
+
+// ScopeRebindItem is the structured, per-object identity rewrite of one
+// isolated object. Only the runtime volume label changes; every other fact is
+// preserved, and the original JSON is kept in the rebind event.
+type ScopeRebindItem struct {
+	ItemID                   domain.ItemID
+	SourceParentIdentityJSON string
+	PreIdentityJSON          string
+	CapturedIdentityJSON     *string
+}
+
+// ScopeRebindWrite is the complete, single-transaction recovery of one scope's
+// runtime identity. A rebind either lands entirely or leaves the old generation
+// and the held status untouched.
+type ScopeRebindWrite struct {
+	ScopeID              domain.ScopeID
+	ExpectedGeneration   int64
+	NewRootIdentityJSON  string
+	NewVaultIdentityJSON string
+	MountBindingKey      string
+	NewMountBindingJSON  string
+	Items                []ScopeRebindItem
+	Event                Event
+}
+
+// ApplyScopeRebind commits the new generation, the new mount binding, the
+// structured identity updates of the isolated objects, the narrowing of active
+// grants and the immutable audit event in one transaction.
+//
+// The scope lands on `paused`, never `active`: a rebind is a recovery of
+// identity, not permission to scan, clean or resume automatic runs. Bumping the
+// generation and protection revision is what makes every old plan/grant binding
+// stale without deleting any history.
+func (s *Store) ApplyScopeRebind(ctx context.Context, w ScopeRebindWrite) error {
+	if w.ScopeID == "" || w.ExpectedGeneration <= 0 || w.NewRootIdentityJSON == "" ||
+		w.NewVaultIdentityJSON == "" || w.MountBindingKey == "" || w.NewMountBindingJSON == "" {
+		return errs.New(errs.CodeInvalidArgument, "a scope rebind needs its scope, generation and new identities")
+	}
+	return s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+UPDATE scopes SET root_identity_json=?, vault_identity_json=?,
+                  generation=generation+1, protection_revision=protection_revision+1,
+                  status=?
+WHERE scope_id=? AND generation=?`,
+			w.NewRootIdentityJSON, w.NewVaultIdentityJSON, domain.ScopePaused,
+			string(w.ScopeID), w.ExpectedGeneration)
+		if err != nil {
+			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errs.Newf(errs.CodePlanStale,
+				"scope %s changed since the rebind preview; re-run the preview", w.ScopeID)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+			w.MountBindingKey, w.NewMountBindingJSON); err != nil {
+			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		}
+		for _, it := range w.Items {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE items SET source_parent_identity_json=?, pre_identity_json=?, captured_identity_json=?
+WHERE item_id=? AND scope_id=?`,
+				it.SourceParentIdentityJSON, it.PreIdentityJSON, it.CapturedIdentityJSON,
+				string(it.ItemID), string(w.ScopeID)); err != nil {
+				return errs.Wrap(errs.CodeStateWriteFailed, err)
+			}
+		}
+		// A grant approved for the previous generation must not become a delete
+		// permission for the new one. The binding check would already refuse it;
+		// narrowing the status makes that fact visible in `status` and `rule show`.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE grants SET status=? WHERE scope_id=? AND status=?`,
+			domain.GrantNeedsReapproval, string(w.ScopeID), domain.GrantActive); err != nil {
+			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		}
+		if h := TestHookBeforeRebindEvent; h != nil {
+			if err := h(); err != nil {
+				return err
+			}
+		}
+		return appendEventTx(ctx, tx, w.Event)
+	})
+}
+
+// ScopePendingOps counts isolated objects that still have an operation in
+// flight. Rebind refuses to change any identity while one is open.
+func (s *Store) ScopePendingOps(ctx context.Context, id domain.ScopeID) (int64, error) {
+	var n int64
+	err := s.queryRow(ctx,
+		"SELECT COUNT(*) FROM items WHERE scope_id=? AND pending_op_id IS NOT NULL",
+		string(id)).Scan(&n)
+	if err != nil {
+		return 0, errs.Wrap(errs.CodeDBError, err)
+	}
+	return n, nil
+}
+
 // ErrNoRows marks a lookup miss for callers that prefer errors.Is.
 var ErrNoRows = errors.New("store: no rows")

@@ -38,6 +38,10 @@ type ReviewDiag struct {
 	OutputTokens int
 	Budget       string
 	Note         string
+	// RequestTimings are the measured, payload-free timings of the requests this
+	// review actually sent, keyed to the same ReviewID. Empty when no request
+	// was dispatched; never padded with a zero-duration placeholder.
+	RequestTimings []review.RequestTiming
 }
 
 // emitDiag drops the record when no logger was attached. A debug command that
@@ -142,10 +146,16 @@ func (e *Executor) settleReview(ctx context.Context, it store.Item, planID *doma
 			Failure: st.Failure, CostStatus: st.CostStatus, ElapsedMS: st.ElapsedMS,
 			HTTPStatus: st.HTTPStatus, InputTokens: st.InputTokens,
 			OutputTokens: st.OutputTokens, Budget: budgetJSON, Note: out.Reason,
+			RequestTimings: d.RequestTimings,
 		})
 		return nil
 	}
 	ev := store.NewReviewEvent(reviewID, it.ID, planID, st.SettledNS, st, d.Verdict)
+	// The settlement event is the one authoritative record of a prepared
+	// request and already carries the real review id. Attach the measured
+	// timings there so the result page can correlate them; an empty slice adds
+	// nothing, so a request that was never sent stays unrecorded.
+	ev.ResultJSON = withRequestTimings(ev.ResultJSON, d.RequestTimings)
 	if err := e.Store.SettleReviewDispatch(ctx, reviewID, st, ev); err != nil {
 		return err
 	}
@@ -155,8 +165,30 @@ func (e *Executor) settleReview(ctx context.Context, it store.Item, planID *doma
 		Failure: st.Failure, CostStatus: st.CostStatus, ElapsedMS: st.ElapsedMS,
 		HTTPStatus: st.HTTPStatus, InputTokens: st.InputTokens,
 		OutputTokens: st.OutputTokens, Budget: budgetJSON, Note: out.Reason,
+		RequestTimings: d.RequestTimings,
 	})
 	return nil
+}
+
+// withRequestTimings merges the measured, payload-free request timings into the
+// settlement event's result JSON, keeping every field the dispatcher wrote.
+// RequestTiming carries only provider, outcome, phase, elapsed_ms and stages_ms,
+// so no URL, header, body or credential can enter the record.
+func withRequestTimings(result *string, timings []review.RequestTiming) *string {
+	if result == nil || len(timings) == 0 {
+		return result
+	}
+	var body map[string]any
+	if json.Unmarshal([]byte(*result), &body) != nil {
+		return result
+	}
+	body["request_timings"] = timings
+	merged, err := json.Marshal(body)
+	if err != nil {
+		return result
+	}
+	s := string(merged)
+	return &s
 }
 
 // refuseReview closes a prepared request whose review never started. A local

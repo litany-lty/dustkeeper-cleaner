@@ -2,6 +2,8 @@ package scope
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	"dustkeeper/internal/domain"
 )
@@ -17,6 +19,11 @@ type IdentityVerdict struct {
 	// Changed is non-empty when the current object cannot be the registered one.
 	// The scope is held and no action of any kind may run.
 	Changed string
+	// RuntimeRelabeled is non-empty when the object is the registered one but
+	// its runtime volume label changed across a boot. It is a fact, not an
+	// approval: the vault binding and the scope row still carry the old label,
+	// and only an explicit `scope rebind` may establish the new generation.
+	RuntimeRelabeled string
 	// Weak is non-empty when nothing proved a change but the surviving evidence
 	// cannot distinguish this object from a different one that reuses the same
 	// inode on a different volume. The scope stays usable for observing and
@@ -39,19 +46,44 @@ func CompareRootIdentity(stored, current domain.RootIdentity) IdentityVerdict {
 		return IdentityVerdict{Changed: fmt.Sprintf(format, args...)}
 	}
 
+	// `dev-<number>` is a runtime device number, not a stable volume UUID. Both
+	// platform files currently derive VolumeID from stat.st_dev (see
+	// internal/fsops/platform_*.go), and macOS renumbers devices across boots.
+	// A boot change therefore cannot prove a volume swap from those two facts.
+	// A value in any other shape is treated as a genuinely persistent label and
+	// stays comparable across boots.
+	newBoot := stored.Runtime.BootOrRunID != "" && current.Runtime.BootOrRunID != "" &&
+		stored.Runtime.BootOrRunID != current.Runtime.BootOrRunID
+	relabeled := ""
+
 	if stored.Persistent.Inode != current.Persistent.Inode {
 		return changed("the root inode changed from %d to %d",
 			stored.Persistent.Inode, current.Persistent.Inode)
 	}
 	if stored.Persistent.VolumeID != "" && current.Persistent.VolumeID != "" &&
 		stored.Persistent.VolumeID != current.Persistent.VolumeID {
-		return changed("the root volume changed from %s to %s",
+		if !newBoot || !LegacyVolumeLabel(stored.Persistent.VolumeID) ||
+			!LegacyVolumeLabel(current.Persistent.VolumeID) {
+			return changed("the root volume changed from %s to %s",
+				stored.Persistent.VolumeID, current.Persistent.VolumeID)
+		}
+		relabeled = fmt.Sprintf("the runtime volume label changed from %s to %s across a new boot",
 			stored.Persistent.VolumeID, current.Persistent.VolumeID)
 	}
 	if stored.Runtime.Device != 0 && current.Runtime.Device != 0 &&
 		stored.Runtime.Device != current.Runtime.Device {
-		return changed("the root device changed from %d to %d",
-			stored.Runtime.Device, current.Runtime.Device)
+		// Inside one boot a different device *is* a different way of reaching
+		// this path, and CompareMountBinding cannot see it on macOS because
+		// mountIDFor returns nil there. Keep that detection. Across boots the
+		// number is not comparable at all.
+		if !newBoot {
+			return changed("the root device changed from %d to %d",
+				stored.Runtime.Device, current.Runtime.Device)
+		}
+		if relabeled == "" {
+			relabeled = fmt.Sprintf("the runtime device number changed from %d to %d across a new boot",
+				stored.Runtime.Device, current.Runtime.Device)
+		}
 	}
 	// Exact comparison, including uid 0. Treating a stored zero as "unset" is
 	// what let a re-chowned directory pass as the same object.
@@ -85,11 +117,41 @@ func CompareRootIdentity(stored, current domain.RootIdentity) IdentityVerdict {
 		return IdentityVerdict{Weak: "the registered root identity carries no creation time or " +
 			"generation, so a volume swap or an inode reuse cannot be told apart from the original"}
 	}
-	return IdentityVerdict{}
+	return IdentityVerdict{RuntimeRelabeled: relabeled}
 }
 
 // known reports whether a filesystem name was actually established.
 func known(name string) bool { return name != "" && name != "unknown" }
+
+// LegacyVolumeLabel reports whether a stored volume id has the `dev-<number>`
+// shape this build derives from the runtime device number. Such a value is
+// runtime-scoped, not a stable volume UUID. Any other shape is compared as a
+// persistent fact; that is how a future platform that can supply a real volume
+// UUID becomes stricter without changing this comparison again.
+func LegacyVolumeLabel(v string) bool {
+	if !strings.HasPrefix(v, "dev-") || len(v) <= 4 {
+		return false
+	}
+	_, err := strconv.ParseUint(v[4:], 10, 64)
+	return err == nil
+}
+
+// LegacyDevice returns the device number encoded by a legacy volume label.
+func LegacyDevice(v string) (uint64, bool) {
+	if !LegacyVolumeLabel(v) {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(v[4:], 10, 64)
+	return n, err == nil
+}
+
+// RootBootChanged reports whether the two identities were observed in different
+// boot sessions. Both sides must name a boot: an unavailable boot id is not
+// evidence of a restart.
+func RootBootChanged(stored, current domain.RootIdentity) bool {
+	return stored.Runtime.BootOrRunID != "" && current.Runtime.BootOrRunID != "" &&
+		stored.Runtime.BootOrRunID != current.Runtime.BootOrRunID
+}
 
 // CompareMountBinding compares the runtime mount identity recorded for this scope
 // with the one observed now.

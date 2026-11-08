@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"dustkeeper/internal/errs"
+	"dustkeeper/internal/review"
 )
 
 // File names. The page lives at a fixed place so that a notification can point at
@@ -157,6 +158,9 @@ func Render(page Page) string {
 				// operational log. It is an identifier, not a file path.
 				flag = strings.TrimSpace(flag + " · 关联审核 " + mdCell(e.ReviewID))
 			}
+			if len(e.RequestTimings) > 0 {
+				flag = strings.TrimSpace(flag + " · 网络耗时 " + mdCell(timingSummary(e.RequestTimings)))
+			}
 			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n",
 				mdCode(e.Path), humanBytes(e.SizeBytes),
 				time.Unix(0, e.AtNS).Format("2006-01-02 15:04:05"), why, flag)
@@ -214,6 +218,34 @@ func reviewFlag(e Entry) string {
 		return "模型接口拒绝或出错，判断未完成"
 	}
 	return "模型服务失败，判断未完成"
+}
+
+// timingSummary states which model took how long, whether the second reviewer
+// was called at all, and the last observed network stage. It reads only fields
+// that were actually recorded: an empty phase is shown as 未记录, and a
+// provider with no timing row (a JEV keep short-circuit) is named as 未调用,
+// never as a zero-duration request. Stage-by-stage durations are derived from
+// comparable event points in the readable receipt, not padded here.
+func timingSummary(timings []review.RequestTiming) string {
+	parts := make([]string, 0, len(timings)+1)
+	called := map[string]bool{}
+	for _, t := range timings {
+		provider := t.Provider
+		if provider == "" {
+			provider = "unknown"
+		}
+		called[provider] = true
+		phase := t.Phase
+		if phase == "" {
+			phase = "未记录"
+		}
+		parts = append(parts, fmt.Sprintf("%s %d ms（%s，最后阶段 %s）",
+			provider, t.ElapsedMS, t.Outcome, phase))
+	}
+	if !called["minimax"] {
+		parts = append(parts, "MiniMax 未调用")
+	}
+	return strings.Join(parts, "；")
 }
 
 // writeMore prints the remainder line R30 asks for.

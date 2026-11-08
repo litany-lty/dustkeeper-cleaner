@@ -32,10 +32,11 @@ type UpgradeResult struct {
 	Upgraded bool `json:"upgraded"`
 }
 
-// UpgradeExplicit brings a schema-3 or schema-4 database to CurrentVersion.
-// A database that is already current is a no-op. Files too short to carry a
-// SQLite header are left to the caller's normal damage handling: this function
-// does not create, delete or rebuild a state file.
+// UpgradeExplicit brings a schema-3, schema-4 or schema-5 database up to
+// CurrentVersion (schema 6). A database that is already current is a no-op.
+// Files too short to carry a SQLite header are left to the caller's normal
+// damage handling: this function does not create, delete or rebuild a state
+// file.
 func UpgradeExplicit(path string) (UpgradeResult, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -135,6 +136,9 @@ func UpgradeExplicit(path string) (UpgradeResult, error) {
 		return UpgradeResult{}, errs.Newf(errs.CodeStateWriteFailed,
 			"upgrade finished at schema %d, expected %d", after, migrations.CurrentVersion)
 	}
+	if err := proveUpgradedSchema(db, path); err != nil {
+		return UpgradeResult{}, err
+	}
 	return UpgradeResult{From: from, To: after, Upgraded: true}, nil
 }
 
@@ -175,6 +179,12 @@ func refuseNonEmptySidecars(path string) error {
 
 // proveOurDatabase checks that the file carries the tables and instance identity
 // this product writes, rather than merely a plausible user_version number.
+//
+// It runs BEFORE any migration, on a schema-3/4/5 file. It must therefore only
+// require tables that exist in every upgradable schema; a schema-6-only table
+// such as review_dispatch_resolution does not exist yet and is checked after
+// the steps by proveUpgradedSchema. Requiring it here would refuse every
+// legitimate 3/4/5 -> 6 upgrade.
 func proveOurDatabase(db *sql.DB, path string) error {
 	var tables int
 	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table'
@@ -189,6 +199,24 @@ func proveOurDatabase(db *sql.DB, path string) error {
 	if err := db.QueryRow("SELECT value FROM meta WHERE key='instance_id'").Scan(&instance); err != nil || instance == "" {
 		return errs.Newf(errs.CodeRecoveryRequired,
 			"%s has no instance identity; it is not a state database this build can upgrade", path)
+	}
+	return nil
+}
+
+// proveUpgradedSchema checks the other half of the integrity contract: after
+// the steps ran, the schema-6 objects must actually be present. A matching
+// user_version alone would still let a build whose 006 step was missing report
+// a successful upgrade and leave the manual-resolution command with no table.
+func proveUpgradedSchema(db *sql.DB, path string) error {
+	var tables int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table'
+		AND name='review_dispatch_resolution'`).Scan(&tables); err != nil {
+		return errs.Wrap(errs.CodeDBError, err)
+	}
+	if tables != 1 {
+		return errs.Newf(errs.CodeStateWriteFailed,
+			"%s reached schema %d without review_dispatch_resolution; refusing to report the upgrade as complete",
+			path, migrations.CurrentVersion)
 	}
 	return nil
 }

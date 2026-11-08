@@ -104,6 +104,12 @@ func kindOf(st *unix.Stat_t) string {
 
 func identityOf(st *unix.Stat_t) domain.FileIdentity {
 	dev := devOf(st)
+	// `dev-<st_dev>` is a RUNTIME label, not a verified stable volume UUID:
+	// APFS device numbers are reassigned across boots. scope.CompareRootIdentity
+	// treats this exact shape as runtime-scoped (still strict within one boot),
+	// and `scope rebind` is the only path that establishes a new generation.
+	// Do not replace this with a claim of persistence, and do not drop the
+	// comparison: a same-boot device change is a real mount replacement.
 	id := domain.FileIdentity{
 		VolumeID: fmt.Sprintf("dev-%d", dev),
 		Device:   dev,

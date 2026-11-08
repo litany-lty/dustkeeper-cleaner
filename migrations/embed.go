@@ -40,6 +40,14 @@ var Schema004 string
 //go:embed 005.sql
 var Schema005 string
 
+// Schema006 records a person's reconciliation of a prepared request that never
+// settled. It is a separate, append-only table: the original request row is kept
+// and never disguised as settled/refused. It is additive too, so an explicit
+// 3/4/5 -> 6 upgrade only creates objects.
+//
+//go:embed 006.sql
+var Schema006 string
+
 // Step is one forward migration.
 type Step struct {
 	Version int
@@ -55,10 +63,11 @@ var Steps = []Step{
 	{Version: 3, SQL: Schema003, Note: "failed scan dirs, claim order, interrupt count"},
 	{Version: 4, SQL: Schema004, Note: "unresolved review requests"},
 	{Version: 5, SQL: Schema005, Note: "pre-request dispatch record and settlement"},
+	{Version: 6, SQL: Schema006, Note: "manual resolution of an unsettled review dispatch"},
 }
 
 // CurrentVersion is the schema version this binary writes and expects.
-const CurrentVersion = 5
+const CurrentVersion = 6
 
 // OldestUpgradable is the oldest schema `init` will explicitly upgrade. A
 // database older than this needs the binary that wrote it, not a leap over

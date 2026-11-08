@@ -13,6 +13,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"strings"
 
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
@@ -41,6 +43,20 @@ type ReviewDispatch struct {
 	OutputTokens int    `json:"output_tokens,omitempty"`
 	SettledNS    *int64 `json:"settled_ns,omitempty"`
 	Note         string `json:"note,omitempty"`
+	// Resolution is a person's separate, append-only conclusion about this one
+	// prepared request. It is nil until someone runs `review dispatch resolve`.
+	// It never rewrites the original State, CostStatus, Attempts or usage above.
+	Resolution *DispatchResolution `json:"resolution,omitempty"`
+}
+
+// DispatchResolution is one manual reconciliation of a prepared request. It is
+// deliberately a different table and a different object from a settlement: it
+// records what a person checked, not what a model or the transport answered.
+type DispatchResolution struct {
+	ResolvedNS    int64  `json:"resolved_ns"`
+	RequestStatus string `json:"request_status"`
+	BillingStatus string `json:"billing_status"`
+	Note          string `json:"note"`
 }
 
 // DispatchSettlement is what the review produced. It is written in the same
@@ -136,15 +152,120 @@ func (s *Store) RefuseReviewDispatch(ctx context.Context, reviewID, reason strin
 	})
 }
 
-// OpenDispatchFor returns unsettled requests for one object and action. The
-// lookup is by object and action rather than by item id, so a re-planned item
-// cannot be asked twice for the same evidence.
+// MaxDispatchResolutionNote bounds a manual note. The limit is a single
+// decision made here, at the one place that writes the table.
+const MaxDispatchResolutionNote = 2000
+
+// ValidateDispatchResolution is the one place the input boundary rules for a
+// manual resolution live. Both the CLI (before it opens the state database) and
+// the store (before it writes) call it, so a checked conclusion cannot be
+// bypassed by another caller.
+//
+// The two status fields are deliberately enumerations: a request result or a
+// billing result that is still "unknown" (or any other value) keeps the row
+// pending and is refused. "not_sent" with "charged" is contradictory - a
+// request that never left cannot have been billed - and is refused too.
+func ValidateDispatchResolution(requestStatus, billingStatus, note string) error {
+	switch requestStatus {
+	case "not_sent", "completed", "failed":
+	default:
+		return errs.Newf(errs.CodeInvalidArgument,
+			"request-status %q is not a checked result; use not_sent|completed|failed (an unknown result stays pending)", requestStatus)
+	}
+	switch billingStatus {
+	case "not_charged", "charged":
+	default:
+		return errs.Newf(errs.CodeInvalidArgument,
+			"billing-status %q is not a checked result; use not_charged|charged (an unknown cost stays pending)", billingStatus)
+	}
+	if requestStatus == "not_sent" && billingStatus == "charged" {
+		return errs.New(errs.CodeInvalidArgument,
+			"not_sent with charged is contradictory: a request that was never sent cannot have been billed")
+	}
+	if strings.TrimSpace(note) == "" {
+		return errs.New(errs.CodeNeedsInput, "say what was checked with --note; an empty note is not a record")
+	}
+	if len(note) > MaxDispatchResolutionNote {
+		return errs.Newf(errs.CodeInvalidArgument,
+			"--note is %d bytes; the limit is %d", len(note), MaxDispatchResolutionNote)
+	}
+	return nil
+}
+
+// ResolveReviewDispatch records a person's conclusion about exactly one
+// prepared request. It is one transaction: the target must still be pending, the
+// append-only resolution is inserted, and an independent manual event is
+// appended. If any part fails - in particular the event write - the whole thing
+// rolls back, so a conclusion can never land without its event (and an event can
+// never "unblock" a request whose conclusion was not written).
+//
+// The dispatch_id primary key is the idempotence guard: a second confirmation
+// hits a unique violation and is refused, leaving the first record intact. The
+// original request row keeps state='pending' and its preparation-time facts -
+// a human decision is never disguised as settled or refused.
+func (s *Store) ResolveReviewDispatch(ctx context.Context, dispatchID string, res DispatchResolution, ev Event) error {
+	if err := ValidateDispatchResolution(res.RequestStatus, res.BillingStatus, res.Note); err != nil {
+		return err
+	}
+	if dispatchID == "" {
+		return errs.New(errs.CodeInvalidArgument, "a resolution needs the dispatch id it belongs to")
+	}
+	return s.write(ctx, func(tx *sql.Tx) error {
+		var state string
+		err := tx.QueryRowContext(ctx,
+			"SELECT state FROM review_dispatch WHERE dispatch_id=?", dispatchID).Scan(&state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return errs.Newf(errs.CodeItemNotFound, "there is no prepared review dispatch with id %q", dispatchID)
+		}
+		if err != nil {
+			return errs.Wrap(errs.CodeDBError, err)
+		}
+		if state != "pending" {
+			return errs.Newf(errs.CodeItemNotFound,
+				"review dispatch %q is %s, not pending; a settled or refused request cannot be reopened", dispatchID, state)
+		}
+
+		_, err = tx.ExecContext(ctx, `INSERT INTO review_dispatch_resolution(
+			dispatch_id, resolved_ns, request_status, billing_status, note)
+			VALUES(?,?,?,?,?)`,
+			dispatchID, res.ResolvedNS, res.RequestStatus, res.BillingStatus, res.Note)
+		if err != nil {
+			if isUniqueViolation(err) {
+				return errs.Newf(errs.CodeStateWriteFailed,
+					"review dispatch %q already has a manual resolution; the first record is kept", dispatchID)
+			}
+			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		}
+		return appendEventTx(ctx, tx, ev)
+	})
+}
+
+// reviewDispatchColumns and reviewDispatchResolutionColumns keep the two reads
+// (OpenDispatchFor and ListReviewDispatch) and their one shared scanner aligned.
+// Both read from review_dispatch d LEFT JOIN review_dispatch_resolution r, so a
+// row always carries both the preparation-time facts and, when present, the
+// independent manual conclusion - shown separately, never conflated.
+const reviewDispatchColumns = `d.dispatch_id, d.review_id, d.run_id, d.item_id, d.scope_id, d.action,
+	d.identity_json, d.token_json, d.budget_json, d.created_ns, d.state, d.attempts,
+	d.failure, d.cost_status, d.elapsed_ms, d.http_status, d.input_tokens, d.output_tokens,
+	d.settled_ns, d.note`
+
+const reviewDispatchResolutionColumns = `r.resolved_ns, r.request_status, r.billing_status, r.note`
+
+const reviewDispatchFrom = ` FROM review_dispatch d
+	LEFT JOIN review_dispatch_resolution r ON r.dispatch_id = d.dispatch_id`
+
+// OpenDispatchFor returns unresolved requests for one object and action. A
+// pending row that already has a manual resolution is NOT unresolved: the
+// person's conclusion lifts exactly this one request's hold, while every other
+// pending dispatch, every other action, and every review_unknown row keeps its
+// own independent hold. The lookup is by object and action rather than by item
+// id, so a re-planned item cannot be asked twice for the same evidence.
 func (s *Store) OpenDispatchFor(ctx context.Context, itemID, action, identityJSON, tokenJSON string) ([]ReviewDispatch, error) {
-	rows, err := s.read(ctx, `SELECT dispatch_id, review_id, run_id, item_id, scope_id, action,
-		identity_json, token_json, budget_json, created_ns, state, attempts, failure,
-		cost_status, elapsed_ms, http_status, input_tokens, output_tokens, settled_ns, note
-		FROM review_dispatch WHERE item_id=? AND action=? AND state='pending'
-		ORDER BY created_ns DESC LIMIT 4`, itemID, action)
+	rows, err := s.read(ctx, `SELECT `+reviewDispatchColumns+`, `+reviewDispatchResolutionColumns+
+		reviewDispatchFrom+` WHERE d.item_id=? AND d.action=? AND d.state='pending'
+		AND r.dispatch_id IS NULL
+		ORDER BY d.created_ns DESC LIMIT 4`, itemID, action)
 	if err != nil {
 		return nil, err
 	}
@@ -167,19 +288,19 @@ func (s *Store) OpenDispatchFor(ctx context.Context, itemID, action, identityJSO
 	return out, nil
 }
 
-// ListReviewDispatch lists pending rows, or all rows when includeSettled is set.
+// ListReviewDispatch lists unresolved rows, or all rows when includeSettled is
+// set. "Unresolved" means pending AND without a manual resolution: the default
+// view is exactly the set that still blocks a re-ask. --all shows the original
+// request facts alongside any independent manual conclusion.
 func (s *Store) ListReviewDispatch(ctx context.Context, includeSettled bool, limit int) ([]ReviewDispatch, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
-	q := `SELECT dispatch_id, review_id, run_id, item_id, scope_id, action,
-		identity_json, token_json, budget_json, created_ns, state, attempts, failure,
-		cost_status, elapsed_ms, http_status, input_tokens, output_tokens, settled_ns, note
-		FROM review_dispatch`
+	q := `SELECT ` + reviewDispatchColumns + `, ` + reviewDispatchResolutionColumns + reviewDispatchFrom
 	if !includeSettled {
-		q += " WHERE state='pending'"
+		q += " WHERE d.state='pending' AND r.dispatch_id IS NULL"
 	}
-	q += " ORDER BY created_ns DESC LIMIT ?"
+	q += " ORDER BY d.created_ns DESC, d.dispatch_id LIMIT ?"
 	rows, err := s.read(ctx, q, limit)
 	if err != nil {
 		return nil, err
@@ -203,10 +324,12 @@ func scanReviewDispatch(rows *sql.Rows) (ReviewDispatch, error) {
 	var d ReviewDispatch
 	var settled sql.NullInt64
 	var note sql.NullString
+	var rNS sql.NullInt64
+	var rReq, rBill, rNote sql.NullString
 	if err := rows.Scan(&d.DispatchID, &d.ReviewID, &d.RunID, &d.ItemID, &d.ScopeID, &d.Action,
 		&d.IdentityJSON, &d.TokenJSON, &d.BudgetJSON, &d.CreatedNS, &d.State, &d.Attempts,
 		&d.Failure, &d.CostStatus, &d.ElapsedMS, &d.HTTPStatus, &d.InputTokens, &d.OutputTokens,
-		&settled, &note); err != nil {
+		&settled, &note, &rNS, &rReq, &rBill, &rNote); err != nil {
 		return ReviewDispatch{}, errs.Wrap(errs.CodeDBError, err)
 	}
 	if settled.Valid {
@@ -214,6 +337,14 @@ func scanReviewDispatch(rows *sql.Rows) (ReviewDispatch, error) {
 		d.SettledNS = &v
 	}
 	d.Note = note.String
+	if rNS.Valid {
+		d.Resolution = &DispatchResolution{
+			ResolvedNS:    rNS.Int64,
+			RequestStatus: rReq.String,
+			BillingStatus: rBill.String,
+			Note:          rNote.String,
+		}
+	}
 	return d, nil
 }
 
@@ -247,5 +378,31 @@ func NewReviewEvent(reviewID string, item domain.ItemID, planID *domain.PlanID, 
 		OccurredAtNS:    atNS,
 		ContractJSON:    string(contract),
 		ResultJSON:      &body,
+	}
+}
+
+// NewReviewDispatchResolutionEvent builds the independent, informational event
+// written with a manual resolution. It is deliberately NOT a "review" decision
+// event: it carries no verdict, no attempts, no token/usage counts and no file
+// action, so it does not increase model review counts, HTTP attempts, token
+// usage or file-action counts. The dispatch id in the contract is what ties it
+// back to the exact prepared request.
+func NewReviewDispatchResolutionEvent(dispatchID string, res DispatchResolution, atNS int64) Event {
+	contract, _ := json.Marshal(map[string]string{"dispatch_id": dispatchID})
+	result, _ := json.Marshal(map[string]any{
+		"source":         "manual_review_dispatch_resolution",
+		"dispatch_id":    dispatchID,
+		"request_status": res.RequestStatus,
+		"billing_status": res.BillingStatus,
+		"resolved_ns":    res.ResolvedNS,
+	})
+	body := string(result)
+	return Event{
+		EventID:      domain.NewID("ev"),
+		Action:       "review_dispatch_resolution",
+		Phase:        domain.PhaseInfo,
+		OccurredAtNS: atNS,
+		ContractJSON: string(contract),
+		ResultJSON:   &body,
 	}
 }

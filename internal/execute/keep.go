@@ -140,9 +140,13 @@ func (e *Executor) noteUnknownRequest(ctx context.Context, sc *ScopeCtx, it stor
 }
 
 // heldUnknownRequest reports whether an unresolved request exists for exactly
-// these bytes. It checks both the unanswered-request table and a dispatch row
-// that was prepared but never settled - a process that died between sending the
-// first request and recording its answer leaves the second kind behind.
+// these bytes. It checks both the unanswered-request table and a pending
+// dispatch row that was prepared but never settled - a process that died
+// between sending the first request and recording its answer leaves the second
+// kind behind. OpenDispatchFor excludes a pending dispatch that already has a
+// manual resolution, so `review dispatch resolve` lifts exactly that one
+// request's hold: other pending dispatches, other actions and review_unknown
+// rows keep their own independent hold. No logic here needs to change for that.
 // A file that has changed since is a different question, so the old row does
 // not suppress a new one - it stays on record either way.
 func (e *Executor) heldUnknownRequest(ctx context.Context, sc *ScopeCtx, it store.Item,

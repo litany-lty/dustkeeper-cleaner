@@ -314,3 +314,84 @@ func TestManagementObjectsSatisfyTheContract(t *testing.T) {
 		}
 	}
 }
+
+// A boot can renumber the APFS data volume's runtime device without replacing
+// the directory. The old build treated `dev-<st_dev>` as a persistent volume
+// UUID and held the scope; the fix keeps every persistent fact strict and only
+// relaxes the two runtime facts when the boot actually changed.
+func TestBootRelabelIsReportedNotHeld(t *testing.T) {
+	stored := baseRoot()
+	current := baseRoot()
+	current.Runtime.BootOrRunID = "boot-b"
+	current.Persistent.VolumeID = "dev-16777231"
+	current.Runtime.Device = 16777231
+	v := CompareRootIdentity(stored, current)
+	if v.Changed != "" || v.Weak != "" || v.RuntimeRelabeled == "" {
+		t.Fatalf("a proven boot relabel was mishandled: %+v", v)
+	}
+	if !RootBootChanged(stored, current) {
+		t.Fatal("the fixture did not actually change boot")
+	}
+}
+
+// The relaxation must NOT hide a real replacement: a different inode, creation
+// time, owner or filesystem still refuses, even across boots and even when both
+// labels have the legacy shape.
+func TestBootRelabelStillChecksEveryPersistentFact(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*domain.RootIdentity)
+	}{
+		{"inode reused", func(r *domain.RootIdentity) { r.Persistent.Inode++ }},
+		{"creation time differs", func(r *domain.RootIdentity) {
+			r.Persistent.BirthTimeNS = int64p(1_700_000_000_000_000_001)
+		}},
+		{"generation differs", func(r *domain.RootIdentity) { r.Persistent.Generation = uint64p(8) }},
+		{"owner differs", func(r *domain.RootIdentity) { r.Persistent.OwnerUID = 0 }},
+		{"filesystem differs", func(r *domain.RootIdentity) { r.Persistent.FileSystem = "ext4" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stored := baseRoot()
+			current := baseRoot()
+			current.Runtime.BootOrRunID = "boot-b"
+			current.Persistent.VolumeID = "dev-16777231"
+			current.Runtime.Device = 16777231
+			tc.mutate(&current)
+			if v := CompareRootIdentity(stored, current); v.Changed == "" {
+				t.Fatalf("%s was accepted during a boot relabel: %+v", tc.name, v)
+			}
+		})
+	}
+}
+
+// A device change inside ONE boot is a mount replacement, not a relabel. The
+// root-cause fix must not open that door.
+func TestSameBootDeviceChangeIsStillRefused(t *testing.T) {
+	stored := baseRoot()
+	current := baseRoot()
+	current.Persistent.VolumeID = "dev-16777231"
+	current.Runtime.Device = 16777231
+	if v := CompareRootIdentity(stored, current); v.Changed == "" || v.RuntimeRelabeled != "" {
+		t.Fatalf("a same-boot device change was accepted: %+v", v)
+	}
+}
+
+// A non-legacy (stable) volume id remains comparable across boots. Only the
+// `dev-*` shape is runtime-scoped.
+func TestStableVolumeIDIsComparedAcrossBoots(t *testing.T) {
+	stored := baseRoot()
+	stored.Persistent.VolumeID = "08317A4F-48DB-4A31-86DC-9FCA86B9B58B"
+	current := baseRoot()
+	current.Persistent.VolumeID = "AAAAAAAA-48DB-4A31-86DC-9FCA86B9B58B"
+	current.Runtime.BootOrRunID = "boot-b"
+	if v := CompareRootIdentity(stored, current); v.Changed == "" {
+		t.Fatalf("a stable volume id change was ignored: %+v", v)
+	}
+	if !LegacyVolumeLabel("dev-16777231") || LegacyVolumeLabel("08317A4F-48DB-4A31") {
+		t.Fatal("legacy label detection does not match the format the platform writes")
+	}
+	if n, ok := LegacyDevice("dev-16777231"); !ok || n != 16777231 {
+		t.Fatalf("legacy device decoding failed: %d %v", n, ok)
+	}
+}

@@ -192,7 +192,15 @@ func OpenVault(root *fsops.Root, expect VaultExpect) (*VaultHandles, error) {
 		}
 	}
 
-	if err := verifyMarker(h.Vault, expect); err != nil {
+	// The volume-label comparison is deferred. A legacy `dev-*` label can be
+	// renumbered across a boot, and that is only acceptable when the bind file's
+	// own digests are reproducible from THIS objects directory and THIS anchor
+	// under that old label. Passing an empty VolumeID skips only that one check;
+	// the owner, inode, scope, kind, format and privacy checks still run here.
+	lax := expect
+	lax.VolumeID = ""
+	marker, err := readMarker(h.Vault, lax)
+	if err != nil {
 		return fail(err)
 	}
 
@@ -216,7 +224,7 @@ func OpenVault(root *fsops.Root, expect VaultExpect) (*VaultHandles, error) {
 			"the durability anchor is on a different device than the objects directory"))
 	}
 
-	bind, err := readBind(h.Vault, expect)
+	bind, err := readBind(h.Vault, lax)
 	if err != nil {
 		return fail(err)
 	}
@@ -242,7 +250,7 @@ func OpenVault(root *fsops.Root, expect VaultExpect) (*VaultHandles, error) {
 	if err != nil {
 		return fail(errs.Wrap(errs.CodeAccessDenied, err))
 	}
-	if string(tag) != bind.AnchorTag || AnchorIdentity(anchorID, string(tag)) != bind.AnchorIdentity {
+	if string(tag) != bind.AnchorTag {
 		return fail(errs.New(errs.CodeScopeChanged,
 			"the durability anchor is not the one this vault was registered with"))
 	}
@@ -251,9 +259,40 @@ func OpenVault(root *fsops.Root, expect VaultExpect) (*VaultHandles, error) {
 	if err != nil {
 		return fail(err)
 	}
-	if identity != bind.ObjectsIdentity {
+
+	// A legacy runtime label may differ from the bound one. Accept it only when
+	// the bind's digests can be reproduced from the objects directory and anchor
+	// we are actually holding, using the bind's own older label. That proves the
+	// directory itself did not change; it does not authorise anything.
+	legacyRelabel := false
+	oldObjectsIdentity, oldAnchorIdentity := "", ""
+	if expect.VolumeID != "" && (bind.VolumeID != expect.VolumeID || marker.VolumeID != expect.VolumeID) {
+		oldDev, ok := LegacyDevice(bind.VolumeID)
+		if !ok || !LegacyVolumeLabel(expect.VolumeID) || marker.VolumeID != bind.VolumeID {
+			return fail(errs.Newf(errs.CodeScopeChanged,
+				"the management directory names volume %q, this scope is bound to %q",
+				bind.VolumeID, expect.VolumeID))
+		}
+		oldObjectsIdentity, err = VaultIdentityUnder(h.Objects, bind.VolumeID, oldDev)
+		if err != nil {
+			return fail(err)
+		}
+		oldAnchorIdentity = AnchorIdentityUnder(anchorID, string(tag), bind.VolumeID, oldDev)
+		if oldObjectsIdentity != bind.ObjectsIdentity || oldAnchorIdentity != bind.AnchorIdentity {
+			return fail(errs.New(errs.CodeScopeChanged,
+				"the old volume label does not reproduce the recorded objects and anchor identities; the management directory is not the registered one"))
+		}
+		legacyRelabel = true
+	}
+
+	if identity != bind.ObjectsIdentity && !(legacyRelabel && oldObjectsIdentity == bind.ObjectsIdentity) {
 		return fail(errs.New(errs.CodeScopeChanged,
 			"the objects directory is not the one this vault was bound to"))
+	}
+	if AnchorIdentity(anchorID, string(tag)) != bind.AnchorIdentity &&
+		!(legacyRelabel && oldAnchorIdentity == bind.AnchorIdentity) {
+		return fail(errs.New(errs.CodeScopeChanged,
+			"the durability anchor is not the one this vault was registered with"))
 	}
 	if expect.Identity != "" && expect.Identity != identity {
 		// The scope row names a different vault. Re-registering is the only way to
@@ -273,24 +312,32 @@ func refuse(what string, err error) error {
 // verifyMarker proves the owner marker exists, is a private file, and names this
 // instance. The content is read through the validated descriptor, not by path.
 func verifyMarker(vault *fsops.Dir, expect VaultExpect) error {
+	_, err := readMarker(vault, expect)
+	return err
+}
+
+// readMarker proves the owner marker exists, is private, names this instance,
+// and returns the facts it records so a caller can compare the volume label in
+// its own context.
+func readMarker(vault *fsops.Dir, expect VaultExpect) (OwnerMarker, error) {
 	const name = "owner.json"
+	var m OwnerMarker
 	if _, _, err := vault.StatEntryPrivate(name, expect.For(false)); err != nil {
-		return refuse("owner marker", err)
+		return m, refuse("owner marker", err)
 	}
 	body, err := vault.ReadFileAt(name, maxMarkerBytes)
 	if err != nil {
-		return refuse("owner marker", err)
+		return m, refuse("owner marker", err)
 	}
-	var m OwnerMarker
 	if err := json.Unmarshal(body, &m); err != nil {
-		return errs.Newf(errs.CodeScopeChanged, "the owner marker is unreadable: %v", err)
+		return m, errs.Newf(errs.CodeScopeChanged, "the owner marker is unreadable: %v", err)
 	}
 	if m.FormatVersion != 1 {
-		return errs.Newf(errs.CodeScopeChanged,
+		return m, errs.Newf(errs.CodeScopeChanged,
 			"the owner marker has format version %d, this build understands 1", m.FormatVersion)
 	}
 	if expect.InstanceID != "" && m.InstanceID != expect.InstanceID {
-		return errs.Newf(errs.CodeScopeOverlap,
+		return m, errs.Newf(errs.CodeScopeOverlap,
 			"this tree is managed by another Dustkeeper instance (%s)", m.InstanceID)
 	}
 	// The marker names the scope, root and kind it was written for. Comparing
@@ -299,19 +346,19 @@ func verifyMarker(vault *fsops.Dir, expect VaultExpect) error {
 	// wrong subject.
 	switch {
 	case expect.ScopeID != "" && m.ScopeID != expect.ScopeID:
-		return errs.Newf(errs.CodeScopeChanged,
+		return m, errs.Newf(errs.CodeScopeChanged,
 			"the owner marker names scope %q, this scope is %q", m.ScopeID, expect.ScopeID)
 	case expect.VolumeID != "" && m.VolumeID != expect.VolumeID:
-		return errs.Newf(errs.CodeScopeChanged,
+		return m, errs.Newf(errs.CodeScopeChanged,
 			"the owner marker was written on volume %q, this volume is %q", m.VolumeID, expect.VolumeID)
 	case expect.RootInode != 0 && m.RootInode != expect.RootInode:
-		return errs.New(errs.CodeScopeChanged,
+		return m, errs.New(errs.CodeScopeChanged,
 			"the owner marker was written for a different root directory")
 	case expect.ScopeKind != "" && m.Kind != expect.ScopeKind:
-		return errs.Newf(errs.CodeScopeChanged,
+		return m, errs.Newf(errs.CodeScopeChanged,
 			"the owner marker was written for a %q scope, this scope is %q", m.Kind, expect.ScopeKind)
 	}
-	return nil
+	return m, nil
 }
 
 // readBind loads and checks the vault binding against the scope contract.
@@ -356,15 +403,52 @@ func readBind(vault *fsops.Dir, expect VaultExpect) (VaultBindV1, error) {
 // It is a function rather than a copy of the expression at each call site so
 // that registration and every later open hash exactly the same facts.
 func VaultIdentity(objects *fsops.Dir, nonce string) (string, error) {
+	_, _, err := objects.Stat()
+	if err != nil {
+		return "", errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	birth, birthOK, generation, generationOK := fsops.CreationEvidence(objects.DirFD())
+	return vaultIdentityPayload(objects, nonce, birth, birthOK, generation, generationOK)
+}
+
+func vaultIdentityPayload(objects *fsops.Dir, nonce string,
+	birth int64, birthOK bool, generation uint64, generationOK bool) (string, error) {
+	id, _, err := objects.Stat()
+	if err != nil {
+		return "", errs.Wrap(errs.CodeAccessDenied, err)
+	}
+	return vaultIdentityOf(id.VolumeID, id.Device, id.Inode,
+		optionalInt(birth, birthOK), optionalUint(generation, generationOK)), nil
+}
+
+func vaultIdentityOf(volume string, device, inode uint64, birth, generation string) string {
+	payload := fmt.Sprintf("%s|%d|%d|%s|%s", volume, device, inode, birth, generation)
+	sum := sha256.Sum256([]byte(payload))
+	return "vault:" + hex.EncodeToString(sum[:])
+}
+
+// VaultIdentityUnder recomputes the objects-directory digest as it would have
+// been recorded under an older legacy `dev-*` runtime label. The inode,
+// creation time and generation are read from the descriptor we actually hold;
+// only the runtime label is substituted.
+//
+// This is how a rebind proves the objects directory did not change: the digest
+// inside vault-bind.json has to be reproducible from this directory under the
+// label that file names.
+func VaultIdentityUnder(objects *fsops.Dir, volume string, device uint64) (string, error) {
 	id, _, err := objects.Stat()
 	if err != nil {
 		return "", errs.Wrap(errs.CodeAccessDenied, err)
 	}
 	birth, birthOK, generation, generationOK := fsops.CreationEvidence(objects.DirFD())
-	payload := fmt.Sprintf("%s|%d|%d|%s|%s", id.VolumeID, id.Device, id.Inode,
-		optionalInt(birth, birthOK), optionalUint(generation, generationOK))
-	sum := sha256.Sum256([]byte(payload))
-	return "vault:" + hex.EncodeToString(sum[:]), nil
+	return vaultIdentityOf(volume, device, id.Inode,
+		optionalInt(birth, birthOK), optionalUint(generation, generationOK)), nil
+}
+
+// AnchorIdentityUnder is AnchorIdentity under an older legacy runtime label.
+func AnchorIdentityUnder(id domain.FileIdentity, tag, volume string, device uint64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("anchor|%s|%d|%d|%s", volume, device, id.Inode, tag)))
+	return "anchor:" + hex.EncodeToString(sum[:])
 }
 
 // FormatVaultIdentity digests the facts that identify one management object.

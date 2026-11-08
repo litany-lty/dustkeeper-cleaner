@@ -93,15 +93,20 @@ jq -c 'select(.phase=="run" or .phase=="scope") | {phase,run_id,scope_id,control
 
 ### 3.1 升级已有实例：先确认手里是哪一版
 
-状态库带 `PRAGMA user_version`。**本工作区这一版是 schema 5**。已知的旧库（schema 3 或 4）**只能由显式
-`init` 升到 5**；`status` / `run` / 其它普通命令一律通过 `OpenExisting` 拒绝版本不一致的库，不改一个字节。
+状态库带 `PRAGMA user_version`。**本工作区这一版是 schema 6**（`migrations/006.sql` 增加
+`review_dispatch_resolution` 人工核查表；`005.sql` 保持不变）。已知的旧库（schema **3、4 或 5**）**只能由显式
+`init` 升到 6**；`status` / `run` / 其它普通命令一律通过 `OpenExisting` 拒绝版本不一致的库，不改一个字节。
 也就是说，"换上新二进制再跑一次 `run` 就自动升级"不成立，但"备份之后跑一次 `init`"会升级，并且会在
-`init --json` 的 `schema_upgrade` 里如实写出 `from` / `to` / `upgraded`。
+`init --json` 的 `schema_upgrade` 里如实写出 `from` / `to` / `upgraded`。本机托管实例当前是 **schema 3**，
+若本轮代码被正式安装，升级结果应写作 **3 → 6**，不是"仍为 5"。
 
 `init` 的升级不是无条件的：`internal/store/upgrade.go` 会先核对文件是普通文件（不是 symlink）、文件头与
 `PRAGMA user_version` 一致、`meta/instance_id` 存在、核心表齐全、sidecar 为空；`headerVersion` 与
-`user_version` 不一致、版本比 3 更旧或比 5 更新、以及库里没有实例身份时都拒绝并保持版本不变。逐 step 在
-事务里执行，同时写 `meta('schema_version')`。这一步是交接计划
+`user_version` 不一致、版本比 3 更旧或比 6 更新、以及库里没有实例身份时都拒绝并保持版本不变。逐 step 在
+事务里执行，同时写 `meta('schema_version')`；迁移结束后再核对 `PRAGMA user_version` 已是 6 且
+`review_dispatch_resolution` 确实存在（`proveUpgradedSchema`），否则不报升级成功。迁移前的
+`proveOurDatabase` 故意只要求 3/4/5 都有的核心表：若在这里要求 schema-6 新表，所有 3/4/5 → 6 升级都会被拒绝。
+这一步是交接计划
 [dustkeeper-next-steps-20261106.md](tasks/dustkeeper-next-steps-20261106.md) §5.3 要求的显式升级边界。
 
 无论哪一版，升级前都遵守：
@@ -114,6 +119,42 @@ jq -c 'select(.phase=="run" or .phase=="scope") | {phase,run_id,scope_id,control
   暂停标记，不恢复 scope 状态，也不补发授权。
 - **状态库副本不是沙箱**（见 §11）。库里记着原 scope 的绝对路径；对副本跑 `run` / `restore` 仍会动真实
   文件。演练要用独立测试目录与独立实例。
+
+### 3.2 目录身份变化：`scope rebind`，不是 `resume`
+
+Darwin 的 `dev-<st_dev>` 是**运行期设备号**，不是已核实的稳定卷 UUID；重启后 APFS 数据卷可能重新编号。
+跨启动出现 `dev-16777229 → dev-16777231` 时，持久证据（inode、创建时间、owner、文件系统）以及
+`.dustkeeper/` 里的 nonce、anchor tag、6 份 manifest 可能全部未变，但旧程序会把这个变化记成
+`SCOPE_CHANGED` 并把 scope 置为 `held`。**`scope resume --accept-stale-hold` 不能修这个**：它只改状态列，
+不重建根身份、vault 绑定、运行期挂载记录或隔离对象的身份字段，下一次打开仍会拒绝。直接删除 scope、
+清空隔离区或另建空实例都是不允许的绕过。
+
+本版新增两步式、保留历史的恢复入口：
+
+```sh
+# 1) 只读预览：证明旧/新证据、影响范围、隔离对象恢复链，并输出 digest；不改任何状态
+dustkeeper scope rebind --id downloads --json
+
+# 2) 只在调度已停止、一致备份存在、全局暂停、无在途操作、具体动作已获批准后确认
+dustkeeper scope rebind --id downloads --digest <预览给的 digest> --confirm \
+  --backup /absolute/private/backup-dir --schedule-stopped --note "已核对重启后的卷与隔离对象"
+```
+
+预览逐项列出：scope / 实例 / 原路径、当前与新 generation、旧新身份差异、owner / vault 卷标签、
+隔离对象数量与逐个「对象仍存在、身份可对应、manifest 存在、恢复链有效」的结论、会失效的计划与授权、
+保护数、pending 操作数、全局暂停状态，以及不可自动处置的对象。确认时**重新验证同一套事实**；
+身份又变了、owner/vault 不匹配、存在未完成文件操作或 digest 过期，一律拒绝且不开放清理。
+
+确认后在一个事务里完成：按结构化字段逐个改写根身份、vault 身份摘要、运行期挂载记录与隔离对象的
+身份 JSON（**不是**批量替换数据库里的 `dev-*` 字符串），generation 与保护版本各 +1，active grant
+收窄为 `needs_reapproval`，并写一条不可变审计事件保存全部旧证据与映射来源。scope ID、全部历史记录、
+原隔离内容、manifest、保护与审核历史保持原样；旧计划不删除，但因 generation / identity 绑定不再可直接执行，
+需要重新预览并确认适用规则。scope 落到 **`paused`**（不是 `active`），全局暂停标记不动，不启动模型、扫描、
+恢复、清理或调度。升到 schema 6 之后不能只换回旧二进制；回退边界见 §11。
+
+> 本版只把**跨启动**的 legacy `dev-*` 重编号当成运行期标签变化处理；同一次启动内 device / mount 变化仍然
+> 视为真实挂载替换并被拒绝。非 `dev-*` 形状的稳定卷标识始终严格比较。跨启动行为尚未在真实设备上做长期
+> 验证，不能写成"已彻底解决"。真实实例的 6 个隔离对象在本轮整改中**未做重绑定**，仍保持 `held`。
 
 ---
 
@@ -476,15 +517,34 @@ dustkeeper review unknown list              # 还没核查的请求（--all 连�
 dustkeeper review unknown resolve \
   --item <item_id> --action quarantine \
   --note "核对了供应商控制台：该请求超时，未计费" --confirm
-dustkeeper review dispatch list             # 已准备但未结算的请求（pending）
-dustkeeper review dispatch list --all       # 连 settled / refused 的历史一起列
+dustkeeper review dispatch list             # 仍未解决：pending 且没有人工核查结论（输出可复制的 dispatch_id）
+dustkeeper review dispatch list --all       # 连 settled / refused 的历史与独立人工结论一起列
+dustkeeper review dispatch resolve --dispatch <dispatch_id> \
+  --request-status not_sent --billing-status not_charged \
+  --note "核对了供应商控制台：该请求未发出、未计费" --confirm
 ```
+
+`list` 默认只把「pending 且没有人工核查结论」当作未解决；`--all` 把**准备时记录**（state、attempts、
+failure、cost_status）与**人工核查后的事实**（request_status / billing_status / note / resolved_ns）分行显示，
+不混在一起。原始 `cost_status`、attempts、token 用量不因人工核查被倒改。
 
 请求发出**之前**会先写一条 `review_dispatch` 的 `pending` 准备记录，审核结果与 decision event 在同一事务里
 结算为 `settled`；本地在发请求前就拒绝的写成 `refused`（`cost_status=not_sent`），不会留下一个假问题挡住下一轮。
 进程在"已发请求、未落结论"之间崩溃留下的 `pending` 会像未知请求一样阻止自动再问——用
-`review dispatch list` 找出它，人工核查后再决定怎么收口。`--all` 可以核对某次 `review_id` 是否真的结算过；
-`review_id` 同时出现在结果页、可读日志、decision event 和运行日志里，是这四处的关联键。
+`review dispatch list` 找出它，再用 `review dispatch resolve` 按**精确 dispatch_id** 人工收口。
+
+`resolve` 需要 `--confirm`、非空且有长度上限的 `--note`、已核查的 `--request-status`
+（`not_sent` / `completed` / `failed`）与 `--billing-status`（`not_charged` / `charged`）。
+`unknown` 不能自动放行，`not_sent + charged` 的矛盾组合被拒绝。它只处理指定的未结算 dispatch：
+已 `settled` / 本地 `refused` 的请求不能用它重新开放；重复确认不会覆写第一份核查记录；
+其他未结算请求、其他动作和 `review_unknown` 记录继续独立生效，命令会明确报告而不是保证"下次一定能问"。
+结论落在独立的追加式 `review_dispatch_resolution` 表并写一条独立人工事件（不增加模型审核次数、
+HTTP attempts、token 用量或文件动作数）；事务里任一写入失败全部回滚，不能出现"记录没写全但已解锁"。
+命令不调用模型、不移动文件、不增加额度，也不代表旧审核允许删除；下次运行仍经过预算、身份、保护、
+规则与模型门禁，并产生新的 request / review ID。执行者须自行核对允许再次调用的批准与剩余额度。
+
+`--all` 可以核对某次 `review_id` 是否真的结算过；`review_id` 同时出现在结果页、可读日志、
+decision event 和运行日志里，是这四处的关联键。
 
 - `list` 给出的路径、动作、尝试次数、失败类别与费用状态就是判断依据。**这条记录的唯一作用就是阻止下一轮
   自动再花一次钱去问同一个问题**；删掉状态库能达到同样效果，但那等于销毁"付过费、没答复"的事实。
@@ -588,6 +648,24 @@ dustkeeper retention plan --manifest /srv/apps/manifest.json
   说明"观察到过变化"，不能保证整个包属于同一时刻。
 - 结果页含业务文件名与路径，按实际分享对象处理。HTTP 尝试次数不证明供应商收到或计费；缺账单就写
   "费用未知"，不要填 0。
+
+### 8.7 正式运行的分段耗时：`request_timings`
+
+时序采集与调试用的 `ReviewBoth` 已经解耦：**正式运行也记录实际发出的请求**，
+不需要、也绝不能把正式模式设成 `ReviewBoth`（那会在 JEV 保留之后仍调用 MiniMax）。
+JEV → MiniMax 的短路、门槛、超时、预算以及模型调用次数、顺序、判断与额度都没有变化。
+
+每条记录仍只有受限字段：`provider` / `outcome` / `phase` / `elapsed_ms` / `stages_ms`。
+只为**确实发生过**的请求写记录；预算拒绝或本地拒绝没有请求时序，也不会生成"0 ms 请求"。
+`stages_ms` 是相对请求开始的**事件时间点**，不是每阶段独立耗时：可读报告只在两个事件点都存在且可比较时
+相减展示 DNS / 连接 / TLS / 首字节，连接复用、DNS 未触发等缺失事件写"未采集/不适用"或"阶段耗时未记录"，
+**不补零**。旧数据缺字段写"未记录"，不推断成零耗时。
+
+时序沿「审核结算事件 → 结果 JSON（`latest.json`）→ 运行日志 `dustkeeper.jsonl` → 可读报告」传递，
+每条通过**实际 review ID** 关联；成功、超时与失败都有相应记录。结果页的人读说明哪个模型耗时、
+最后观测的阶段、MiniMax 是否未调用。全程不记录 URL、代理地址、HTTP 头、正文、文件内容或凭据，
+仍旧遵守日志轮转（2 MiB）与单字段 4 KiB 上限。`scripts/collect-run-data.py` 的白名单与总大小上限
+保持不变，只是采集到的现有日志与结果页现在包含这些字段。
 
 ---
 
@@ -731,16 +809,39 @@ dustkeeper pause
 dustkeeper status                                    # pending_operations 必须为 0，且没有 run 在跑
 lsof "$STATE/instance.lock"                          # 应当没有输出：有输出说明还有进程持有这把锁
 
-# 2) 数据库用 SQLite 自己的备份，不要 cp 一个正在写的文件
-sqlite3 "$STATE/state.db" ".backup '/backup/state.db'"
+# 2) 库静止后按原权限复制数据库与现存 sidecar（不要 cp 一个正在写的文件）
+#    本项目用 journal_mode=DELETE；若出现非空 -journal/-wal/-shm，先保留现场，
+#    用旧二进制正常打开关闭，再按已有恢复路径处理，绝不删 sidecar。
+cp -p "$STATE/state.db" /backup/state.db
+for s in -journal -wal -shm; do
+  [ -e "$STATE/state.db$s" ] && cp -p "$STATE/state.db$s" /backup/state.db$s
+done
+shasum -a 256 /backup/state.db > /backup/state.db.sha256
 
-# 3) 配置、隔离区、二进制
+# 3) 配置、隔离区、二进制与部署参数
 tar czf /backup/dustkeeper-config.tgz -C "$CONFIG" .
 tar czf /backup/vault-exports.tgz -C /srv/app/disposable-exports .dustkeeper
-cp /usr/local/bin/dustkeeper /backup/dustkeeper-1.0.0-phase1-linux-amd64
+cp -p /usr/local/bin/dustkeeper /backup/dustkeeper-1.0.0-phase1-linux-amd64
+dustkeeper version --json > /backup/version.json
+shasum -a 256 /usr/local/bin/dustkeeper > /backup/dustkeeper.sha256
 ```
 
+> 上面的 `systemctl` / `/usr/local/bin` / `/srv/app/...` 是**跨平台模板**，不是本机命令。本机托管实例
+> 的调度单元是 macOS launchd 的 `com.dustkeeper.managed`，配置文件是
+> `~/Library/LaunchAgents/com.dustkeeper.managed.plist`，二进制在 `~/.local/bin/dustkeeper`，实例目录在
+> `~/Library/Application Support/Dustkeeper-Managed/`。实际执行时**只停这一个已确认的 label**，不停止其他
+> launchd 或用户服务；先用 `launchctl print "gui/$(id -u)/com.dustkeeper.managed"` 确认状态，不强杀进程。
+
+**关于系统 `sqlite3 .backup`**：旧模板写过 `sqlite3 "$STATE/state.db" ".backup ..."`，但本机系统自带的
+`sqlite3` 版本能否解释本项目的 STRICT 表、`PRAGMA` 与当前 schema **没有在所有本机环境上验证过**，
+因此它不能当作通用备份命令写进步骤。上面的口径与 §3.1 的显式升级说明一致：先停调度、等进程退出、
+确认 `pending=0` 且无进程持有实例锁，再复制**同一时点**的库、sidecar、完整 config、每个 scope 的
+`.dustkeeper/`、旧二进制、`version --json` / SHA-256 与实际 plist。配置含凭据，只在本机按原权限或更严格
+权限保存，不贴进报告、不上传。诊断 ZIP 不属于一致性恢复备份。
+
 `status` 里只要还有 pending 操作，就先跑 `recover reconcile` 再备份。备份一个"半途"状态，恢复时会更难解释。
+数据库升级后不能只换回旧二进制（旧程序可能不认识新 schema）；一旦有新隔离、恢复或永久删除，
+禁止盲目覆盖旧数据库或旧 vault，先核对真实文件与事件再制定恢复步骤。
 
 **副本不是沙箱。** 把 `DUSTKEEPER_STATE_DIR` 指向备份、然后对着它跑 `run` 或 `quarantine restore`，是很危险的
 动作：库里的 scope 根路径仍然是原目录的绝对路径，副本会照着这些路径去动真实文件。恢复演练要么在一个真正

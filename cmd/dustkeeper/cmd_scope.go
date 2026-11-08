@@ -16,7 +16,7 @@ import (
 func cmdScope(ctx context.Context, a *app, args []string) (output, error) {
 	if len(args) == 0 {
 		return output{}, errs.New(errs.CodeInvalidArgument,
-			"scope needs a subcommand: add, list, show, pause, resume")
+			"scope needs a subcommand: add, list, show, pause, resume, rebind")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -30,6 +30,8 @@ func cmdScope(ctx context.Context, a *app, args []string) (output, error) {
 		return scopePause(ctx, a, rest, false)
 	case "resume":
 		return scopePause(ctx, a, rest, true)
+	case "rebind":
+		return scopeRebind(ctx, a, rest)
 	}
 	return output{}, errs.Newf(errs.CodeInvalidArgument, "unknown scope subcommand %q", sub)
 }
@@ -298,4 +300,107 @@ func scopePause(ctx context.Context, a *app, args []string, resume bool) (output
 		out.Message = "scope paused; no new plan will be created for it while the background run continues elsewhere"
 	}
 	return out, nil
+}
+
+// scopeRebind is the two-step, history-preserving recovery of a scope whose
+// runtime volume label was renumbered across a boot.
+//
+// With no --digest it is strictly read-only: it proves the tree, the vault and
+// every isolated object, and prints a digest over those exact facts. Confirming
+// re-verifies the same facts and refuses a stale digest. `scope resume
+// --accept-stale-hold` cannot do this: it only changes a status column and
+// leaves the vault binding and the old generation untouched.
+func scopeRebind(ctx context.Context, a *app, args []string) (output, error) {
+	fs := flagset("scope rebind", io.Discard)
+	ref := fs.String("id", "", "scope ID")
+	digest := fs.String("digest", "", "digest printed by the read-only preview")
+	confirm := fs.Bool("confirm", false, "confirm this exact rebind; without it the command is a read-only preview")
+	backup := fs.String("backup", "", "existing private backup directory outside the scope root")
+	scheduleStopped := fs.Bool("schedule-stopped", false, "attest that the launchd job for this instance is stopped")
+	note := fs.String("note", "", "why this recovery was performed (recorded with the audit event)")
+	if err := parseFlags(fs, args); err != nil {
+		return output{}, err
+	}
+	if *ref == "" {
+		return output{}, errs.New(errs.CodeInvalidArgument, "--id is required")
+	}
+	if err := a.openStore(); err != nil {
+		return output{}, err
+	}
+	reg := a.registrar()
+	scopeID := domain.ScopeID(*ref)
+
+	if *digest == "" {
+		p, err := reg.RebindPreviewFor(ctx, scopeID)
+		if err != nil {
+			return output{}, err
+		}
+		out := ok()
+		out.ScopeID = *ref
+		out.Data = map[string]any{"preview": p, "digest": p.Digest, "mode": "preview"}
+		out.Message = "read-only preview; no status, identity, event or vault file was changed"
+		out.Human = []string{
+			fmt.Sprintf("scope %s rebind preview (read-only)", p.ScopeID),
+			fmt.Sprintf("  instance: %s   root: %s", p.InstanceID, p.Root),
+			fmt.Sprintf("  status: %s   generation: %d -> %d   protection revision: %d -> %d",
+				p.Status, p.Generation, p.NewGeneration, p.ProtectionRevision, p.NewProtectionRevision),
+			fmt.Sprintf("  identity: %s -> %s   boot changed: %t",
+				p.OldRootIdentity.Persistent.VolumeID, p.NewRootIdentity.Persistent.VolumeID, p.BootChanged),
+			fmt.Sprintf("  reason: %s", p.Verdict.RuntimeRelabeled),
+			fmt.Sprintf("  vault label in owner/bind: %s / %s   objects: %d   pending ops: %d",
+				p.OwnerVolumeLabel, p.BindVolumeLabel, p.QuarantinedCount, p.PendingOps),
+			fmt.Sprintf("  plans: %d   grants: %d   protections: %d   observations: %d (all preserved)",
+				len(p.Plans), len(p.Grants), p.Protections, p.Observations),
+			fmt.Sprintf("  global pause: %t   unresolved objects: %d", p.GlobalPaused, len(p.Unresolvable)),
+			fmt.Sprintf("  preview digest: %s", p.Digest),
+		}
+		for _, o := range p.Objects {
+			out.Human = append(out.Human, fmt.Sprintf(
+				"    %s  state=%s manifest=%t object=%t identity_match=%t restore_chain=%t %s",
+				o.ItemID, o.State, o.ManifestPresent, o.ObjectPresent, o.IdentityMatches,
+				o.RestoreChainValid, o.UnresolvedReason))
+		}
+		for _, n := range p.Notes {
+			out.Human = append(out.Human, "  - "+n)
+		}
+		out.Human = append(out.Human,
+			"  confirm only after the schedule is stopped, a consistent backup exists and the specific action is authorised",
+			"  a rebind never unpauses the instance, never resumes the schedule and never runs a cleanup")
+		out.Next = []string{
+			fmt.Sprintf("dustkeeper scope rebind --id %s --digest %s --confirm --backup <backup_dir> --schedule-stopped --note \"<reason>\"",
+				shellQuote(*ref), shellQuote(p.Digest)),
+		}
+		return out, nil
+	}
+
+	if !*confirm {
+		return output{}, errs.New(errs.CodeNeedsInput,
+			"a confirmed rebind changes the scope generation; repeat with --confirm (or omit --digest for a read-only preview)")
+	}
+	if *note == "" {
+		return output{}, errs.New(errs.CodeNeedsInput, "--note must record why this recovery was performed")
+	}
+	return a.withInstance(func() (output, error) {
+		res, err := reg.ConfirmRebind(ctx, scopeID, scope.RebindOptions{
+			Digest:          *digest,
+			BackupPath:      *backup,
+			ScheduleStopped: *scheduleStopped,
+			Note:            *note,
+		})
+		if err != nil {
+			return output{}, err
+		}
+		out := ok()
+		out.ScopeID = *ref
+		out.Data = map[string]any{"rebind": res, "mode": "confirmed"}
+		out.Message = "scope rebound on a new generation while paused; no scan, model call, restore, cleanup or schedule change was made"
+		out.Human = []string{
+			fmt.Sprintf("scope %s: generation %d -> %d, status %s", res.ScopeID, res.OldGeneration, res.NewGeneration, res.Status),
+			fmt.Sprintf("  %d isolated object(s) and their manifests/history preserved; audit event %s", res.Objects, res.EventID),
+			"  old plans and grants are bound to the old generation and cannot execute; re-preview and re-confirm the applicable rules",
+			"  the instance is still globally paused and the schedule is still stopped",
+			"  next: verify with doctor / status, review rule previews, and only then decide separately about resuming",
+		}
+		return out, nil
+	})
 }

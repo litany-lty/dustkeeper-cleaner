@@ -16,6 +16,7 @@ import (
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/outcome"
+	"dustkeeper/internal/review"
 	"dustkeeper/internal/store"
 )
 
@@ -64,6 +65,11 @@ type Entry struct {
 	Attempts    int    `json:"http_attempts,omitempty"`
 	CostStatus  string `json:"cost_status,omitempty"`
 	ReviewState string `json:"review_state,omitempty"`
+	// RequestTimings are the measured, payload-free timings of the prepared
+	// request correlated by ReviewID. They come from the settlement event, not
+	// from the keep/completion record, and an unrecorded timing is never
+	// invented as a zero.
+	RequestTimings []review.RequestTiming `json:"request_timings,omitempty"`
 }
 
 // Summary counts what the three sections cannot: reviews that produced no
@@ -147,6 +153,7 @@ func Collect(ctx context.Context, st *store.Store, w Window) (Page, error) {
 	// led to a move or a deletion rather than a keep; the settlement event is
 	// the one authoritative record of each prepared request, keyed by review id.
 	tallyReviews(&page.Summary, events)
+	timingsByReview := reviewTimings(events)
 
 	// One entry per item per section: several events can describe the same object
 	// (a retry, a reconciliation), and a page that lists a file twice reads like
@@ -176,6 +183,12 @@ func Collect(ctx context.Context, st *store.Store, w Window) (Page, error) {
 			continue
 		}
 		seen[key] = struct{}{}
+		// Timings are recorded on the settlement event, not on the
+		// keep/completion record. Correlate them by the actual review id so a
+		// section that names that id exposes the same measured rows.
+		if t, ok := timingsByReview[entry.ReviewID]; ok {
+			entry.RequestTimings = t
+		}
 		appendEntry(&page, section, entry)
 	}
 
@@ -359,6 +372,30 @@ func reviewIDOf(ev store.Event) string {
 	return ""
 }
 
+// reviewTimings indexes the per-request timings that settlement events carry
+// under the actual review id. A keep/completion record only stores request
+// counts and cost, so timings must be read from the settlement event that the
+// dispatcher wrote in the same transaction. Only events that really recorded
+// timings contribute: a missing field stays absent, never a zero-filled row.
+func reviewTimings(events []store.Event) map[string][]review.RequestTiming {
+	out := map[string][]review.RequestTiming{}
+	for _, ev := range events {
+		if ev.Action != "review" || ev.Phase != domain.PhaseInfo || ev.ResultJSON == nil {
+			continue
+		}
+		var body struct {
+			RequestTimings []review.RequestTiming `json:"request_timings"`
+		}
+		if json.Unmarshal([]byte(*ev.ResultJSON), &body) != nil || len(body.RequestTimings) == 0 {
+			continue
+		}
+		if id := reviewIDOf(ev); id != "" {
+			out[id] = body.RequestTimings
+		}
+	}
+	return out
+}
+
 // tallyReviews counts every review of the window once.
 //
 // Pass one reads settlement events ("review"/info), which cover successful and
@@ -508,7 +545,10 @@ func reviewStateOf(reason string) string {
 }
 
 // fillReview copies the request facts and the correlation id a keep record
-// carries.
+// carries. It intentionally does not read timings: a keep record stores only
+// request counts and cost. The measured timings are joined by review id from
+// the settlement event in Collect, so adding Decision.RequestTimings alone
+// would not have populated this view.
 func fillReview(entry *Entry, ev store.Event) {
 	entry.ReviewID = reviewIDOf(ev)
 	if ev.ResultJSON == nil {

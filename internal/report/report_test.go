@@ -1,6 +1,7 @@
 package report
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -282,5 +283,91 @@ func TestRenderStatesUnknownFactsWithoutPaddingTheAttemptTotal(t *testing.T) {
 		if !strings.Contains(md, want) {
 			t.Fatalf("the page does not contain %q:\n%s", want, md)
 		}
+	}
+}
+
+// Timings live on the settlement event, not on the keep record. Collect must
+// join them by the real review id, keep stages_ms intact in the result JSON,
+// and name the models (and an uncalled one) in the readable page.
+func TestCollectCorrelatesTimingsByReviewID(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ctx := context.Background()
+	it := domain.ItemID("itm-timing")
+	scopeID := domain.ScopeID("scope-timing")
+	if err := st.InsertScope(ctx, store.Scope{
+		ID: scopeID, RawRoot: []byte("/tmp/scope-timing"),
+		RootIdentityJSON: `{"persistent":{"inode":1}}`, InstanceID: "inst-1",
+		Kind: domain.KindManagedDisposable, Generation: 1, ProtectionRevision: 1,
+		Status: domain.ScopeActive, ScanEpoch: 0, CreatedAtNS: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertPlan(ctx, store.Plan{
+		ID: domain.PlanID("plan-timing"), Kind: domain.PlanManualRule, HeaderJSON: `{}`,
+		Digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		Status: domain.PlanReady, CreatedAtNS: 1, ExpiresAtNS: 1 << 60,
+	}, []store.Item{{
+		ID: it, ScopeID: scopeID, RawRelative: []byte("old.zip"),
+		ObjectName: "old.zip", Reason: domain.ReasonLifecycle,
+		SourceKind: domain.SourceManualRule, BindingJSON: `{}`,
+		SourceParentIdentityJSON: `{}`, PreIdentityJSON: `{"inode":5}`,
+		PreTokenJSON: `{"size":10}`, BoundRetentionSeconds: 2592000,
+		State: domain.StatePlanned,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	keepBody := `{"review_id":"rev-1","reason":"kept_by_model","review":{"http_attempts":2,"cost_status":"usage_recorded"}}`
+	settleBody := `{"review_id":"rev-1","verdict":"allow","attempts":2,"cost_status":"usage_recorded","request_timings":[{"provider":"jev","outcome":"ok","phase":"response_body","elapsed_ms":120,"stages_ms":{"dns_start":1,"dns_done":6,"connection_ready":22,"first_byte":100}},{"provider":"minimax","outcome":"ok","phase":"response_body","elapsed_ms":210,"stages_ms":{"connection_ready":5,"first_byte":150}}]}`
+	for _, ev := range []store.Event{
+		{EventID: "ev-set", ItemID: &it, Action: "review", Phase: domain.PhaseInfo,
+			OccurredAtNS: 100, ContractJSON: `{"review_id":"rev-1"}`, ResultJSON: &settleBody},
+		{EventID: "ev-keep", ItemID: &it, Action: "keep", Phase: domain.PhaseInfo,
+			OccurredAtNS: 100, ContractJSON: `{}`, ResultJSON: &keepBody},
+	} {
+		if err := st.AppendEvent(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := Collect(ctx, st, Window{StartNS: 0, EndNS: 1 << 60, RunID: "run-x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Kept.Entries) != 1 {
+		t.Fatalf("got %d kept entries, want 1: %+v", len(page.Kept.Entries), page.Kept.Entries)
+	}
+	entry := page.Kept.Entries[0]
+	if entry.ReviewID != "rev-1" || len(entry.RequestTimings) != 2 {
+		t.Fatalf("timings not correlated by review id: %+v", entry)
+	}
+	if entry.RequestTimings[0].StagesMS["dns_done"] != 6 || entry.RequestTimings[1].StagesMS["first_byte"] != 150 {
+		t.Fatalf("stages_ms lost on the result page: %+v", entry.RequestTimings)
+	}
+	raw, _ := json.Marshal(page)
+	if !strings.Contains(string(raw), `"stages_ms"`) {
+		t.Fatal("the result JSON lost stages_ms")
+	}
+	md := Render(page)
+	for _, want := range []string{"jev 120 ms", "minimax 210 ms", "最后阶段"} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("the readable page omits %q:\n%s", want, md)
+		}
+	}
+	// With only a JEV row (a keep short-circuit), the second model is named
+	// as not called rather than shown as a zero-duration request.
+	onlyJEV := Page{GeneratedAtNS: 1, WindowStartNS: 1,
+		Kept: Section{Entries: []Entry{{Path: "a", ReasonText: "保留", ReviewID: "rev-1",
+			RequestTimings: entry.RequestTimings[:1]}}, Total: 1}}
+	if !strings.Contains(Render(onlyJEV), "MiniMax 未调用") {
+		t.Fatal("a JEV-only review did not say MiniMax was not called")
+	}
+	// Old settlement events without request_timings contribute no rows.
+	oldBody := `{"review_id":"rev-old","verdict":"allow","attempts":2,"cost_status":"usage_recorded"}`
+	if len(reviewTimings([]store.Event{{EventID: "ev-old", Action: "review", Phase: domain.PhaseInfo,
+		ContractJSON: `{"review_id":"rev-old"}`, ResultJSON: &oldBody}})) != 0 {
+		t.Fatal("an old event without timings produced a fabricated row")
 	}
 }
