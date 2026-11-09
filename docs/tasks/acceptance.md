@@ -9,16 +9,46 @@
 >
 > **顶部「当前状态」表已就地回填**；带「截至整改完成」「未获授权 / 未执行 / 不适用」字样的段落是
 > 2026-11-08 B 阶段完成时点的历史快照，按执行文档 §12 保留历史事实、不逐格改写为「已执行」。
-> 以下表为最新结论，回填记录见 §1、§2 与 §5.0A。
+> 以下表为最新结论；11-09 午后受控模型首跑见紧随本表的续办记录。§1、§2 与 §5.0A 保留此前阶段的回填事实。
 
 | 可报告的状态 | 本轮结论 | 事实 / 缺口 |
 |---|---|---|
 | 代码修复完成 | **是** | P0 `scope rebind`、P1 `review dispatch resolve` + `006.sql`/schema 6、P2 正式路径 `request_timings` 已提交 `88097e4438b9f3af1366d54fd8a28c994b23f66a` 并推送 `main`；CI run `42507420327` 双平台 success；全量 `go test ./...`、`-race`、25 项 Python 用例、原生 release 构建冒烟通过。 |
 | 新版本已安装 | **是** | 停 `com.dustkeeper.managed`、一致备份（30 文件）、替换二进制、显式 `init --json` 得 `from=3 / to=6 / upgraded=true`；升级前后 events/grants/items/observations/plans/rules/scopes/protections/purge_members/scan_queue 计数、scope 身份、授权行与 items 行**完全一致**，唯一变化是 `schema_version 3 → 6` 与三张空表。 |
 | 身份恢复完成 | **是** | 真实 `downloads` 只读预览 digest `sha256:81ef65b1…` 确认后重绑定：generation `1 → 2`、protection_revision `1 → 2`、`status paused`、审计事件 `ev_abda156d…`；6 个隔离对象 `restore_chain_valid=true`、payload 与备份字节一致；`doctor` 六项全绿、`scope ok=true`；旧 grant 收窄为 `needs_reapproval`，旧 plan 保留。 |
-| 手动清理可用 | **否** | 一次真实 `run --json` 已执行但**没有有效清理动作**：`exit=6` / `REVIEW_REQUIRED` / `control=stop_scope`，扫描 1390、`quarantined=0`/`purged=0`、HTTP 尝试 0、无费用。本机缺 `review` 双模型审核配置与凭据。按 §11.2-5 只能记「本轮未验证清理动作」。 |
-| 有限范围自动运行通过 | **否** | 调度保持卸载，自然日历触发 1 次 + 后续 3 次观察**未执行**；§11.3-1 要求「手动首跑满足要求」才恢复调度，该条件不成立。 |
-| 待批准 / 阻塞 | **E2 + 模型配置** | 缺的不是执行授权，而是客观配置：`config.json` 无 `review` 段、`model.enabled=false`、模型名/端点为占位值、缺第二层凭据。`NewService()` 返回 `REVIEW_REQUIRED: retained: configure dual review before any quarantine or deletion`。需用户提供 review 配置、真实端点与凭据，并确认外发字段与费用额度，才能补齐双模型门禁、完成有效首跑与调度观察。 |
+| 手动清理可用 | **审核运行路径通过；实际移动尚未验证** | 21:53 受控复验 `dustkeeper exit=0`，外层 `run_97ab0c9bdf4dea76a4050b6cd916eac2` / 结果页 `run_9e2c94efb59490dd503f664240d1591e`。JEV 416ms、MiniMax 5815ms，均成功，各 1 请求；候选因 `move_safety_unknown` 保留，隔离/永久删除 0、`cost_unknown=0`。旧首轮鉴权失败仍保留，累计模型请求 4。 |
+| 有限范围自动运行通过 | **已恢复调度；自然触发验收待观察** | 21:54 原 label `com.dustkeeper.managed` 已加载到受控 Python 入口及明确的 Managed 环境，Hour 19 / Minute 30；无 RunAtLoad / KeepAlive / StartInterval、无 kickstart。回读 `state=not running` / `runs=0`，4 次自然触发仍为 0；下一次计划 2026-11-10 19:30（Asia/Shanghai）。 |
+| 待批准 / 阻塞 | **无当前执行阻塞；后续验收待实际发生** | 用户「继续」后，主控直接接续已批准的恢复、复验和调度操作，未消耗 WorkBuddy 积分。实例 `paused=false`、`pending_ops=0`、downloads active、原 6 个隔离对象仍在；guard `next_round_allowed=true`。尚未证明真实文件移动和 4 次自然触发，不以退出 0 或调度加载代替这些证据。 |
+
+### 2026-11-09 21:54 续办：双模型复验通过，19:30 调度恢复
+
+- 用户回复「继续」后，主控接续此前已经批准的本机操作，未切换模型、端点或账号配置，未使用 WorkBuddy 积分。先回读确认账本只有旧失败轮、实例暂停、调度未加载，随后备份账本并通过现有 `fee` / `recover` 入口处理。恢复标记只覆盖 round001，原 `aborted`、2 请求和错误事件未改。
+- round002 为**手动复验**，不是自然触发：正常 `resume` 后通过 `finite-run.py run --kind manual` 执行一次。`dustkeeper_exit=0` / `healthy=true`，JEV `ok` 416ms、MiniMax `ok` 5815ms，各 1 请求；本轮没有重试。结果页与外层 run ID 不相同，以上表分别记录。
+- 候选 `ApsaraDB-CA-Chain.zip`（248440 B）因 `move_safety_unknown / 无法确认移动是否安全` 原位保留。审核 1 件，`review_failed_kept=0`、`review_unknown_held=0`、`cost_unknown=0`；隔离/永久删除均为 0。实例回读 `paused=false`、`pending_ops=0`、downloads active、隔离对象数仍为 6、到期清空 0。**本轮证明审核及保留路径正常，不证明文件移动已验收**。
+- 本轮运行前官方只读套餐查询返回 HTTP 200 / status 0，general 区间及周剩余比例均为 100%。MiniMax 按订阅用量处理；JEV 与 MiniMax 混合 token 不冒称可精确拆分。账本保留本轮 0.01 元预算，占用加旧轮估算合计 **0.010245952 元**；再预留下一轮为 0.020245952 元，远低于 70 元。它们是估算与工程预算，**不是实际账单扣款**。
+- 21:54 备份原 plist 后，仅把运行参数替换为 `/opt/homebrew/opt/python@3.14/bin/python3.14` + 本机 `finite-run.py run --kind scheduled`，保留原 Managed config/state 和日志路径、每日 19:30。`plutil` 通过，`launchctl bootstrap` 退出 0；加载回读确认参数、环境和 `com.apple.launchd.calendarinterval` 中 Hour 19 / Minute 30，`runs=0` / `last exit=(never exited)`，没有立即补跑或伪造自然触发。
+- 运行证据：`~/.dustkeeper-closeout-20261109/finite-execution/runs/round-002/`（结果页、订阅回执、用量、耗时、退出码）；调度回读：同目录 `schedule-loaded-20261109.txt`。原 ledger/plist 备份与 `manual-recovery-round-001.json` 也在该私有目录。guard 回读 `stopped=false` / `next_round_allowed=true` / `conservative_checked_through_round=2`；累计 2 轮、4 次模型请求，旧失败 1 轮、正常复验 1 轮。
+- 下一次计划触发为 **2026-11-10 19:30（Asia/Shanghai）**。后续 4 次自然触发及实际文件移动仍未观察，不勾选相应验收项。此次复用已完成的 8 项定向检查，未重跑全量测试、构建或安装二进制。
+
+### 2026-11-09 17:23 续办（历史）：授权修订完成，真实复验待接续
+
+- 用户在主会话 `call_6d4b3f86fad9456db69f40e9002a9aa2` 回复「不限制次数」，取消旧 10 次请求及派生总轮次限制；70 元新增费用、每轮最多隔离 1 文件 / 1 GiB、无永久删除、异常暂停均不变。后续 4 次自然触发是观察目标，不是已经完成的证据。
+- 用户批准「改用当前已登录 MiniMax 账号的订阅 Key，只更新 Dustkeeper 私有副本」。私有文件仍 0600/nlink=1、无符号链接和 ACL；JEV 凭据及全局配置未改变。新 Key 对官方只读套餐接口返回 HTTP 200 / `base_resp.status_code=0`，general 行区间/周剩余比例均为 100%；这是套餐鉴权与用量证据，不是模型调用。脱敏回执：`~/.dustkeeper-closeout-20261109/finite-execution/subscription-check-after-key-update.json`。
+- 唯一旧 `review_unknown` 已用现有命令追加真实处理说明；主控读回 `resolved_ns=1794213189115597000`。原 `failure=auth`、`cost_status=unknown` 和原始事件保留，未伪造发票或把未知费用写为 0；没有重复调用 `review dispatch resolve`。
+- 本机 `finite-run.py` 已取消累计次数限制，保留显式 Managed 实例、每轮范围、真实异常暂停和账本历史。预算采用已知估算费用加每轮未释放的 0.01 元预留，发起前不得超过 70 元；该预留明确为工程保守占用，**不是实际扣款或 JEV 实测**。首轮 MiniMax 401 无用量贡献，732 输入可归属 JEV；按官方 $0.042/百万输入、输出免费和 8 元/美元预算折算，估算 0.000245952 元，非逐笔账单核销。成功混合用量轮次不冒称可精确拆分，保留预算占用。
+- 定向检查：语法检查通过，`test_revision_step.py` **8 项通过（1.710s，exit 0）**；覆盖无逐轮人工费用命令的连续运行、缺预算预留阻断、零调用正常结束/已调用缺用量暂停、真实套餐字段提取、自然触发不虚报、旧轮恢复不放行未来未完成轮次。复用此前已通过项，未重跑全套、构建或安装；本机运维脚本改动不改变已安装 `88097e4` 二进制。
+- 最新账本 seq=4：追加一次授权修订，原 seq 1–3 和 round001 `aborted` / 2 请求未改；`stopped=true`，已知费用估算 0.000245952 元、held=0。真实模型累计仍 2 次，只有 `round-001`；未解除实际暂停、未加载调度、未产生新文件动作。
+- 17:21 已向 WorkBuddy 下发已批准的真实复验与恢复调度步骤，但应用因 Hy4 免费额度频控直接失败。待用户选择接续方式后执行：仅恢复已处理的 round1 → 一次受控手动复验 → 健康才恢复同一实例每日 19:30 → 观察后续 4 次自然触发。不得用手动运行、测试通过或仅加载调度替代自然触发验收。
+
+### 2026-11-09 午后首跑记录（历史）：配置已就绪，旧 Key 鉴权失败
+
+- 首次授权为最多 10 次模型请求（已由上文最新授权取消累计次数限制）、70 元新增费用，每轮最多隔离 1 文件 / 1 GiB，无永久删除；并明确 MiniMax 使用现有订阅 Key，消耗套餐/积分，不按普通 API Key 的按量现金费用处理，不购买或变更订阅。
+- 本机 `review` 现为固定 `jev-1.14.0` / `MiniMax-M3.1-Flash`、1 候选 / 2 次尝试，`run_soft_seconds=300`，`model.enabled=false`。凭据文件权限 0600、目录 0700；正确实例环境下 `status` / `doctor` 通过。未输出或提交凭据。
+- 有限执行入口为 `/Users/litany/.dustkeeper-closeout-20261109/finite-execution/finite-run.py`，账本为同目录 `ledger.json`，证据为 `runs/round-001/`。它是本次本机运维入口，不属于已安装的 `88097e4` 制品。WorkBuddy 的 26 项定向夹具通过；主线程静态复核了实例绑定、异常暂停、额度和轮次边界，未另跑全量检查。
+- 模型首跑失败：JEV 1 次成功、MiniMax 1 次 HTTP 401；共 2 次请求，失败计入额度，2 次预留未释放。没有自动重试或替换候选，隔离/永久删除均为 0。外层与结果页 run ID 如上表，不混用。
+- 有限账本 `stopped=true`、首轮 `aborted`、费用核对状态仍为 `unverified`；不能把初始金额字段 0 当作本次实际费用为 0。新增 `review_unknown` 保留未解决状态，真实 `pause.request` 存在，调度未加载。
+- 主线程另做 1 次官方只读套餐查询，得到 2049；这不是模型调用。其依据为 [MiniMax 官方 M Plan FAQ](https://platform.minimax.cn/docs/m-plan/faq)。当前模型地址依据见 [官方模型调用文档](https://platform.minimax.cn/docs/guides/text-generation)。未用新域名发起模型请求。
+- 当时等待有效订阅凭据或区域确认（已由上文私有 Key 更新和只读鉴权结果接续）。任何后续操作都必须保留本轮 2 次请求及失败证据，不重置预算，不把未来自然触发预报为完成。本次仅本地更新状态文档，未提交、推送或重跑发布门禁。
 
 **发布与制品对应**：最终候选 `88097e4` → CI run `42507420327`（push main）→ `darwin-arm64` SHA-256
 `6c556e5aa6b8ee01aad207367b736c17c699d66162e4b9bb31c76d52e4e9f0fd`、`linux-amd64`
@@ -29,16 +59,16 @@
 
 **当前实例状态**：`/Users/litany/.local/bin/dustkeeper` 为 CI 制品（`88097e4` / schema 6），旧二进制另存
 `~/.local/bin/dustkeeper.old-2cbf8cb` 及备份目录。真实库 schema 6、实例 ID `inst_4a8ad6d08c9ccf2b4bf7a180114834be`
-不变、scope `downloads` generation 2 / `active`（首跑时由 `paused` 恢复）、全局暂停**已恢复**、调度**仍卸载**。
+不变、scope `downloads` generation 2 / `active`（首跑时由 `paused` 恢复）、全局暂停已解除、调度已通过受控入口恢复每日 19:30（21:54 回读，见上文）。
 6 个 quarantined 对象与 6 份 manifest 仍在隔离区、字节未变；`owner.json` / `vault-bind.json` / manifest
 仍固化旧 `dev-16777229` 标签作为历史证据，而库内根身份 / vault 身份 / items 的 captured identity 已重映射到
 `dev-16777231`（当前 boot `F0B18583-…`）。`scope_mount_binding:downloads` 由新二进制 `OpenVerified` 在身份
 比较通过后刷新为当前 boot/device——这是 P0 修复后 scope 可被重新打开的预期行为，**不是数据丢失或绕过验证**。
-`items` 从 4 planned 变为 5 planned + 6 quarantined，`plans` 新增一条 `blocked`：这是首跑候选被规划后
-审核拒绝留下的记录，不是文件动作。
+此前 `REVIEW_REQUIRED` 运行曾使 `items` 从 4 planned 变为 5 planned + 6 quarantined，`plans` 新增一条
+`blocked`；这是该历史轮次的规划记录，不是文件动作，也不作为午后模型首跑的统计。最新结果以上表及本次轮次证据为准。
 
-**完成口径**：可写「代码修复完成 / 新版本已安装 / 身份恢复完成」三层，**不可写「全部完成」**；不得用
-「所有测试通过」「程序退出 0」「定时任务已加载」替代后两层。完整 C/D/E 回填见 §1、§2 与 §5.0A。
+**完成口径**：可写代码修复、安装、身份恢复、真实双模型审核与保留路径通过、调度已恢复；**不可写「全部清理验收完成」**。实际移动和 4 次自然触发仍需各自证据，不得用
+「所有测试通过」「程序退出 0」「定时任务已加载」替代。完整 C/D/E 回填见 §1、§2 与 §5.0A。
 
 ---
 
