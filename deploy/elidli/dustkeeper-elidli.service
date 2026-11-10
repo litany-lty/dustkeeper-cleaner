@@ -1,0 +1,21 @@
+[Unit]
+Description=Dustkeeper bounded automatic cleanup with readable logs
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/dustkeeper-elidli/state/pause.request
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/var/lib/dustkeeper-elidli
+Environment=DUSTKEEPER_CONFIG_DIR=/var/lib/dustkeeper-elidli/config
+Environment=DUSTKEEPER_STATE_DIR=/var/lib/dustkeeper-elidli/state
+ExecStart=/usr/bin/python3 /var/lib/dustkeeper-elidli/run-scheduled-log.py --instance-root /var/lib/dustkeeper-elidli
+TimeoutStartSec=1050
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dustkeeper-elidli

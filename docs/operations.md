@@ -689,6 +689,18 @@ JEV → MiniMax 的短路、门槛、超时、预算以及模型调用次数、�
 
 ---
 
+### 8.9 elidli 无人值守入口
+
+服务器已安装 `dustkeeper-elidli.timer`，每天 19:30 触发 `dustkeeper-elidli.service`；持久定时器在错过日程后补一次，无失败重试循环。手动运行也使用 `dustkeeper-elidli-run`，不要绕过自动入口直接跑核心二进制，否则不会经过这份预算账本。
+
+自动入口 `scripts/run-scheduled-log.py --instance-root /var/lib/dustkeeper-elidli` 读取安装时显式创建的 `automation-budget.json`，缺失或损坏时拒绝且不会重置。elidli / macOS 预算各 35 元；每次先保留 0.01 元工程预算，0 HTTP 的新回执才退回，有模型调用则保留上界。费用字段不是实际扣款。上轮未结算、模型异常、费用未知、坏回执及超预算都暂停，不用下一次日程自动重试不明请求。
+
+正常回执必须有新的 run ID、可解析且属于本轮的起止时间，以及明确的请求/失败/费用计数；部分完成只接受有明确“审核预算耗尽”证据的情况，其他部分失败暂停。结果仍自动写入既有 `readable-reports` 与 `state/logs`，可用 `systemctl list-timers dustkeeper-elidli.timer` 查下次日程，`journalctl -u dustkeeper-elidli.service` 查服务出口。
+
+用户已批准服务器到期自动清空，但首次直接删除仍禁用；至少 7 天是下限，旧对象遵守原保留期和隔离时绑定的授权。暂停后先查本轮日志、pending 和预算记录，核实原因再恢复；不要删除账本、清空 pending 或改成 0 费用来强行续跑。
+
+---
+
 ## 9. 出问题了：恢复与对账
 
 ### 9.1 用户主动恢复一个被隔离的文件

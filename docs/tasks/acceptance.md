@@ -28,6 +28,18 @@
 - 已实测：`internal/review` 的正式协议/旧格式/非法分类和原调试审计要求定向用例；`internal/execute` 的两类原因区分、隐私字段排除及真实 SQLite 结算事件写入；`internal/report` 的精确 ID 关联、旧记录兼容、实际 Collect/Markdown 输出定向用例。先复现缺字段/正式响应拒绝，再修复并通过受影响用例。未重跑全量测试、构建或真实模型评测。
 - 用户随后明确批准“提交发布+安装，发布到 elidli 服务器”，并要求日志记录情况以供后续优化。结构化 settled 日志接入受限摘要，自动可读日志升级 schema 3；相关 Go 日志用例、Python 白名单及端到端报告用例通过。代码已提交 `9365dfc6fb24329cf5d165add5150752161cf844` 并推送 main，CI `42784830038` 的 Linux / macOS 两个平台全部成功。elidli 安装与实跑事实见下文；历史 round002 缺失的明细仍不补造。
 
+### 2026-11-10 elidli 自动清理已启用（18:01 验证）
+
+- 用户明确要求自动清理，随后在 `call_b111d1e004344fbca33d7510256e24cf` 选择“允许到期自动清空”：现有服务器受管范围内，先隔离至少 7 天，到期后由本地检查和双模型再次确认才清空；每轮最多 1 文件 / 1 GiB、保护项不动。首次直接删除分类仍为空；本机仍不获永久删除权限。
+- 系统级 `dustkeeper-elidli.timer` 已 `enabled/active`，每日 **19:30（Asia/Shanghai）**，`Persistent=true`，错过后补一次，随机延时 0；service 为 oneshot、无 Restart。首个自然触发计划 **2026-11-10 19:30**，不是手动调用的时间。
+- service 与 `/usr/local/bin/dustkeeper-elidli-run` 都经过 `run-scheduled-log.py`：显式绑定实例、一次调用既有可读日志包装器、不重试；账本缺失/损坏、上轮 pending、超预算、失败或回执缺失都会阻断并尝试实际暂停。旧 latest 不能冒充本轮；零 HTTP 的确证回执才退回预留；非预算原因的部分失败也暂停。
+- 总 70 元预算按用户批准分配为 macOS 35 元、elidli 35 元。本机 ledger 追加 `budget_allocation` 审计，原 2 轮/4 请求和费用占用保留；服务器 `automation-budget.json` 用整数厘元记保守预留，每轮 10 厘（0.01 元），不是实际扣款，历史摘要有界而累计数不重置。异常时预留保留，不将未知费用归零。
+- 旧 syslog 规则只列出 3 个历史日期，无法持续处理新轮转日志。现已通过 import/enable 两步流程发布 `obsolete_syslog` revision 2，匹配 `messages-20??????` 及 `.gz`，至少 7 天、最多 256 MiB，原活跃 `messages` 不匹配；隔离观察期 7 天，auto_quarantine / auto_purge 各 1 文件/256 MiB。按现有 DSL 的 literal/`?` 语法实施，不扩到其它日志名。两处历史发布目录保留原规则、保护和排除，实例总额仍 1 文件/1 GiB。
+- 备份 `/var/backups/dustkeeper/automation-20261110-095620/` 包含修改前 state/config/launcher；新增服务/定时器位于 `/etc/systemd/system/dustkeeper-elidli.{service,timer}`。实例运行额度 `max_auto_purge_files=1`、`max_auto_purge_bytes=1 GiB`；旧隔离对象仍受原隔离时绑定的授权和保留期约束，不追溯改写。
+- 验证：自动入口 4 组定向测试通过，另针对“非预算部分失败被当成正常”先复现再修复，受影响 2 例通过；服务器 Python 编译与 systemd 单元检查通过。没有重建核心二进制（仍 `9365dfc`），没有重跑全量套件。
+- **服务入口真实验证**：手动 `systemctl start dustkeeper-elidli.service`，18:01:26–18:01:31，`Result=success / ExecMainStatus=0`，run `run_28b09d6a488c24462a94b698a99708cb`；扫描 5349，候选/模型请求/移动/删除全为 0，预算预留退回、pending=null、paused=false，日志自动更新。最后仅收紧 exit 9 的错误分类，复用未受影响的 exit 0 实机证据，未重复清理。**此记录是手动服务入口验证，首个自然触发尚未发生，也未证明已永久删除文件。**
+- 当前两份轮转日志年龄约 0.6/1.6 天，尚未达到 7 天匹配条件；不为展示效果提前移动或删除。后续符合规则的候选由定时任务自行审核，隔离期满后可按上述授权自行清空。
+
 ### 2026-11-10 elidli 服务器安装与真实运行
 
 - 目标为 SSH 别名 `elidli` 的既有 `/var/lib/dustkeeper-elidli` 实例，不是易道业务应用发布。原二进制 `e78057e` / schema 3；先暂停 Dustkeeper，在实例锁内备份 config / creds / state、旧二进制及旧可读日志脚本至 `/var/backups/dustkeeper/elidli-20261110-084414/`，源库与副本 SHA-256 一致。未停止或重启业务服务。
