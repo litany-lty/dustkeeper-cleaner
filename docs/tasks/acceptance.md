@@ -20,13 +20,24 @@
 | 有限范围自动运行通过 | **已恢复调度；自然触发验收待观察** | 21:54 原 label `com.dustkeeper.managed` 已加载到受控 Python 入口及明确的 Managed 环境，Hour 19 / Minute 30；无 RunAtLoad / KeepAlive / StartInterval、无 kickstart。回读 `state=not running` / `runs=0`，4 次自然触发仍为 0；下一次计划 2026-11-10 19:30（Asia/Shanghai）。 |
 | 待批准 / 阻塞 | **无当前执行阻塞；后续验收待实际发生** | 用户「继续」后，主控直接接续已批准的恢复、复验和调度操作，未消耗 WorkBuddy 积分。实例 `paused=false`、`pending_ops=0`、downloads active、原 6 个隔离对象仍在；guard `next_round_allowed=true`。尚未证明真实文件移动和 4 次自然触发，不以退出 0 或调度加载代替这些证据。 |
 
-### 2026-11-10 发布候选：保留原因与自动日志
+### 2026-11-10 发布安装：保留原因与自动日志
 
 - 用户要求“优化+修复”后，修复 `move_safety_unknown` 同时覆盖本地不可移动与模型依据不足、且缺少决策摘要的问题。原处置原因码、权限、安全规则和模型调用次数/顺序保持不变。
 - 新增受限 `review_explanation`：记录本地检查、主要原因分支、JEV 选择/门禁阻断、MiniMax 决策/原因及缺失依据分类；在审核结算事件与 keep 事件落库，再按实际 review ID 关联到结果 JSON / Markdown。
 - 正式 MiniMax 请求增加结构化 `missing_evidence` 分类列表，兼容旧格式缺字段；未知分类、错误形状或超长列表仍拒绝。调试模式原有解释要求不变；正式摘要不保存自由文本、文件正文、提示词、原始响应或凭据。旧记录不补造明细，不作数据库 schema 迁移。
 - 已实测：`internal/review` 的正式协议/旧格式/非法分类和原调试审计要求定向用例；`internal/execute` 的两类原因区分、隐私字段排除及真实 SQLite 结算事件写入；`internal/report` 的精确 ID 关联、旧记录兼容、实际 Collect/Markdown 输出定向用例。先复现缺字段/正式响应拒绝，再修复并通过受影响用例。未重跑全量测试、构建或真实模型评测。
-- 用户随后明确批准“提交发布+安装，发布到 elidli 服务器”，并要求日志记录情况以供后续优化。结构化 settled 日志接入受限摘要，自动可读日志升级 schema 3；相关 Go 日志用例、Python 白名单及端到端报告用例通过。正在按双平台 CI 原生制品流程发布，安装与真实效果单独回填；不会把本地测试代替服务器验收。历史 round002 缺失的明细仍不补造。
+- 用户随后明确批准“提交发布+安装，发布到 elidli 服务器”，并要求日志记录情况以供后续优化。结构化 settled 日志接入受限摘要，自动可读日志升级 schema 3；相关 Go 日志用例、Python 白名单及端到端报告用例通过。代码已提交 `9365dfc6fb24329cf5d165add5150752161cf844` 并推送 main，CI `42784830038` 的 Linux / macOS 两个平台全部成功。elidli 安装与实跑事实见下文；历史 round002 缺失的明细仍不补造。
+
+### 2026-11-10 elidli 服务器安装与真实运行
+
+- 目标为 SSH 别名 `elidli` 的既有 `/var/lib/dustkeeper-elidli` 实例，不是易道业务应用发布。原二进制 `e78057e` / schema 3；先暂停 Dustkeeper，在实例锁内备份 config / creds / state、旧二进制及旧可读日志脚本至 `/var/backups/dustkeeper/elidli-20261110-084414/`，源库与副本 SHA-256 一致。未停止或重启业务服务。
+- 安装 CI `42784830038` 原生 Linux 制品至 `/var/lib/dustkeeper-elidli/bin/dustkeeper`，版本 `1.0.0-phase1` / commit `9365dfc` / schema 6；SHA-256 `ec3205d5aa82cba4c41a93d7bf437a6fa55a76893df9f3f843467354a84b15de` 与 manifest 和服务器文件一致。可读日志脚本同步到既有位置，未重新构建替代 CI 制品。
+- 显式 `init` 升级 3→6；升级前后 scopes 3、rules 5、grants 10、observations 5373、plans 17、items 116、events 115、protections 2 完全一致，原 1 个隔离对象仍在。时钟检查提示距上次可信运行超过 48 小时；核对 `NTPSynchronized=yes` 和实际时刻后，用正常 `doctor --acknowledge-clock` 入口确认；最终 doctor 六项全通过。
+- 服务器已有订阅 Key 只读鉴权 HTTP 200 / status 0，区间剩余 99%、周剩余 100%；未替换服务器凭据。为本次小批实际运行收窄为 1 候选 / 2 尝试、最多隔离 1 文件 / 1 GiB；直接删除分类为空、自动 purge 数量和字节额度均为 0；原保护与排除规则保留，观察期 7 天。
+- **真实运行**：2026-11-10 16:55:10–16:55:15（Asia/Shanghai），run ID `run_bbe5945ee474a680ddbf7d6622c53e36`，exit 0 / OK。完整扫描 5349 文件，候选 0、隔离 0、删除 0、模型请求 0；规则只读预览另确认 `NO_CANDIDATES`。没有为演示制造文件、扩大规则或重复调用模型。磁盘空闲变化 -40 KiB 来自本轮日志/状态等写入，不称为清理释放空间。
+- **自动日志**：服务器 `/var/lib/dustkeeper-elidli/readable-reports/latest-readable.md` / `latest-readable.json`（schema 3）；结构化日志 `/var/lib/dustkeeper-elidli/state/logs/dustkeeper.jsonl`。目录 0700、报告 0600；每次运行自动更新 latest 并保留原有最近 10 轮/20 MiB 限额。稳定入口 `/usr/local/bin/dustkeeper-elidli-run` 明确绑定此实例、调用包装器，已做 shell 语法检查；没有新增服务器定时任务。
+- 最终实例 `paused=false`、pending_ops 0、3 scopes active、due_for_purge 0；原 1 个隔离对象保留。安装回执与备份入口在 `/var/lib/dustkeeper-elidli/releases/9365dfc/deployment-receipt.json`。
+- **证据边界**：新版本安装、升级、真实扫描和自动日志链路已验证；因无匹配候选，本次没有真实触发模型原因明细、隔离或删除分支，相关证据仍是定向测试/CI。macOS 仍是原 `88097e4` 与每日 19:30 调度，本次没有替换；旧 dkacct 验收实例及其 unit 文件也未修改。
 
 ### 2026-11-09 21:54 续办：双模型复验通过，19:30 调度恢复
 

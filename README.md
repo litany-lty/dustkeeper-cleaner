@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Go](https://img.shields.io/badge/go-1.26.1-00ADD8)
 
-## 当前状态（2026-11-09，四种状态分开看）
+## 当前状态（macOS 本机与 elidli 服务器分别记录）
 
 > 本文其余段落混杂了 2026-10-30 的 FINAL-1.0 历史收口、11-07 的制品门禁与后续开发说明。
 > **只有本节是当前事实**；标题带日期、写「历史」或「FINAL-1.0」的段落是当时快照，不与本节并列。
@@ -22,7 +22,7 @@ MiniMax 使用订阅 Key，仅替换 Dustkeeper 私有副本；本轮真实模�
 本机入口每轮预留 0.01 元作保守预算占用，不冒称实际扣款；当前已知估算加占用为 **0.010245952 元**（不是账单），计入下一轮预留后为 0.020245952 元。
 订阅核对失败、真实运行异常或已发送请求缺用量时暂停。WorkBuddy 完成入口修订与检查后遇平台频控，用户回复「继续」后由主控接续本机操作，未使用 WorkBuddy 积分。
 
-**2026-11-10 发布候选修复**：保留结果新增本地检查、JEV 门禁和 MiniMax 缺失依据摘要，保留原原因码及旧记录兼容。源码与定向验证完成，结构化日志及自动可读日志已接入相同摘要；用户已批准发布安装，具体 CI、制品与实例版本以验收记录为准。详情见验收记录及 [运维手册 §8.8](docs/operations.md#88-保留原因明细review_explanation)。
+**2026-11-10 已发布到 elidli**：原因明细和自动日志改动为 `9365dfc`，双平台 CI `42784830038` 通过；服务器已安装并升级至 schema 6。真实扫描 5349 文件、无匹配候选、0 模型请求/隔离/删除，自动日志已生成。服务器运行入口为 `dustkeeper-elidli-run`，自动报告在 `/var/lib/dustkeeper-elidli/readable-reports/`；本机仍为上表 `88097e4`，本次未替换。详情见验收记录及 [运维手册 §8.8](docs/operations.md#88-保留原因明细review_explanation)。
 
 本轮新增的运维入口：`dustkeeper scope rebind --id <scope>`（不带 `--digest` 为只读预览）、
 `dustkeeper review dispatch resolve --dispatch <id> … --confirm`，以及结果页/可读报告中的
