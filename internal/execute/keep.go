@@ -204,6 +204,10 @@ func reviewPayload(reviewed review.Outcome, it store.Item) string {
 	if reviewed.ReviewID != "" {
 		correlation = `,"review_id":` + quoteJSON(reviewed.ReviewID)
 	}
+	if reviewed.Explanation != nil {
+		detail, _ := json.Marshal(reviewed.Explanation)
+		correlation += `,"review_explanation":` + string(detail)
+	}
 	return `{"source":"decision","disposition":` + quoteJSON(domain.DispositionKeep) +
 		`,"reason":` + quoteJSON(reviewed.Reason) +
 		`,"reason_text":` + quoteJSON(outcome.ReasonText(reviewed.Reason)) +

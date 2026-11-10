@@ -70,6 +70,10 @@ type Entry struct {
 	// from the keep/completion record, and an unrecorded timing is never
 	// invented as a zero.
 	RequestTimings []review.RequestTiming `json:"request_timings,omitempty"`
+	// ReviewExplanation is a bounded, payload-free summary of the local and
+	// model gates behind this line. Old records have no summary and stay nil;
+	// the report must not reconstruct missing facts after the run.
+	ReviewExplanation *review.Explanation `json:"review_explanation,omitempty"`
 }
 
 // Summary counts what the three sections cannot: reviews that produced no
@@ -154,6 +158,7 @@ func Collect(ctx context.Context, st *store.Store, w Window) (Page, error) {
 	// the one authoritative record of each prepared request, keyed by review id.
 	tallyReviews(&page.Summary, events)
 	timingsByReview := reviewTimings(events)
+	explanationsByReview := reviewExplanations(events)
 
 	// One entry per item per section: several events can describe the same object
 	// (a retry, a reconciliation), and a page that lists a file twice reads like
@@ -188,6 +193,12 @@ func Collect(ctx context.Context, st *store.Store, w Window) (Page, error) {
 		// section that names that id exposes the same measured rows.
 		if t, ok := timingsByReview[entry.ReviewID]; ok {
 			entry.RequestTimings = t
+		}
+		// The settlement event is authoritative for a prepared request. Join by
+		// its real correlation id only; a neighbouring review for the same item
+		// must never supply an explanation this record did not carry.
+		if entry.ReviewExplanation == nil {
+			entry.ReviewExplanation = explanationsByReview[entry.ReviewID]
 		}
 		appendEntry(&page, section, entry)
 	}
@@ -297,6 +308,7 @@ func entryOf(section sectionKind, item store.Item, ev store.Event) (Entry, bool)
 		entry.Reason, entry.ReasonText, entry.ModelFailed = keepReason(ev)
 		entry.ReviewState = reviewStateOf(entry.Reason)
 		fillReview(&entry, ev)
+		entry.ReviewExplanation = explanationOf(ev)
 	}
 	// A completed action also carries the review it was approved under when the
 	// record says so, so the same id can be followed from any section.
@@ -394,6 +406,40 @@ func reviewTimings(events []store.Event) map[string][]review.RequestTiming {
 		}
 	}
 	return out
+}
+
+// reviewExplanations indexes the non-sensitive decision summary carried by a
+// settlement event. An absent field is intentionally not replaced with an
+// empty object: legacy runs did not record these facts, and the report cannot
+// safely infer them from the final disposition.
+func reviewExplanations(events []store.Event) map[string]*review.Explanation {
+	out := map[string]*review.Explanation{}
+	for _, ev := range events {
+		if ev.Action != "review" || ev.Phase != domain.PhaseInfo || ev.ResultJSON == nil {
+			continue
+		}
+		explanation := explanationOf(ev)
+		if explanation == nil {
+			continue
+		}
+		if id := reviewIDOf(ev); id != "" {
+			out[id] = explanation
+		}
+	}
+	return out
+}
+
+func explanationOf(ev store.Event) *review.Explanation {
+	if ev.ResultJSON == nil {
+		return nil
+	}
+	var body struct {
+		Explanation *review.Explanation `json:"review_explanation"`
+	}
+	if json.Unmarshal([]byte(*ev.ResultJSON), &body) != nil {
+		return nil
+	}
+	return body.Explanation
 }
 
 // tallyReviews counts every review of the window once.

@@ -27,7 +27,7 @@ class ReadableRunLogTest(unittest.TestCase):
                     if args[:2] == ["cleanup", "report"]:
                         page = {
                             "run_id": "run_fixture", "window_start_ns": 100, "window_end_ns": 200,
-                            "deleted": {"total": 2, "entries": [{"item_id": "del", "path": "old/releases/a.zip", "size_bytes": 18, "reason": "dual_review_agrees", "reason_text": "双模型同意永久删除", "http_attempts": 2, "cost_status": "usage_recorded", "review_id": "rev_del"}]},
+                            "deleted": {"total": 2, "entries": [{"item_id": "del", "path": "old/releases/a.zip", "size_bytes": 18, "reason": "dual_review_agrees", "reason_text": "双模型同意永久删除", "http_attempts": 2, "cost_status": "usage_recorded", "review_id": "rev_del", "review_explanation": {"local":{"facts_complete":True,"movable":True,"checks":{"single_link":True,"parent_unchanged":True,"open_by_visible_process":False}}, "jev":{"choice":"allow_review","gate_passed":True,"blockers":[]}, "minimax":{"sent":True,"consulted":True,"decision":"allow","reason":"disposable","missing_evidence":[]}}}]},
                             "to_be_deleted": {"total": 1, "entries": [{"item_id": "q1", "path": "releases/old/application.jar", "size_bytes": 4096, "reason": "dual_review_agrees", "reason_text": "双模型同意进入观察区", "purge_after_ns": 1762000000000000000, "http_attempts": 2, "cost_status": "usage_recorded"}]},
                             "kept": {"total": 1, "entries": [{"item_id": "keep", "path": "logs/messages", "size_bytes": 19, "reason": "not_started_budget", "reason_text": "审核预算已用完，本轮未开始审核", "http_attempts": 0, "cost_status": "not_sent", "review_state": "not_started_budget"}]},
                             "review_summary": {"reviewed": 1, "review_not_started": 1, "review_unknown_held": 1,
@@ -97,9 +97,9 @@ class ReadableRunLogTest(unittest.TestCase):
                 "JEV `allow_review`（jev-test）",
                 "MiniMax `allow`（mm-test）",
                 "JEV 门禁：confidence 0.950 / 0.900；allow_review 0.960 / 0.900；通过",
-                "JEV 阻碍：none",
-                "MiniMax 简短理由：disposable；Measured temporary package is replaceable.",
+                "MiniMax 简短理由：disposable",
                 "缺失依据：current_use",
+                "判断明细：本地必要检查通过；JEV：允许复核；MiniMax：允许",
                 "jev 120 ms (ok)",
                 "logs/messages",
                 "审批预算用完，本轮未发起请求；该对象不产生请求费用",
@@ -140,6 +140,7 @@ class ReadableRunLogTest(unittest.TestCase):
                 self.assertIn(expected, latest)
             self.assertNotIn("raw_response", latest)
             self.assertNotIn("prompt", latest)
+            self.assertNotIn("Measured temporary package is replaceable.", latest)
             # The injected URL, header and body fields must not reach either
             # the markdown or the machine-readable receipt.
             machine = (out / "latest-readable.json").read_text(encoding="utf-8")
@@ -154,7 +155,7 @@ class ReadableRunLogTest(unittest.TestCase):
             self.assertEqual(stages["dns_start"], 1)
             self.assertEqual(stages["first_byte"], 100)
             self.assertIsNone(del_review["timings"][2]["stages_ms"])
-            self.assertEqual(receipt["schema_version"], 2)
+            self.assertEqual(receipt["schema_version"], 3)
             self.assertEqual(receipt["summary"]["review"]["not_started"], 1)
             self.assertEqual(receipt["summary"]["review"]["http_attempts"], 3)
             self.assertEqual(receipt["summary"]["total_entries"], 4)
@@ -248,6 +249,61 @@ class ReadableRunLogTest(unittest.TestCase):
         self.assertIn("首字节 29 ms", md)
         self.assertIn("DNS 未采集/不适用", md)
         self.assertNotIn(" 0 ms", md)
+
+    def test_reason_details_use_only_allowlisted_codes_and_booleans(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("readable_log_reason", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        raw = {
+            "cause": "model_insufficient_for_isolation",
+            "local": {
+                "facts_complete": True,
+                "movable": True,
+                "checks": {
+                    "single_link": True,
+                    "parent_unchanged": True,
+                    "open_by_visible_process": False,
+                    "prompt": "private prompt must not survive",
+                },
+            },
+            "jev": {
+                "choice": "allow_review",
+                "gate_passed": True,
+                "blockers": ["confidence_below_threshold", "private-blocker"],
+                "free_text": "private JEV text",
+            },
+            "minimax": {
+                "sent": True,
+                "consulted": True,
+                "decision": "insufficient",
+                "reason": "insufficient_evidence",
+                "missing_evidence": ["current_use", "recoverability", "private-fact"],
+                "explanation": "private MiniMax text",
+            },
+        }
+        clean = mod.normalize_explanation(raw)
+        encoded = json.dumps(clean, ensure_ascii=False)
+        for leaked in ("private prompt", "private JEV", "private MiniMax", "private-blocker", "private-fact"):
+            self.assertNotIn(leaked, encoded)
+        self.assertEqual(clean["minimax"]["missing_evidence"], ["current_use", "recoverability"])
+
+        review = mod.review_summary({"review_explanation": raw}, "move_safety_unknown", True)
+        receipt = mod.build_receipt(
+            0, {"status": "ok", "code": "OK", "message": "", "data": {}}, {},
+            [{"outcome": "保留", "path": "a.zip", "size_bytes": 1,
+              "reason": "move_safety_unknown", "reason_text": "无法确认移动是否安全",
+              "item_id": "i", "purge_after": "", "review": review}],
+            "start", "end", "/", 0, 0, "",
+        )
+        md = mod.render(receipt)
+        for expected in ("模型认为隔离依据不足", "本地必要检查通过", "JEV：允许复核",
+                         "MiniMax：依据不足", "当前使用情况", "可恢复性"):
+            self.assertIn(expected, md)
+        for leaked in ("private prompt", "private JEV", "private MiniMax", "private-blocker", "private-fact"):
+            self.assertNotIn(leaked, md)
 
 
 if __name__ == "__main__":

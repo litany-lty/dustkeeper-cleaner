@@ -182,6 +182,7 @@ type Request struct {
 // Outcome is the result of a triage: a disposition plus the approval that binds
 // it. Approval is nil for a keep decision, because there is nothing to approve.
 type Outcome struct {
+	Explanation *Explanation
 	Decision    Decision
 	Approval    Approval
 	Disposition string

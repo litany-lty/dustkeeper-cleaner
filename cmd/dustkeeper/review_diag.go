@@ -62,6 +62,14 @@ func (a *app) reviewDiag() func(execute.ReviewDiag) {
 				kv = append(kv, "request_timings", string(raw))
 			}
 		}
+		// The explanation contains only measured booleans and allowlisted
+		// decision codes. Emit it only for a real settled decision; pending and
+		// refused records must not look as if a conclusion already exists.
+		if d.State == "settled" && d.Explanation != nil {
+			if raw, err := json.Marshal(d.Explanation); err == nil {
+				kv = append(kv, "review_explanation", string(raw))
+			}
+		}
 		a.log.Log("review", kv...)
 	}
 }

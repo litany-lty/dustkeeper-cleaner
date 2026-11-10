@@ -20,7 +20,29 @@ MAX_REPORT_DIR_BYTES = 20 << 20
 # The result page shows at most 200 entries per section; the readable log keeps
 # the same ceiling and states the total and the remainder.
 MAX_LISTED_ENTRIES = 200
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+EXPLANATION_CAUSES = {
+    "local_facts_missing", "local_move_safety_unknown",
+    "model_insufficient_for_isolation",
+}
+CHECK_NAMES = {
+    "protected", "single_link", "in_use_by_keeper",
+    "open_by_visible_process", "known_reference", "parent_unchanged",
+    "content_read",
+}
+JEV_CHOICES = {"allow_review", "keep", "insufficient"}
+JEV_BLOCKERS = {
+    "model_keep", "model_insufficient", "confidence_below_threshold",
+    "probability_below_threshold",
+}
+MINIMAX_DECISIONS = {"allow", "deny", "insufficient"}
+MINIMAX_REASONS = {"disposable", "still_needed", "insufficient_evidence"}
+MISSING_EVIDENCE = {
+    "purpose_or_disposal_basis", "references", "current_use",
+    "recoverability", "sensitive_content", "provenance",
+    "action_constraints",
+}
 
 # stages_ms holds event points relative to the start of a request, not
 # per-stage durations. A stage duration is only meaningful as the difference of
@@ -222,7 +244,10 @@ def review_summary(decision, reason, recorded, timings=None):
     return {
         "verdict": str(decision.get("verdict", "")),
         "reason": str(decision.get("reason", "")),
-        "model_error": str(decision.get("model_error", "")),
+        # Provider/model prose is deliberately not copied into this receipt.
+        # The boolean keeps the useful distinction without storing free text.
+        "model_error": "",
+        "model_error_recorded": bool(decision.get("model_error")),
         "jev_decision": str(jev_choice),
         "jev_model": str(decision.get("jev_model", "")),
         "jev_confidence": safe_float(jev.get("confidence")),
@@ -230,13 +255,14 @@ def review_summary(decision, reason, recorded, timings=None):
         "jev_allow_probability": safe_float(jev.get("probabilities", {}).get("allow_review")) if isinstance(jev.get("probabilities"), dict) else None,
         "jev_min_allow_probability": safe_float(jev.get("min_allow_probability")),
         "jev_gate_passed": bool(jev.get("gate_passed", False)),
-        "jev_blockers": safe_list(jev.get("blockers"), 8, 80),
+        "jev_blockers": safe_codes(jev.get("blockers"), JEV_BLOCKERS),
         "minimax_decision": str(minimax),
         "minimax_model": str(decision.get("llm_model", "")),
         "minimax_consulted": consulted,
-        "minimax_reason": safe_text(decision.get("llm_reason", ""), 300),
-        "minimax_explanation": safe_text(decision.get("llm_explanation", ""), 300),
-        "missing_evidence": safe_list(decision.get("missing_evidence"), 8, 80),
+        "minimax_reason": safe_code(decision.get("llm_reason"), MINIMAX_REASONS),
+        "minimax_explanation": "",
+        "missing_evidence": safe_codes(decision.get("missing_evidence"), MISSING_EVIDENCE),
+        "explanation": normalize_explanation(decision.get("review_explanation")),
         "current_run_recorded": recorded,
         "timings": normalize_timings(rows),
         "jev_usage": safe_usage(jev.get("usage")),
@@ -244,15 +270,119 @@ def review_summary(decision, reason, recorded, timings=None):
     }
 
 
-def safe_text(value, limit):
-    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
-    return text if len(text) <= limit else text[:limit] + "…[truncated]"
+def safe_code(value, allowed):
+    return value if isinstance(value, str) and value in allowed else ""
 
 
-def safe_list(value, count, width):
+def safe_codes(value, allowed):
     if not isinstance(value, list):
         return []
-    return [safe_text(item, width) for item in value[:count] if safe_text(item, width)]
+    # Iterate the fixed vocabulary so duplicates and attacker-controlled order
+    # cannot inflate the receipt. Unknown values are not copied at all.
+    return [code for code in sorted(allowed) if code in value]
+
+
+def normalize_explanation(value):
+    """Copy only the bounded booleans and enumerated decision codes.
+
+    Free-form model text, prompts, response bodies and unknown keys never enter
+    either readable artifact. None preserves the difference between a legacy
+    record that had no explanation and an explanation with an empty list.
+    """
+    if not isinstance(value, dict):
+        return None
+    clean = {"cause": safe_code(value.get("cause"), EXPLANATION_CAUSES)}
+    local = value.get("local")
+    if isinstance(local, dict):
+        checks = local.get("checks")
+        clean_checks = {}
+        if isinstance(checks, dict):
+            for name in sorted(CHECK_NAMES):
+                if isinstance(checks.get(name), bool):
+                    clean_checks[name] = checks[name]
+        clean["local"] = {
+            "facts_complete": bool(local.get("facts_complete")),
+            "movable": bool(local.get("movable")),
+            "checks": clean_checks,
+        }
+    jev = value.get("jev")
+    if isinstance(jev, dict):
+        clean["jev"] = {
+            "choice": safe_code(jev.get("choice"), JEV_CHOICES),
+            "gate_passed": bool(jev.get("gate_passed")),
+            "blockers": safe_codes(jev.get("blockers"), JEV_BLOCKERS),
+        }
+    minimax = value.get("minimax")
+    if isinstance(minimax, dict):
+        missing = minimax.get("missing_evidence")
+        clean["minimax"] = {
+            "sent": bool(minimax.get("sent")),
+            "consulted": bool(minimax.get("consulted")),
+            "decision": safe_code(minimax.get("decision"), MINIMAX_DECISIONS),
+            "reason": safe_code(minimax.get("reason"), MINIMAX_REASONS),
+            "missing_evidence": (safe_codes(missing, MISSING_EVIDENCE)
+                                 if isinstance(missing, list) else None),
+        }
+    return clean
+
+
+def explanation_summary(value):
+    if not isinstance(value, dict):
+        return ""
+    parts = []
+    cause_text = {
+        "local_facts_missing": "本地必要检查未完成",
+        "local_move_safety_unknown": "本地检查尚不能确认可安全移动",
+        "model_insufficient_for_isolation": "模型认为隔离依据不足",
+    }
+    if value.get("cause") in cause_text:
+        parts.append(cause_text[value["cause"]])
+    local = value.get("local")
+    if isinstance(local, dict):
+        checks = local.get("checks") if isinstance(local.get("checks"), dict) else {}
+        if local.get("facts_complete") and local.get("movable"):
+            parts.append("本地必要检查通过")
+        for name, blocked, text in (
+            ("protected", True, "文件受保护"),
+            ("single_link", False, "不是单链接文件"),
+            ("in_use_by_keeper", True, "仍被保留副本使用"),
+            ("open_by_visible_process", True, "可见进程正在打开文件"),
+            ("parent_unchanged", False, "父目录稳定性未确认"),
+        ):
+            if checks.get(name) is blocked:
+                parts.append(text)
+        if not local.get("facts_complete") and "open_by_visible_process" not in checks:
+            parts.append("进程占用检查未完成")
+    jev = value.get("jev")
+    if isinstance(jev, dict):
+        choice = {"allow_review": "允许复核", "keep": "保留", "insufficient": "依据不足"}.get(jev.get("choice"))
+        if choice:
+            parts.append("JEV：" + choice)
+        for blocker, text in (
+            ("confidence_below_threshold", "JEV 置信度未达阈值"),
+            ("probability_below_threshold", "JEV 允许复核概率未达阈值"),
+        ):
+            if blocker in (jev.get("blockers") or []):
+                parts.append(text)
+    minimax = value.get("minimax")
+    if isinstance(minimax, dict):
+        decision = {"allow": "允许", "deny": "保留", "insufficient": "依据不足"}.get(minimax.get("decision"))
+        if minimax.get("consulted") and decision:
+            parts.append("MiniMax：" + decision)
+        elif minimax.get("sent"):
+            parts.append("MiniMax：请求未取得有效判断")
+        missing_text = {
+            "purpose_or_disposal_basis": "处置目的或依据", "references": "引用情况",
+            "current_use": "当前使用情况", "recoverability": "可恢复性",
+            "sensitive_content": "敏感内容", "provenance": "来源",
+            "action_constraints": "动作约束",
+        }
+        missing = minimax.get("missing_evidence")
+        if isinstance(missing, list) and missing:
+            parts.append("MiniMax 缺少：" + "、".join(missing_text[x] for x in missing if x in missing_text))
+        elif missing is None and minimax.get("consulted"):
+            parts.append("MiniMax 未提供缺失依据明细")
+    return "；".join(parts)
 
 
 def safe_float(value):
@@ -307,6 +437,9 @@ def collect_entries(executable, page, timeout):
             recorded["page_cost_status"] = str(entry.get("cost_status", ""))
             recorded["page_review_state"] = str(entry.get("review_state", ""))
             recorded["page_review_id"] = str(entry.get("review_id", ""))
+            page_explanation = normalize_explanation(entry.get("review_explanation"))
+            if page_explanation is not None:
+                recorded["explanation"] = page_explanation
             # The result page (latest.json) also carries the timings. Use them
             # when the event lookup found none, so stages_ms survives the
             # event -> JSON -> readable report path.
@@ -601,8 +734,11 @@ def render(receipt):
             lines.append("- MiniMax 简短理由：" + "；".join(minimax_notes))
         if review["missing_evidence"]:
             lines.append("- 缺失依据：" + "；".join(review["missing_evidence"]))
-        if review["model_error"]:
-            lines.append(f"- 模型错误：{review['model_error']}")
+        reason_details = explanation_summary(review.get("explanation"))
+        if reason_details:
+            lines.append("- 判断明细：" + reason_details)
+        if review.get("model_error_recorded"):
+            lines.append("- 模型错误：已记录（自由文本未复制到本日志）")
         if attempts:
             cost = review.get("page_cost_status") or "unknown"
             lines.append(f"- 请求事实：发出 {attempts} 次；费用状态 {md_code(cost)}（未知不等于 0）")

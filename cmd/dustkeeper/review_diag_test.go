@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"dustkeeper/internal/diag"
+	"dustkeeper/internal/domain"
 	"dustkeeper/internal/execute"
 	"dustkeeper/internal/review"
 	"dustkeeper/migrations"
@@ -109,9 +110,22 @@ func TestReviewDiagWritesRequestTimingsWithoutPayload(t *testing.T) {
 		t.Fatalf("open diagnostic log: %v", err)
 	}
 	a := &app{log: log, runID: "run_timing", cmd: "run"}
+	decision := review.Decision{
+		Verdict: domain.VerdictInsufficient,
+		JEV: &review.JEVDiagnostic{Choice: "insufficient", GatePassed: false,
+			Blockers: []string{"model_insufficient"}},
+		LLMSent: true, LLMConsulted: true, LLMDecision: "insufficient",
+		LLMReason: "insufficient_evidence", MissingEvidence: []string{"current_use", "references"},
+		LLMExplanation: "raw model prose must not enter diagnostics",
+	}
+	explanation := review.NewExplanation(review.Request{
+		Action: domain.DispositionQuarantine, FactsComplete: true, Movable: true,
+		Checks: review.Checks{OpenByProcess: review.Bool(false), ParentStable: review.Bool(true)},
+	}, decision, "move_safety_unknown")
 	a.reviewDiag()(execute.ReviewDiag{
 		ReviewID: "rev_timing", State: "settled", Journal: true, Attempts: 2,
-		CostStatus: "usage_recorded",
+		CostStatus:  "usage_recorded",
+		Explanation: explanation,
 		RequestTimings: []review.RequestTiming{
 			{Provider: "jev", Outcome: "ok", Phase: "response_body", ElapsedMS: 120,
 				StagesMS: map[string]int64{"dns_start": 1, "dns_done": 6, "connection_ready": 22, "first_byte": 100}},
@@ -137,10 +151,24 @@ func TestReviewDiagWritesRequestTimingsWithoutPayload(t *testing.T) {
 	if rows[0].StagesMS["dns_done"] != 6 || rows[1].StagesMS["first_byte"] != 150 {
 		t.Fatalf("stages_ms lost in the operational log: %s", raw)
 	}
+	explanationRaw, ok := recs[0]["review_explanation"].(string)
+	if !ok {
+		t.Fatalf("review_explanation not written as bounded JSON: %#v", recs[0]["review_explanation"])
+	}
+	var logged review.Explanation
+	if json.Unmarshal([]byte(explanationRaw), &logged) != nil || logged.Cause != "model_insufficient_for_isolation" ||
+		logged.Local == nil || !logged.Local.FactsComplete || !logged.Local.Movable ||
+		logged.JEV == nil || logged.JEV.Choice != "insufficient" ||
+		logged.MiniMax == nil || len(logged.MiniMax.MissingEvidence) != 2 {
+		t.Fatalf("structured local/JEV/MiniMax explanation was lost: %s", explanationRaw)
+	}
 	for _, forbidden := range []string{"http://", "https://", "Bearer", "api_key", "proxy", "/Users/", "Authorization"} {
-		if strings.Contains(raw, forbidden) {
-			t.Errorf("timing record carries forbidden payload %q: %s", forbidden, raw)
+		if strings.Contains(raw+explanationRaw, forbidden) {
+			t.Errorf("review diagnostic carries forbidden payload %q: timings=%s explanation=%s", forbidden, raw, explanationRaw)
 		}
+	}
+	if strings.Contains(explanationRaw, decision.LLMExplanation) {
+		t.Fatalf("raw model prose entered the structured explanation: %s", explanationRaw)
 	}
 }
 
@@ -151,7 +179,8 @@ func TestReviewDiagOmitsTimingsWhenNoRequestSent(t *testing.T) {
 		t.Fatalf("open diagnostic log: %v", err)
 	}
 	a := &app{log: log, runID: "run_unsent", cmd: "run"}
-	a.reviewDiag()(execute.ReviewDiag{State: "not_started", CostStatus: review.CostNotSent})
+	a.reviewDiag()(execute.ReviewDiag{State: "not_started", CostStatus: review.CostNotSent,
+		Explanation: &review.Explanation{Cause: "local_facts_missing"}})
 	if err := log.Close(); err != nil {
 		t.Fatalf("close diagnostic log: %v", err)
 	}
@@ -162,5 +191,8 @@ func TestReviewDiagOmitsTimingsWhenNoRequestSent(t *testing.T) {
 	// A request that never left the process must not get a 0ms timing row.
 	if _, ok := recs[0]["request_timings"]; ok {
 		t.Fatalf("an unsent request invented a timing record: %v", recs[0])
+	}
+	if _, ok := recs[0]["review_explanation"]; ok {
+		t.Fatalf("an unsent request invented a review explanation: %v", recs[0])
 	}
 }

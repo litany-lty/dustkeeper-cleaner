@@ -186,8 +186,19 @@ func TestSettleReviewCarriesTimingsToDiagAndEvent(t *testing.T) {
 	}
 	out := review.Outcome{
 		ReviewID: "rev-timing",
-		Decision: review.Decision{Verdict: domain.VerdictKeep, RequestTimings: timings},
+		Decision: review.Decision{
+			Verdict: domain.VerdictInsufficient, RequestTimings: timings,
+			JEV: &review.JEVDiagnostic{Choice: "insufficient", GatePassed: false,
+				Blockers: []string{"model_insufficient"}},
+			LLMSent: true, LLMConsulted: true, LLMDecision: "insufficient",
+			LLMReason: "insufficient_evidence", MissingEvidence: []string{"current_use"},
+			LLMExplanation: "raw model prose must not enter diagnostics",
+		},
 	}
+	out.Explanation = review.NewExplanation(review.Request{
+		Action: domain.DispositionQuarantine, FactsComplete: true, Movable: true,
+		Checks: review.Checks{OpenByProcess: review.Bool(false)},
+	}, out.Decision, "move_safety_unknown")
 	if err := e.prepareReview(ctx, it, "scope-timing", domain.ActionQuarantine, "rev-timing",
 		`{"action":"quarantine"}`, `{"size":1}`, `{"mtime":1}`); err != nil {
 		t.Fatal(err)
@@ -209,6 +220,11 @@ func TestSettleReviewCarriesTimingsToDiagAndEvent(t *testing.T) {
 	if len(settled[0].RequestTimings) != 2 || settled[0].RequestTimings[0].StagesMS["dns_done"] != 6 {
 		t.Fatalf("timings or stages_ms lost in the diag record: %+v", settled[0].RequestTimings)
 	}
+	if settled[0].Explanation == nil || settled[0].Explanation.Cause != "model_insufficient_for_isolation" ||
+		settled[0].Explanation.JEV == nil || settled[0].Explanation.JEV.Choice != "insufficient" ||
+		settled[0].Explanation.MiniMax == nil || len(settled[0].Explanation.MiniMax.MissingEvidence) != 1 {
+		t.Fatalf("structured explanation lost in the diag callback: %+v", settled[0].Explanation)
+	}
 
 	events, err := st.ListEvents(ctx, 10, 0)
 	if err != nil {
@@ -217,6 +233,7 @@ func TestSettleReviewCarriesTimingsToDiagAndEvent(t *testing.T) {
 	var body struct {
 		ReviewID       string                 `json:"review_id"`
 		RequestTimings []review.RequestTiming `json:"request_timings"`
+		Explanation    *review.Explanation    `json:"review_explanation"`
 	}
 	settlementJSON, found := "", false
 	for _, ev := range events {
@@ -229,6 +246,11 @@ func TestSettleReviewCarriesTimingsToDiagAndEvent(t *testing.T) {
 	}
 	if !found || len(body.RequestTimings) != 2 || body.RequestTimings[1].StagesMS["first_byte"] != 150 {
 		t.Fatalf("settlement event lost timings: found=%v body=%+v", found, body)
+	}
+	if body.Explanation == nil || body.Explanation.Local == nil ||
+		!body.Explanation.Local.FactsComplete || !body.Explanation.Local.Movable ||
+		body.Explanation.Local.Checks.OpenByProcess == nil || *body.Explanation.Local.Checks.OpenByProcess {
+		t.Fatalf("settlement event lost measured local explanation: %+v", body.Explanation)
 	}
 	for _, forbidden := range []string{"http://", "https://", "Authorization", "Bearer", "api_key", "proxy", "secret"} {
 		if strings.Contains(settlementJSON, forbidden) {

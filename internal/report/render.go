@@ -153,6 +153,11 @@ func Render(page Page) string {
 		for _, e := range page.Kept.Entries {
 			why := mdCell(reasonOf(e))
 			flag := reviewFlag(e)
+			if e.ReviewExplanation != nil {
+				if summary := e.ReviewExplanation.Summary(); summary != "" {
+					flag = strings.TrimSpace(flag + " · 判断依据 " + mdCell(summary))
+				}
+			}
 			if e.ReviewID != "" {
 				// The same id joins the dispatch row, the decision event and the
 				// operational log. It is an identifier, not a file path.

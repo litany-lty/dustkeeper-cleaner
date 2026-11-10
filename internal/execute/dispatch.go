@@ -38,6 +38,10 @@ type ReviewDiag struct {
 	OutputTokens int
 	Budget       string
 	Note         string
+	// Explanation is the bounded, allowlisted local/JEV/MiniMax summary built by
+	// the reviewer. It is populated only for a settled decision; never for a
+	// pending, refused or unstarted request.
+	Explanation *review.Explanation
 	// RequestTimings are the measured, payload-free timings of the requests this
 	// review actually sent, keyed to the same ReviewID. Empty when no request
 	// was dispatched; never padded with a zero-duration placeholder.
@@ -146,6 +150,7 @@ func (e *Executor) settleReview(ctx context.Context, it store.Item, planID *doma
 			Failure: st.Failure, CostStatus: st.CostStatus, ElapsedMS: st.ElapsedMS,
 			HTTPStatus: st.HTTPStatus, InputTokens: st.InputTokens,
 			OutputTokens: st.OutputTokens, Budget: budgetJSON, Note: out.Reason,
+			Explanation:    out.Explanation,
 			RequestTimings: d.RequestTimings,
 		})
 		return nil
@@ -156,6 +161,7 @@ func (e *Executor) settleReview(ctx context.Context, it store.Item, planID *doma
 	// timings there so the result page can correlate them; an empty slice adds
 	// nothing, so a request that was never sent stays unrecorded.
 	ev.ResultJSON = withRequestTimings(ev.ResultJSON, d.RequestTimings)
+	ev.ResultJSON = withReviewExplanation(ev.ResultJSON, out.Explanation)
 	if err := e.Store.SettleReviewDispatch(ctx, reviewID, st, ev); err != nil {
 		return err
 	}
@@ -165,6 +171,7 @@ func (e *Executor) settleReview(ctx context.Context, it store.Item, planID *doma
 		Failure: st.Failure, CostStatus: st.CostStatus, ElapsedMS: st.ElapsedMS,
 		HTTPStatus: st.HTTPStatus, InputTokens: st.InputTokens,
 		OutputTokens: st.OutputTokens, Budget: budgetJSON, Note: out.Reason,
+		Explanation:    out.Explanation,
 		RequestTimings: d.RequestTimings,
 	})
 	return nil

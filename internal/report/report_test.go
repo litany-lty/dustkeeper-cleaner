@@ -322,6 +322,7 @@ func TestCollectCorrelatesTimingsByReviewID(t *testing.T) {
 	}
 	keepBody := `{"review_id":"rev-1","reason":"kept_by_model","review":{"http_attempts":2,"cost_status":"usage_recorded"}}`
 	settleBody := `{"review_id":"rev-1","verdict":"allow","attempts":2,"cost_status":"usage_recorded","request_timings":[{"provider":"jev","outcome":"ok","phase":"response_body","elapsed_ms":120,"stages_ms":{"dns_start":1,"dns_done":6,"connection_ready":22,"first_byte":100}},{"provider":"minimax","outcome":"ok","phase":"response_body","elapsed_ms":210,"stages_ms":{"connection_ready":5,"first_byte":150}}]}`
+	settleBody = strings.TrimSuffix(settleBody, "}") + `,"review_explanation":{"cause":"local_move_safety_unknown","local":{"facts_complete":true,"movable":false,"checks":{"open_by_visible_process":true}}}}`
 	for _, ev := range []store.Event{
 		{EventID: "ev-set", ItemID: &it, Action: "review", Phase: domain.PhaseInfo,
 			OccurredAtNS: 100, ContractJSON: `{"review_id":"rev-1"}`, ResultJSON: &settleBody},
@@ -343,6 +344,9 @@ func TestCollectCorrelatesTimingsByReviewID(t *testing.T) {
 	if entry.ReviewID != "rev-1" || len(entry.RequestTimings) != 2 {
 		t.Fatalf("timings not correlated by review id: %+v", entry)
 	}
+	if entry.ReviewExplanation == nil || entry.ReviewExplanation.Local == nil || entry.ReviewExplanation.Local.Movable {
+		t.Fatalf("settlement explanation did not reach collected entry: %+v", entry.ReviewExplanation)
+	}
 	if entry.RequestTimings[0].StagesMS["dns_done"] != 6 || entry.RequestTimings[1].StagesMS["first_byte"] != 150 {
 		t.Fatalf("stages_ms lost on the result page: %+v", entry.RequestTimings)
 	}
@@ -351,7 +355,7 @@ func TestCollectCorrelatesTimingsByReviewID(t *testing.T) {
 		t.Fatal("the result JSON lost stages_ms")
 	}
 	md := Render(page)
-	for _, want := range []string{"jev 120 ms", "minimax 210 ms", "最后阶段"} {
+	for _, want := range []string{"jev 120 ms", "minimax 210 ms", "最后阶段", "可见进程正在打开文件"} {
 		if !strings.Contains(md, want) {
 			t.Fatalf("the readable page omits %q:\n%s", want, md)
 		}

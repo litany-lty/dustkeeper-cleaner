@@ -72,7 +72,11 @@ func (e *Executor) reviewItem(ctx context.Context, req review.Request) (review.O
 	if e.Review == nil {
 		return review.Outcome{}, errs.New(errs.CodeReviewRequired, "dual review is required; no file action was started")
 	}
-	return e.Review(ctx, req)
+	out, err := e.Review(ctx, req)
+	if err == nil {
+		out.Explanation = review.NewExplanation(req, out.Decision, out.Reason)
+	}
+	return out, err
 }
 
 // decodeToken reads the change token a plan bound.
