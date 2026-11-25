@@ -284,19 +284,34 @@ func (r *Registrar) rebindPreview(ctx context.Context, id domain.ScopeID) (Rebin
 			return empty, nil, refuse(pair.name, err)
 		}
 	}
-	// The volume label in these two files is the OLD one, so the comparison is
-	// made against the old identity, not the current one.
-	oldExpect := f.expect
-	oldExpect.VolumeID = old.Persistent.VolumeID
-	f.marker, err = readMarker(f.vault, oldExpect)
+	// The volume label in these two on-disk files comes from the boot that
+	// registered the vault (which may predate an earlier legacy dev-* rebind).
+	// Defer the volume comparison here and prove below that both the on-disk
+	// bind label and the stored scope-row label reproduce their respective
+	// digests from THIS objects directory and THIS anchor.
+	laxExpect := f.expect
+	laxExpect.VolumeID = ""
+	f.marker, err = readMarker(f.vault, laxExpect)
 	if err != nil {
 		f.close()
 		return empty, nil, err
 	}
-	f.bind, err = readBind(f.vault, oldExpect)
+	f.bind, err = readBind(f.vault, laxExpect)
 	if err != nil {
 		f.close()
 		return empty, nil, err
+	}
+	if f.marker.VolumeID != f.bind.VolumeID {
+		f.close()
+		return empty, nil, errs.Newf(errs.CodeScopeChanged,
+			"the owner marker names volume %q while vault-bind names %q",
+			f.marker.VolumeID, f.bind.VolumeID)
+	}
+	bindDevice, bindOK := LegacyDevice(f.bind.VolumeID)
+	if !bindOK {
+		f.close()
+		return empty, nil, errs.Newf(errs.CodeScopeChanged,
+			"the vault binding volume label %q is not a legacy device label", f.bind.VolumeID)
 	}
 	p.OwnerVolumeLabel = f.marker.VolumeID
 	p.BindVolumeLabel = f.bind.VolumeID
@@ -344,6 +359,12 @@ func (r *Registrar) rebindPreview(ctx context.Context, id domain.ScopeID) (Rebin
 		f.close()
 		return empty, nil, errs.New(errs.CodeScopeChanged, "the stored volume label is not a legacy device label")
 	}
+	bindObjectsIdentity, err := VaultIdentityUnder(f.objects, f.bind.VolumeID, bindDevice)
+	if err != nil {
+		f.close()
+		return empty, nil, err
+	}
+	bindAnchorIdentity := AnchorIdentityUnder(f.anchorID, f.tag, f.bind.VolumeID, bindDevice)
 	p.OldObjectsIdentity, err = VaultIdentityUnder(f.objects, old.Persistent.VolumeID, oldDevice)
 	if err != nil {
 		f.close()
@@ -357,7 +378,7 @@ func (r *Registrar) rebindPreview(ctx context.Context, id domain.ScopeID) (Rebin
 	}
 	p.NewAnchorIdentity = AnchorIdentity(f.anchorID, f.tag)
 	p.NewVaultIdentity = p.NewObjectsIdentity
-	if p.OldObjectsIdentity != f.bind.ObjectsIdentity || p.OldAnchorIdentity != f.bind.AnchorIdentity ||
+	if bindObjectsIdentity != f.bind.ObjectsIdentity || bindAnchorIdentity != f.bind.AnchorIdentity ||
 		p.OldVaultIdentity != p.OldObjectsIdentity {
 		f.close()
 		return empty, nil, errs.New(errs.CodeScopeChanged,
@@ -444,8 +465,7 @@ func objectEvidence(f *rebindFacts, it store.Item, old, current domain.RootIdent
 	e.ObjectPresent = true
 	e.IdentityMatches = objID.Equal(captured) ||
 		(captured.VolumeID == old.Persistent.VolumeID && objID.VolumeID == current.Persistent.VolumeID &&
-			objID.Inode == captured.Inode && objID.Kind == captured.Kind &&
-			equalPtr(objID.BirthTimeNS, captured.BirthTimeNS) && equalPtr(objID.Generation, captured.Generation))
+			sameFileFacts(objID, captured))
 	body, err := f.manifests.ReadFileAt(it.ObjectName+".json", maxMarkerBytes)
 	if err != nil {
 		e.UnresolvedReason = fmt.Sprintf("the manifest is missing: %v", err)
@@ -459,10 +479,32 @@ func objectEvidence(f *rebindFacts, it store.Item, old, current domain.RootIdent
 	}
 	e.ContentHash = m.ContentHash
 	e.ManifestLabel = m.ParentIdentity.VolumeID
-	if m.ObjectID != it.ObjectName || m.ScopeID != string(it.ScopeID) || m.InstanceID != f.expect.InstanceID ||
-		m.ParentIdentity.VolumeID != old.Persistent.VolumeID ||
-		m.ExpectedIdentity.VolumeID != old.Persistent.VolumeID {
-		e.UnresolvedReason = "the manifest does not describe this object under the recorded label"
+	var storedParent, storedPre domain.FileIdentity
+	if err := json.Unmarshal([]byte(it.SourceParentIdentityJSON), &storedParent); err != nil {
+		e.UnresolvedReason = "the recorded parent identity is unreadable"
+		return e
+	}
+	if err := json.Unmarshal([]byte(it.PreIdentityJSON), &storedPre); err != nil {
+		e.UnresolvedReason = "the recorded pre-move identity is unreadable"
+		return e
+	}
+	mDev, mOK := LegacyDevice(m.ParentIdentity.VolumeID)
+	switch {
+	case m.ObjectID != it.ObjectName || m.ScopeID != string(it.ScopeID) || m.InstanceID != f.expect.InstanceID:
+		e.UnresolvedReason = "the manifest does not describe this object under this scope and instance"
+		return e
+	case !mOK || m.ExpectedIdentity.VolumeID != m.ParentIdentity.VolumeID ||
+		m.ParentIdentity.Device != mDev || m.ExpectedIdentity.Device != mDev:
+		e.UnresolvedReason = fmt.Sprintf("the manifest does not describe a consistent legacy label (parent=%s/%d expected=%s/%d)",
+			m.ParentIdentity.VolumeID, m.ParentIdentity.Device, m.ExpectedIdentity.VolumeID, m.ExpectedIdentity.Device)
+		return e
+	case !sameFileFacts(m.ParentIdentity, storedParent):
+		e.UnresolvedReason = fmt.Sprintf("the manifest parent identity (%s) does not match stored parent (%s)",
+			formatFileFacts(m.ParentIdentity), formatFileFacts(storedParent))
+		return e
+	case !sameFileFacts(m.ExpectedIdentity, storedPre):
+		e.UnresolvedReason = fmt.Sprintf("the manifest expected identity (%s) does not match stored pre identity (%s)",
+			formatFileFacts(m.ExpectedIdentity), formatFileFacts(storedPre))
 		return e
 	}
 	if !e.IdentityMatches {
@@ -478,6 +520,23 @@ func objectEvidence(f *rebindFacts, it store.Item, old, current domain.RootIdent
 	}
 	e.RestoreChainValid = true
 	return e
+}
+
+func sameFileFacts(a, b domain.FileIdentity) bool {
+	return a.Inode == b.Inode && a.Kind == b.Kind &&
+		equalPtr(a.BirthTimeNS, b.BirthTimeNS) && equalPtr(a.Generation, b.Generation)
+}
+
+func formatFileFacts(id domain.FileIdentity) string {
+	birth := "none"
+	if id.BirthTimeNS != nil {
+		birth = fmt.Sprintf("%d", *id.BirthTimeNS)
+	}
+	gen := "none"
+	if id.Generation != nil {
+		gen = fmt.Sprintf("%d", *id.Generation)
+	}
+	return fmt.Sprintf("inode=%d kind=%s birth=%s gen=%s", id.Inode, id.Kind, birth, gen)
 }
 
 func equalPtr[T comparable](a, b *T) bool {

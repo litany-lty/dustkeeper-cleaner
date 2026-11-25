@@ -6,6 +6,7 @@ package main
 // the persisted half of a boot relabel (nothing outside t.TempDir is touched).
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -200,7 +201,9 @@ func readJSONFile(t *testing.T, p string, dst any) {
 	if err != nil {
 		t.Fatalf("read %s: %v", p, err)
 	}
-	if err := json.Unmarshal(b, dst); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(dst); err != nil {
 		t.Fatalf("decode %s: %v", p, err)
 	}
 }
@@ -543,5 +546,125 @@ func TestScopeRebindCommitBoundaryKeepsTheOldHeldState(t *testing.T) {
 	}
 	if afterStatus != "held" {
 		t.Fatalf("the scope must stay held after an interrupted commit, got %q", afterStatus)
+	}
+}
+
+// Reproduces a two-hop legacy recovery (dev-A -> dev-B -> current), where an
+// earlier scope rebind updated SQLite rows to dev-B while preserving the on-disk
+// owner.json, vault-bind.json, and manifests/*.json byte-for-byte at dev-A.
+func TestScopeRebindAcrossPriorLegacyRebind(t *testing.T) {
+	base, itemID, tree, origLabel, newLabel, origDev := rebindFixture(t)
+	db := rebindDB(t, base)
+
+	payloadBefore, err := os.ReadFile(filepath.Join(tree, domain.VaultDirName, "objects", itemID))
+	if err != nil {
+		t.Fatalf("read isolated payload: %v", err)
+	}
+
+	root, err := fsops.OpenRoot(tree)
+	if err != nil {
+		t.Fatalf("open fixture root: %v", err)
+	}
+	objects, err := root.OpenDir([]byte(domain.VaultObjects))
+	if err != nil {
+		root.Close()
+		t.Fatalf("open vault objects: %v", err)
+	}
+	midDev := origDev + 3
+	midLabel := fmt.Sprintf("dev-%d", midDev)
+	midVault, err := scope.VaultIdentityUnder(objects, midLabel, midDev)
+	objects.Close()
+	if err != nil {
+		root.Close()
+		t.Fatalf("derive mid vault identity: %v", err)
+	}
+	current, err := root.Identity()
+	root.Close()
+	if err != nil {
+		t.Fatalf("read root identity: %v", err)
+	}
+
+	// Simulate an earlier completed rebind in SQLite (origLabel -> midLabel)
+	// while leaving on-disk owner.json, vault-bind.json and manifests/*.json untouched at origLabel.
+	midRoot := current
+	midRoot.Persistent.VolumeID = midLabel
+	midRoot.Runtime.Device = midDev
+	midRoot.Runtime.BootOrRunID = "boot-fixture-mid"
+	midRootJSON, err := json.Marshal(midRoot)
+	if err != nil {
+		t.Fatalf("marshal mid identity: %v", err)
+	}
+	midMountJSON, err := json.Marshal(domain.RuntimeMountIdentity{
+		BootOrRunID: "boot-fixture-mid", Device: midDev,
+	})
+	if err != nil {
+		t.Fatalf("marshal mid mount binding: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE scopes SET root_identity_json=?, vault_identity_json=?, generation=generation+1, status='paused' WHERE scope_id='exports'`,
+		string(midRootJSON), midVault); err != nil {
+		t.Fatalf("update scope row to mid label: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO meta(key,value) VALUES('scope_mount_binding:exports',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		string(midMountJSON)); err != nil {
+		t.Fatalf("update mount binding to mid label: %v", err)
+	}
+	var rawParent, rawPre, rawCaptured string
+	if err := db.QueryRow(`SELECT source_parent_identity_json, pre_identity_json, COALESCE(captured_identity_json,'') FROM items WHERE item_id=?`, itemID).
+		Scan(&rawParent, &rawPre, &rawCaptured); err != nil {
+		t.Fatalf("read item identities: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE items SET source_parent_identity_json=?, pre_identity_json=?, captured_identity_json=? WHERE item_id=?`,
+		rewriteLabel(t, rawParent, midLabel, midDev),
+		rewriteLabel(t, rawPre, midLabel, midDev),
+		rewriteLabel(t, rawCaptured, midLabel, midDev),
+		itemID); err != nil {
+		t.Fatalf("update item identities to mid label: %v", err)
+	}
+
+	preview := mustCLI(t, "scope", "rebind", "--id", "exports", "--json")
+	p := dataMap(t, dataOf(t, preview)["preview"])
+	if got := p["owner_volume_label"]; got != origLabel {
+		t.Fatalf("owner_volume_label = %v, want %s", got, origLabel)
+	}
+	if unres, _ := p["unresolvable"].([]any); len(unres) != 0 {
+		t.Fatalf("expected 0 unresolvable objects across two-hop legacy rebind, got %v", unres)
+	}
+	digest := dataString(t, preview, "digest")
+
+	backup := filepath.Join(base, "backup-two-hop")
+	if err := os.MkdirAll(backup, 0o700); err != nil {
+		t.Fatalf("mkdir backup: %v", err)
+	}
+	res := mustCLI(t, "scope", "rebind", "--id", "exports", "--digest", digest, "--confirm",
+		"--backup", backup, "--schedule-stopped", "--note", "fixture: two-hop legacy rebind", "--json")
+	rd := dataMap(t, dataOf(t, res)["rebind"])
+	if rd["status"] != "paused" || rd["objects"].(float64) < 1 {
+		t.Fatalf("unexpected rebind result: %v", rd)
+	}
+
+	_, rootJSON, vaultJSON, _, _ := rebindScopeRow(t, db)
+	var storedRoot domain.RootIdentity
+	if err := json.Unmarshal([]byte(rootJSON), &storedRoot); err != nil {
+		t.Fatalf("decode new root identity: %v", err)
+	}
+	if storedRoot.Persistent.VolumeID != newLabel || strings.Contains(vaultJSON, midLabel) {
+		t.Fatalf("scope did not rebind cleanly from %s -> %s -> %s (root=%s vault=%s)",
+			origLabel, midLabel, newLabel, rootJSON, vaultJSON)
+	}
+
+	if err := os.MkdirAll(filepath.Join(tree, "recovered-two-hop"), 0o755); err != nil {
+		t.Fatalf("mkdir restore destination: %v", err)
+	}
+	restored := mustCLI(t, "quarantine", "restore", "--object", itemID,
+		"--destination-relative", "recovered-two-hop/old.zip", "--json")
+	if got := dataString(t, restored, "restored"); got != "recovered-two-hop/old.zip" {
+		t.Fatalf("restored to %q", got)
+	}
+	body, err := os.ReadFile(filepath.Join(tree, "recovered-two-hop", "old.zip"))
+	if err != nil {
+		t.Fatalf("read restored file: %v", err)
+	}
+	if string(body) != string(payloadBefore) {
+		t.Fatalf("restored content differs after two-hop rebind")
 	}
 }
