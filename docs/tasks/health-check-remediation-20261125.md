@@ -277,4 +277,36 @@
 
 - **本机代理端口变化**：当前宿主机 `scutil --proxy` 生效代理为 **`127.0.0.1:7897`**（旧配置的 `127.0.0.1:7890` 端口未监听）；外部现有 `~/.dustkeeper-review/config.json` 与 `~/Library/Application Support/Dustkeeper-Managed/config/config.json` 仍写着 `127.0.0.1:7890`，按边界约定本轮未修改，后续如需在宿主直接联调或运行，请先确认并将对应配置中的 `jev_proxy_url` 更新为当前可用代理端口。
 - **宿主机磁盘余量**：宿主机 `/System/Volumes/Data` 当前余量约 `73.7–77 GiB`（约 `8%` 空闲，接近 `min_free_percent: 5`/`10` 边界），真机运行若低于配置下限会自动进入 `DISK_PRESSURE`（暂停新隔离并仅放行已授权到期清空或确认的直接删除类别）。
-- **仍待显式授权事项**：将本次二进制更新安装到宿主实机、`Dustkeeper-Managed` 解除暂停及日常运行调度、Linux 容器正式构建（`./build/build-linux-release.sh`）与 `elidli` 部署、以及 `git commit` / `push`。
+- **本轮上线状态**：已获用户授权并在下文 **§ 六** 完成正式提交、双平台 CI 发布与本机 macOS + `elidli` Linux 双端实机升级恢复。
+
+---
+
+## 六、正式提交、双平台 CI 与本机 + `elidli` 实机升级恢复记录（2026-11-25）
+
+### 6.1 提交历史与双平台 GitHub Actions CI 制品
+
+- **代码提交链**：
+  - `b5c3509`：`feat: harden long-running unattended reliability, macOS fsid identity, and observability`
+  - `3e3614b`：`fix(ci): guard darwin chflags test by build tag and install pyyaml in CI`（将 `chflags` 测试隔离至 [observation_rounds_darwin_test.go](file:///Users/litany/WorkBuddy/清理器/test/integration/observation_rounds_darwin_test.go) 并为 [ci.yml](file:///Users/litany/WorkBuddy/清理器/.github/workflows/ci.yml) macOS runner 补装 `pyyaml`，CI Run `45605529273` 双平台通过）
+  - `1a78f59`：`fix(scope): support rebinding scopes across prior legacy dev-* rebinds`（实机 `downloads` rebind 暴露出此前经历过 `dev-16777229 -> dev-16777231` 的域仍保留原始 `dev-16777229` 的 `owner.json` / `vault-bind.json` / `manifests/*.json`；在 [rebind.go](file:///Users/litany/WorkBuddy/清理器/internal/scope/rebind.go#L287-L540) 改用 `OpenVault` 同款双重可再现证明与持久化文件事实校验，并在 [scope_rebind_test.go](file:///Users/litany/WorkBuddy/清理器/cmd/dustkeeper/scope_rebind_test.go#L549-L667) 增加 `TestScopeRebindAcrossPriorLegacyRebind` 回归与 `UseNumber()` 64 位整数保真，复跑 `go vet ./...` 与 `go test -race -count=1 ./internal/scope ./cmd/dustkeeper` 全绿）
+- **最终上线 CI Run `45608718898`**（commit `1a78f59`，`test (ubuntu-latest, linux-amd64)` 与 `test (macos-latest, darwin-arm64)` 全绿）：
+  - `dustkeeper-1.0.0-phase1-darwin-arm64`：SHA-256 `f6a3084513379295d5e17a4221783b2df0d3bffe9f0a45ea02fd263ff997d0bf`
+  - `dustkeeper-1.0.0-phase1-linux-amd64`（musl 静态）：SHA-256 `1c087f31375ecfc57d801a1223c77ecced276aabcfb42fea1ae6e709a11dbb1e`
+
+### 6.2 本机 macOS（`Dustkeeper-Managed`）实机升级与 `SCOPE_CHANGED` 根治
+
+1. **停调度与一致性备份**：`bootout` 卸除 `gui/501/com.dustkeeper.managed` 后创建 `0700` 备份 `/Users/litany/.dustkeeper-closeout-20261109/backup-20261125-upgrade/`（含 `managed-config`、`managed-state/state.db` SHA-256 `35622143e39741ca7fc2e93385f14bc22bef8ae7c9786889c84f980178e32baf`、`downloads-.dustkeeper`、`dustkeeper.old-88097e4`、`ledger.json.bak`、`dustkeeper-review-config.json`）。
+2. **安装与配置对齐**：原子替换 `/Users/litany/.local/bin/dustkeeper`（`version --json` 确认为 `commit=1a78f59`、`schema=6`）；将 `Dustkeeper-Managed/config/config.json` 与 `~/.dustkeeper-review/config.json` 的 `jev_proxy_url` 更新为 `http://127.0.0.1:7897`、`timeout_seconds` 更新为 `60`（保持 `0600`）。
+3. **跨两跳 `scope rebind` 至 APFS 持久卷 UUID**：
+   - 预览确认 `downloads` 由 `dev-16777231`（盘上原始凭据 `dev-16777229`）迁移至持久卷标 **`DF6E9B01-C76F-AF01-0000-000000000000`**，6 个隔离对象（`unresolvable: null`、`restore_chain_valid: true`）全部通过校验，提交后 `generation: 2 -> 3`（事件 `ev_66c1add8f442706a80e3d59040c76fb1`），再执行 `scope resume --id downloads`。
+4. **最小授权与台账恢复**：重新授权唯一 `active` 规则 `grant_85b239a59b99d909cf7df53bb634759d`（`rule-001` rev 2、`auto_quarantine`、`approved_max_files: 1`、`approved_max_logical_bytes: 1073741824`，零 `auto_purge`）；执行 `doctor --acknowledge-clock` 与 `doctor --json`（全项通过）；写入 `0600` 标记并执行 `finite-run.py recover --round 13` 解除 Round 13 停机锁（保留第 13 轮 `aborted` 记录）。
+5. **恢复调度与第 14 轮受控实跑**：`resume --json` 移除暂停标记、`launchctl bootstrap` 重载 `com.dustkeeper.managed` 后，运行 `finite-run.py run --kind manual`（Round 14 / `run_330540f0e5e2524e903b89d5bd896c0e`）以 `exit 0` (`settled`) 完成：`jev` `369ms` + `MiniMax` **`27367ms`**（验证 `60s` 超时生效、`input_tokens=1387`、`output_tokens=2200`）；`status --json` 显示 `paused: false`、`last_run_health.healthy: true`、`downloads` `active`（`1406` 观察项、`6` 隔离对象、`0` 未决审核）。
+
+### 6.3 远端 Linux 服务器（`elidli`）实机升级与 `systemd` 挂载命名空间护栏
+
+1. **备份与制品安装**：确认 `NTPSynchronized=yes` 后暂止 `dustkeeper-elidli.timer`，建立 `0700` 备份 `/var/backups/dustkeeper/elidli-20261125-upgrade/`（含 `state-raw/state.db` `sha256` `a4a23ed5a0f725e6ca63aaed4471f2620b8dbfe8c5163989195e91a411ec49aa`、`config`、`automation-budget.json`、`dustkeeper.old` 及原脚本/服务单元）；上传并校验 CI `linux-amd64` 二进制、`run-readable-log.py` 与 `run-scheduled-log.py`，原子安装后确认 `commit=1a78f59`、`schema=6`。
+2. **排查并消除 `PrivateTmp=true` 同启动 `mount_id` 漂移**：
+   - 升级中首次触发 `systemctl start dustkeeper-elidli.service` 时因临时加入 `PrivateTmp=true`，`systemd` 每次启动均新建独立挂载命名空间，导致 3 个域内 `mount_id` 在同一 `boot_id` 内从宿主 `100` 变为 `1447`，被安全防线以 `SCOPE_CHANGED`（`exit 4`、0 次 HTTP 调用）拦停并挂起 3 个域。
+   - **修复与固化护栏**：移除 `/etc/systemd/system/dustkeeper-elidli.service` 中的 `PrivateTmp=true`（保持 `User=root` 以匹配 `/var/lib/dustkeeper-elidli`、`/opt/elidli-test/releases` 与 `/var/log` 权限，移除 `ConditionPathExists`，保留 `TimeoutStartSec=1200` / `KillSignal=SIGTERM` / `TimeoutStopSec=60`），并在仓库模板 [dustkeeper-elidli.service](file:///Users/litany/WorkBuddy/清理器/deploy/elidli/dustkeeper-elidli.service#L5-L8) 补充禁止 `PrivateTmp=`/`ProtectSystem=` 等挂载命名空间指令的注释防线；随后在宿主命名空间用 `--accept-stale-hold` 恢复全部 3 个域并验证 `doctor --json` 通过。
+3. **11 月 13 日未决项与台账恢复**：执行 `review unknown resolve --item obj_732daefa6f9e852f4519109308eb33fd --action purge --confirm` 清零未决列表（保留 11-13 `10 millicny` 预留与 `2` 次 `http_attempts`）；在 `automation-budget.json` 记录 11-13（`exit 8`）与上述 0 调用 `PrivateTmp` 误拦（退回后 `used_millicny=10/35000`、`rounds=7`、`pending=null`）；执行 `doctor --acknowledge-clock`、`doctor --json` 与 `resume --json`。
+4. **实跑复验**：重启 `dustkeeper-elidli.timer`（`active`）并执行 `systemctl start dustkeeper-elidli.service`，返回 `Result=success`、`ExecMainStatus=0`（`run_d544f88fc2739095b1825347571fd60a`，全量扫描 `5474` 项、`exit 0`、`0` HTTP 调用）；`status --json` 确认 `paused: false`、`last_run_health.healthy: true`、3 域均为 `active`、`unresolved_reviews: 0`。

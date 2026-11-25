@@ -4,6 +4,8 @@ After=network-online.target
 Wants=network-online.target
 # Do not silently mask pauses via ConditionPathExists: letting run-scheduled-log.py
 # observe pause.request emits an explicit journal refusal so operators notice.
+# Do NOT enable PrivateTmp=, ProtectSystem=, or other mount-namespace options:
+# per-invocation Linux mount_id renumbering triggers same-boot SCOPE_CHANGED.
 
 [Service]
 Type=oneshot
