@@ -38,7 +38,7 @@ func TestKeepRecordsMeasuredCauseWithoutModelFreeText(t *testing.T) {
 			if r.Disposition != domain.DispositionKeep || r.Reason != outcome.ReasonMoveSafetyUnknown {
 				t.Fatalf("decision changed: %+v", r)
 			}
-			raw := reviewPayload(r, store.Item{})
+			raw := reviewPayload(r, store.Item{}, domain.DispositionQuarantine)
 			var payload map[string]json.RawMessage
 			if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 				t.Fatal(err)

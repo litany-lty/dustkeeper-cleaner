@@ -45,7 +45,11 @@ func TestCycle08TempOriginDoesNotEraseInstallerEvidenceRequirement(t *testing.T)
 	}
 }
 func TestCycle09CredentialFilesNeverBecomeSpaceCandidates(t *testing.T) {
-	for _, path := range []string{"id_rsa", ".env", ".env.production", "wallet.dat", "vault.kdbx", "client.p12", "client.pfx", "backup.gpg"} {
+	for _, path := range []string{
+		"id_rsa", ".env", ".env.production", "wallet.dat", "vault.kdbx",
+		"client.p12", "client.pfx", "backup.gpg", ".netrc", ".pgpass",
+		"credentials.json", "kubeconfig", "terraform.tfstate", "prod.keystore", "vpn.ovpn",
+	} {
 		r := Assess(Facts{Path: path, Regular: true, NLink: 1, AllocatedBytes: 4096}, 30, time.Now())
 		if r.Disposition != "keep" {
 			t.Fatalf("credential candidate: %s %+v", path, r)

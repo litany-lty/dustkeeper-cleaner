@@ -67,7 +67,7 @@ func ClassifyName(base string) Classification {
 	if isCredentialName(name, ext) {
 		return Classification{Category: CatCredential, Reason: "credential_or_recovery_signal", KeepName: true}
 	}
-	if strings.Contains(name, "private_key") || strings.Contains(name, "recovery") {
+	if strings.Contains(name, "credential") || strings.Contains(name, "private_key") || strings.Contains(name, "recovery") {
 		return Classification{Category: CatCredential, Reason: "credential_or_recovery_signal", KeepName: true}
 	}
 	if isAssetExtension(ext) {
@@ -104,14 +104,18 @@ func isProjectName(name string) bool {
 
 func isCredentialName(name, ext string) bool {
 	switch name {
-	case ".env", "id_rsa", "id_ed25519", "id_ecdsa", "wallet.dat", ".npmrc", ".pypirc", "accesskey.csv", "osskey.txt":
+	case ".env", "id_rsa", "id_ed25519", "id_ecdsa", "wallet.dat",
+		".npmrc", ".pypirc", ".netrc", ".pgpass", ".my.cnf",
+		"credentials", "credentials.json", "application_default_credentials.json",
+		"kubeconfig", "terraform.tfstate", "terraform.tfstate.backup",
+		"accesskey.csv", "osskey.txt":
 		return true
 	}
 	if strings.HasPrefix(name, ".env.") {
 		return true
 	}
 	switch ext {
-	case ".p12", ".pfx", ".gpg", ".kdbx":
+	case ".p12", ".pfx", ".gpg", ".kdbx", ".keystore", ".jks", ".ovpn", ".asc", ".age":
 		return true
 	}
 	return false

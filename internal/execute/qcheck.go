@@ -39,7 +39,7 @@ func (e *Executor) checkQuarantineSpace(sc *ScopeCtx) error {
 		return errs.Newf(errs.CodeScopeChanged,
 			"scope %s has no object directory, so the space available cannot be established", sc.Scope.ID)
 	}
-	free, total, err := statfsFD(sc.Objects.DirFD())
+	free, total, err := scopeStatFS(sc)
 	if err != nil {
 		return errs.Wrap(errs.CodeIOError, err)
 	}
@@ -88,6 +88,15 @@ func (e *Executor) abandonPreparation(sc *ScopeCtx, it store.Item, cause error) 
 			"the preparation manifest for %s could not be removed: %v; it was left in place", it.ID, err)
 	}
 	return cause
+}
+
+// scopeStatFS queries volume space via TestHookDiskStatus when injected by a
+// deterministic test, or directly from the open objects directory otherwise.
+func scopeStatFS(sc *ScopeCtx) (free, total uint64, err error) {
+	if h := TestHookDiskStatus; h != nil {
+		return h(string(sc.Scope.RawRoot))
+	}
+	return statfsFD(sc.Objects.DirFD())
 }
 
 // statfsFD reports free and total bytes for the volume behind an open descriptor.

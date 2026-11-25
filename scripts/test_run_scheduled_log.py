@@ -167,6 +167,85 @@ class ScheduledLogTest(unittest.TestCase):
         self.assertNotEqual(self.mod.run_once(self.root, runner=runner), 0)
         self.assertTrue((self.root / "state/pause.request").is_file())
 
+    def test_null_run_id_future_timestamp_and_empty_scopes_are_rejected(self):
+        # 1) run_id=None must not pass via str(None)=="None".
+        bad_null = self.receipt(None)
+        runner, _ = self.runner(bad_null)
+        with redirect_stdout(io.StringIO()):
+            self.assertNotEqual(self.mod.run_once(self.root, runner=runner), 0)
+        self.assertTrue((self.root / "state/pause.request").is_file())
+
+        # 2) Future-dated receipt must be rejected.
+        (self.root / "state/pause.request").unlink()
+        self.write_ledger()
+        bad_future = self.receipt("run-future")
+        future_iso = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() + 3600, timezone.utc
+        ).astimezone().replace(microsecond=0).isoformat()
+        bad_future["started_at"] = future_iso
+        bad_future["ended_at"] = future_iso
+        runner, _ = self.runner(bad_future)
+        with redirect_stdout(io.StringIO()):
+            self.assertNotEqual(self.mod.run_once(self.root, runner=runner), 0)
+        self.assertTrue((self.root / "state/pause.request").is_file())
+
+        # 3) Partial exit 9 with empty scopes list must be rejected.
+        (self.root / "state/pause.request").unlink()
+        self.write_ledger()
+        bad_empty = self.receipt("run-empty-scopes", attempts=0, exit_code=9)
+        bad_empty["code"] = "BUDGET_EXHAUSTED"
+        bad_empty["summary"]["review"]["not_started"] = 1
+        bad_empty["summary"]["scopes"] = []
+        runner, _ = self.runner(bad_empty, returncode=9)
+        with redirect_stdout(io.StringIO()):
+            self.assertNotEqual(self.mod.run_once(self.root, runner=runner), 0)
+        self.assertTrue((self.root / "state/pause.request").is_file())
+
+    def test_zero_http_environmental_exits_release_reservation_without_pausing(self):
+        report_path = self.root / "readable-reports/latest-readable.json"
+        for idx, (exit_code, code) in enumerate(
+            ((3, "INSTANCE_BUSY"), (6, "CLOCK_UNTRUSTED"), (7, "DISK_PRESSURE")), start=1
+        ):
+            if report_path.exists():
+                report_path.unlink()
+            receipt = self.receipt(f"run-env-{idx}", attempts=0, exit_code=exit_code)
+            receipt["code"] = code
+            runner, calls = self.runner(receipt, returncode=exit_code)
+            with redirect_stdout(io.StringIO()):
+                got = self.mod.run_once(self.root, runner=runner)
+            self.assertEqual(got, exit_code)
+            self.assertFalse((self.root / "state/pause.request").exists())
+            self.assertEqual(len(calls), 1)
+            ledger = json.loads((self.root / "automation-budget.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger["used_millicny"], 0)
+            self.assertIsNone(ledger["pending"])
+            self.assertEqual(ledger["history"][-1]["environmental_skip"], code)
+
+    def test_ledger_optional_limits_and_key_prefix_override(self):
+        (self.root / "config/review-credentials.json").write_text(
+            json.dumps({"typesafe_api_key": "jev-secret", "minimax_api_key": "api-custom-key"}),
+            encoding="utf-8",
+        )
+        (self.root / "config/config.json").write_text(json.dumps({"review": {
+            "credentials_file": str(self.root / "config/review-credentials.json"),
+            "jev_model": "jev-fixed", "minimax_model": "minimax-fixed",
+            "max_candidates": 3, "batch_max_candidates": 3, "batch_max_attempts": 6,
+        }}), encoding="utf-8")
+        self.write_ledger(
+            limits={
+                "max_candidates": 3,
+                "batch_max_candidates": 3,
+                "batch_max_attempts": 6,
+                "reserve_millicny": 30,
+            },
+            minimax_key_prefix="",
+        )
+        runner, _ = self.runner(self.receipt("run-custom", attempts=4, exit_code=0))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(self.mod.run_once(self.root, runner=runner), 0)
+        ledger = json.loads((self.root / "automation-budget.json").read_text(encoding="utf-8"))
+        self.assertEqual((ledger["used_millicny"], ledger["http_attempts"]), (30, 4))
+
 
 if __name__ == "__main__":
     unittest.main()

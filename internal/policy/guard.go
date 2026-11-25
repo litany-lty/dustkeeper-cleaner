@@ -170,6 +170,9 @@ func IdentityKey(id domain.FileIdentity) string {
 	if id.Inode == 0 && id.Device == 0 {
 		return ""
 	}
+	if domain.HasPersistentVolumeID(id.VolumeID) {
+		return id.VolumeID + "|0|" + itoaU(id.Inode)
+	}
 	return id.VolumeID + "|" + itoa(id.Device) + "|" + itoaU(id.Inode)
 }
 

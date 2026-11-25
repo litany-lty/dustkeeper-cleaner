@@ -294,6 +294,8 @@ func renderDarwin(opt Options) ([]File, error) {
   <true/>
   <key>Nice</key>
   <integer>10</integer>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>StandardOutPath</key>
   <string>%s/run.log</string>
   <key>StandardErrorPath</key>

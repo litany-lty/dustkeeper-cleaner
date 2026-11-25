@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -281,4 +282,71 @@ func (r *rotating) Close() error {
 		r.dir = -1
 	}
 	return err
+}
+
+// RotateFileIfOversize rotates dir/name into name.1..name.<keep> when it is an
+// owned, non-group/world-writable single-link regular file at least maxBytes in
+// size. Missing directories or files are treated as no-ops; symlinks and
+// tampered files are refused without modifying them.
+func RotateFileIfOversize(dir, name string, maxBytes int64, keep int) error {
+	if dir == "" || name == "" || maxBytes <= 0 {
+		return nil
+	}
+	if keep < 1 {
+		keep = 1
+	}
+	dirFD, err := openLogDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return err
+	}
+	defer unix.Close(dirFD)
+
+	var st unix.Stat_t
+	if err := unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return fmt.Errorf("diag: stat %s: %w", filepath.Join(dir, name), err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("%w: %s is not a regular file (mode %#o)", ErrNotPrivate, filepath.Join(dir, name), st.Mode)
+	}
+	if st.Nlink != 1 {
+		return fmt.Errorf("%w: %s has %d links, want 1", ErrNotPrivate, filepath.Join(dir, name), st.Nlink)
+	}
+	if uid := uint32(os.Geteuid()); st.Uid != uid {
+		return fmt.Errorf("%w: %s is owned by uid %d, want %d", ErrNotPrivate, filepath.Join(dir, name), st.Uid, uid)
+	}
+	if wide := st.Mode & 0o022; wide != 0 {
+		return fmt.Errorf("%w: %s is writable by group or others (mode %04o)", ErrNotPrivate, filepath.Join(dir, name), st.Mode&0o7777)
+	}
+	if st.Size < maxBytes {
+		return nil
+	}
+
+	oldest := name + "." + strconv.Itoa(keep)
+	if err := unix.Unlinkat(dirFD, oldest, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("diag: drop %s: %w", filepath.Join(dir, oldest), err)
+	}
+	for i := keep - 1; i >= 1; i-- {
+		from := name + "." + strconv.Itoa(i)
+		to := name + "." + strconv.Itoa(i+1)
+		if err := unix.Renameat(dirFD, from, dirFD, to); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return fmt.Errorf("diag: rotate %s: %w", filepath.Join(dir, from), err)
+		}
+	}
+	if err := unix.Renameat(dirFD, name, dirFD, name+".1"); err != nil {
+		return fmt.Errorf("diag: rotate %s: %w", filepath.Join(dir, name), err)
+	}
+	_ = unix.Unlinkat(dirFD, name+"."+strconv.Itoa(keep+1), 0)
+	if err := unix.Fsync(dirFD); err != nil {
+		return fmt.Errorf("diag: sync %s: %w", dir, err)
+	}
+	return nil
 }

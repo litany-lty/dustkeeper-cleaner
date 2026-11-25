@@ -268,7 +268,7 @@ func OpenVault(root *fsops.Root, expect VaultExpect) (*VaultHandles, error) {
 	oldObjectsIdentity, oldAnchorIdentity := "", ""
 	if expect.VolumeID != "" && (bind.VolumeID != expect.VolumeID || marker.VolumeID != expect.VolumeID) {
 		oldDev, ok := LegacyDevice(bind.VolumeID)
-		if !ok || !LegacyVolumeLabel(expect.VolumeID) || marker.VolumeID != bind.VolumeID {
+		if !ok || marker.VolumeID != bind.VolumeID {
 			return fail(errs.Newf(errs.CodeScopeChanged,
 				"the management directory names volume %q, this scope is bound to %q",
 				bind.VolumeID, expect.VolumeID))
@@ -422,7 +422,14 @@ func vaultIdentityPayload(objects *fsops.Dir, nonce string,
 }
 
 func vaultIdentityOf(volume string, device, inode uint64, birth, generation string) string {
-	payload := fmt.Sprintf("%s|%d|%d|%s|%s", volume, device, inode, birth, generation)
+	// When volume is a persistent volume UUID (not a runtime dev-<st_dev> label),
+	// exclude the volatile runtime device number from the digest so APFS reboot
+	// renumbering never invalidates an existing vault binding.
+	dev := device
+	if domain.HasPersistentVolumeID(volume) {
+		dev = 0
+	}
+	payload := fmt.Sprintf("%s|%d|%d|%s|%s", volume, dev, inode, birth, generation)
 	sum := sha256.Sum256([]byte(payload))
 	return "vault:" + hex.EncodeToString(sum[:])
 }
@@ -469,7 +476,11 @@ func FormatVaultIdentity(id domain.FileIdentity, nonce string) string {
 // file this vault never installed. The tag written past the barrier area is what
 // closes that, because a replacement does not have it.
 func AnchorIdentity(id domain.FileIdentity, tag string) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("anchor|%s|%d|%d|%s", id.VolumeID, id.Device, id.Inode, tag)))
+	dev := id.Device
+	if domain.HasPersistentVolumeID(id.VolumeID) {
+		dev = 0
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("anchor|%s|%d|%d|%s", id.VolumeID, dev, id.Inode, tag)))
 	return "anchor:" + hex.EncodeToString(sum[:])
 }
 

@@ -158,10 +158,14 @@ func Scan(ctx context.Context, root string, opt Options) (Report, error) {
 				}
 			}
 			name := strings.ToLower(entry.Name())
-			if name == ".dustkeeper" || name == ".git" || name == "node_modules" ||
-				name == ".ssh" || name == ".gnupg" || name == ".aws" ||
+			if name == ".dustkeeper" || name == ".git" || name == ".hg" || name == ".svn" ||
+				name == "node_modules" || name == ".ssh" || name == ".gnupg" || name == ".aws" ||
 				strings.HasSuffix(name, ".app") || strings.HasSuffix(name, ".framework") ||
-				strings.HasSuffix(name, ".bundle") || strings.HasSuffix(name, ".plugin") {
+				strings.HasSuffix(name, ".bundle") || strings.HasSuffix(name, ".plugin") ||
+				strings.HasSuffix(name, ".xcodeproj") || strings.HasSuffix(name, ".xcworkspace") ||
+				strings.HasSuffix(name, ".playground") || strings.HasSuffix(name, ".photoslibrary") ||
+				strings.HasSuffix(name, ".photolibrary") || strings.HasSuffix(name, ".imovielibrary") ||
+				strings.HasSuffix(name, ".tvlibrary") {
 				r.SkippedDirectories++
 				r.SkippedPaths = append(r.SkippedPaths, rel)
 				return fs.SkipDir
@@ -184,6 +188,7 @@ func Scan(ctx context.Context, root string, opt Options) (Report, error) {
 		}
 		f := Facts{Path: rel, LogicalBytes: st.Size, Device: uint64(st.Dev), Inode: st.Ino, NLink: uint64(st.Nlink), Regular: st.Mode&unix.S_IFMT == unix.S_IFREG, MTime: time.Unix(st.Mtim.Sec, st.Mtim.Nsec), ATime: time.Unix(st.Atim.Sec, st.Atim.Nsec), OpenByProcess: opt.OpenPaths[p], ProcessVisibility: opt.ProcessCoverage, LastUsedStatus: "not_requested"}
 		f.CTimeNS, f.Mode, f.UID, f.GID = time.Unix(st.Ctim.Sec, st.Ctim.Nsec).UnixNano(), uint32(st.Mode), st.Uid, st.Gid
+		f.Immutable, f.CloudDataless = inspectStatFlags(&st)
 		f.Protected = protectedIDs[[2]uint64{f.Device, f.Inode}]
 		if f.ProcessVisibility == "" {
 			f.ProcessVisibility = "unknown"
@@ -242,9 +247,20 @@ func Scan(ctx context.Context, root string, opt Options) (Report, error) {
 		}
 	}
 	references = resolvedReferences
+	openResolved := map[string]bool{}
+	openIDs := map[[2]uint64]bool{}
 	openDirectories := []string{}
 	for path, open := range opt.OpenPaths {
 		if open {
+			clean := filepath.Clean(path)
+			openResolved[clean] = true
+			if resolved, rerr := filepath.EvalSymlinks(path); rerr == nil {
+				openResolved[filepath.Clean(resolved)] = true
+			}
+			var ost unix.Stat_t
+			if unix.Stat(path, &ost) == nil {
+				openIDs[[2]uint64{uint64(ost.Dev), ost.Ino}] = true
+			}
 			if info, err := os.Stat(path); err == nil && info.IsDir() {
 				if resolved, err := filepath.EvalSymlinks(path); err == nil {
 					openDirectories = append(openDirectories, resolved)
@@ -254,13 +270,15 @@ func Scan(ctx context.Context, root string, opt Options) (Report, error) {
 	}
 	for i := range r.Files {
 		f := &r.Files[i].Facts
+		fullPath := filepath.Join(root, f.Path)
+		f.OpenByProcess = f.OpenByProcess || openResolved[fullPath] || openIDs[[2]uint64{f.Device, f.Inode}]
 		for _, dir := range openDirectories {
-			if strings.HasPrefix(filepath.Join(root, f.Path), dir+string(filepath.Separator)) {
+			if strings.HasPrefix(fullPath, dir+string(filepath.Separator)) {
 				f.OpenDirectoryContext = true
 				break
 			}
 		}
-		f.KnownReference = references[filepath.Join(root, f.Path)] || referencedIDs[[2]uint64{f.Device, f.Inode}]
+		f.KnownReference = references[fullPath] || referencedIDs[[2]uint64{f.Device, f.Inode}]
 		for ref, known := range references {
 			if known && strings.HasPrefix(filepath.Join(root, f.Path), ref+string(filepath.Separator)) {
 				f.KnownReference = true

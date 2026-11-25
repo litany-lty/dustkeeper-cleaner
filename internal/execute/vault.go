@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"path/filepath"
 	"time"
 
@@ -252,6 +253,51 @@ func (c *ScopeCtx) RemoveManifest(objectID string) error {
 		return errs.Wrap(errs.CodeDurabilityFailed, err)
 	}
 	return nil
+}
+
+// SweepOrphanTmp removes aged single-link regular temporary files left behind
+// inside .dustkeeper/tmp when no pending operations exist for this scope.
+func (c *ScopeCtx) SweepOrphanTmp(now time.Time, maxAge time.Duration) int {
+	if c == nil || c.Tmp == nil || maxAge <= 0 {
+		return 0
+	}
+	cutoff := now.UnixNano() - int64(maxAge)
+	var victims []string
+	for {
+		entries, err := c.Tmp.Readdir(256)
+		for _, ent := range entries {
+			name := ent.Name()
+			if name == "." || name == ".." {
+				continue
+			}
+			id, tok, serr := c.Tmp.StatEntry(name)
+			if serr != nil || id.Kind != "regular" || tok.NLink != 1 {
+				continue
+			}
+			if tok.MTimeNS > 0 && tok.MTimeNS <= cutoff {
+				victims = append(victims, name)
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			break
+		}
+		if len(entries) == 0 {
+			break
+		}
+	}
+	removed := 0
+	for _, name := range victims {
+		if uerr := fsops.UnlinkAt(c.Tmp, name); uerr == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		_ = fsops.DurableDir(c.Tmp)
+	}
+	return removed
 }
 
 // PlanBindingOf decodes the stored item binding.

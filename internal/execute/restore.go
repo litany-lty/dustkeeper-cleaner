@@ -237,6 +237,8 @@ func (e *Executor) Restore(ctx context.Context, sc *ScopeCtx, itemID domain.Item
 	if err := e.Store.ReleaseItemKeeperPin(ctx, it.ID); err != nil {
 		return res, err
 	}
+	// Best-effort cleanup of the manifest once restore has committed in SQLite.
+	_ = sc.RemoveManifest(it.ObjectName)
 
 	res.State = domain.StateRestored
 	res.Code = string(errs.CodeOK)

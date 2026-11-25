@@ -17,6 +17,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // Identifier types. They are distinct so that a plan ID cannot be passed where
@@ -259,14 +261,39 @@ type FileIdentity struct {
 	Generation  *uint64 `json:"generation"`
 }
 
-// Equal compares the fields that identify an object. Birth time and generation
-// are compared only when both sides have them, because a filesystem may stop
-// reporting a fact that it reported earlier.
-func (a FileIdentity) Equal(b FileIdentity) bool {
-	if a.Device != b.Device || a.Inode != b.Inode || a.Kind != b.Kind {
+// IsLegacyVolumeLabel reports whether v has the runtime-scoped `dev-<number>`
+// shape derived from stat.st_dev rather than a persistent volume UUID.
+func IsLegacyVolumeLabel(v string) bool {
+	if !strings.HasPrefix(v, "dev-") || len(v) <= 4 {
 		return false
 	}
-	if a.VolumeID != "" && b.VolumeID != "" && a.VolumeID != b.VolumeID {
+	_, err := strconv.ParseUint(v[4:], 10, 64)
+	return err == nil
+}
+
+// HasPersistentVolumeID reports whether v is a non-empty persistent volume
+// identifier (any shape other than the runtime `dev-<number>` fallback).
+func HasPersistentVolumeID(v string) bool {
+	return v != "" && !IsLegacyVolumeLabel(v)
+}
+
+// Equal compares the fields that identify an object. Birth time and generation
+// are compared only when both sides have them, because a filesystem may stop
+// reporting a fact that it reported earlier. When both sides carry the same
+// persistent volume UUID, a runtime st_dev change across boots does not break
+// object identity.
+func (a FileIdentity) Equal(b FileIdentity) bool {
+	if a.Inode != b.Inode || a.Kind != b.Kind {
+		return false
+	}
+	if a.VolumeID != "" && b.VolumeID != "" {
+		if a.VolumeID != b.VolumeID {
+			return false
+		}
+		if !HasPersistentVolumeID(a.VolumeID) && a.Device != b.Device {
+			return false
+		}
+	} else if a.Device != b.Device {
 		return false
 	}
 	if a.BirthTimeNS != nil && b.BirthTimeNS != nil && *a.BirthTimeNS != *b.BirthTimeNS {

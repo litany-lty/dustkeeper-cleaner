@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"dustkeeper/internal/assess"
 	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/config"
 	"dustkeeper/internal/domain"
@@ -61,6 +62,22 @@ type RulePlanRequest struct {
 	// DryRun builds the plan and its digest without storing anything. Preview
 	// uses it, so looking at a plan never creates one.
 	DryRun bool
+	// SkipKept excludes observations that already hold a valid keep verdict
+	// within KeepRetryDays so a kept item never starves eligible files behind it.
+	SkipKept bool
+	// SkipPending excludes observations frozen by an unresolved review_unknown
+	// or pending review_dispatch row without double-charging or starving others.
+	SkipPending bool
+	// MaxReadBudgetBytes, when positive, skips candidates whose required 2x
+	// stable-verification read exceeds the run's remaining read budget.
+	MaxReadBudgetBytes int64
+	// ExcludedDirPrefixes skips observations under directories that failed to
+	// scan in the current epoch so unreadable subtrees are never touched.
+	ExcludedDirPrefixes []string
+	// DirectDeleteOnly restricts planning to candidates that qualify for direct
+	// permanent deletion (used under disk pressure so moves stay paused while
+	// authorised deletions can still free space).
+	DirectDeleteOnly bool
 }
 
 // RulePlanResult reports what the planner froze.
@@ -125,14 +142,29 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 		return res, err
 	}
 
-	// How long a newly isolated object must stay in the observation area is
-	// decided once, before the iteration: the candidate iterator below holds the
-	// database's single connection, so a query from inside it would wait for
-	// ever. Reading it here also means every item of one plan is bound to the
-	// same value.
-	observationSeconds, err := p.observationSeconds(ctx)
+	// Load cleanup policy and any keep/pending summaries BEFORE opening the
+	// observation iterator: the store holds a single SQLite connection, so
+	// queries inside the callback would deadlock and be refused.
+	pol, err := cleanup.Load(ctx, p.Store)
 	if err != nil {
 		return res, err
+	}
+	observationSeconds := pol.RetentionSeconds()
+
+	var keepIdx *KeepIndex
+	if req.SkipKept && pol.KeepRetryDays > 0 {
+		sinceNS := req.NowNS - int64(pol.KeepRetryDays)*int64(24*time.Hour)
+		keepIdx, err = LoadKeepIndex(ctx, p.Store, req.Scope.ID, sinceNS)
+		if err != nil {
+			return res, err
+		}
+	}
+	var pendingIdx *PendingIndex
+	if req.SkipPending {
+		pendingIdx, err = LoadPendingIndex(ctx, p.Store, req.Scope.ID)
+		if err != nil {
+			return res, err
+		}
 	}
 
 	var (
@@ -168,7 +200,7 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 		return ids, werr
 	}
 
-	err = p.Store.IterateObservations(ctx, req.Scope.ID, func(o store.Observation) error {
+	err = p.Store.IterateObservationsOrdered(ctx, req.Scope.ID, req.Config.Runtime.CandidateOrder, func(o store.Observation) error {
 		res.Scanned++
 		if len(items) >= req.MaxFiles {
 			res.Truncated = true
@@ -231,6 +263,9 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 			// after a scan be ignored by a plan created after it.
 			protected, reason = true, r
 		}
+		if !protected && cleanup.CategoryOf(rel) == assess.CatCredential {
+			protected, reason = true, "credential or recovery material"
+		}
 
 		v := policy.Decide(req.Rule, policy.Input{
 			Rel:             rel,
@@ -240,14 +275,37 @@ func (p *Planner) CreateRulePlan(ctx context.Context, req RulePlanRequest) (Rule
 			Protected:       protected,
 			ProtectedReason: reason,
 		})
-		res.Reasons[v.ReasonCode]++
 		if !v.Candidate {
+			res.Reasons[v.ReasonCode]++
 			return nil
 		}
-		if total+o.SizeBytes > req.MaxBytes && req.MaxBytes > 0 {
+		if len(req.ExcludedDirPrefixes) > 0 && policy.UnderAnyPrefix(req.ExcludedDirPrefixes, rel) {
+			res.Reasons[policy.ReasonFailedDirExcluded]++
+			return nil
+		}
+		planAction := plannedActionFor(pol, string(req.Scope.ID), rel, req.Kind, req.PurgeGrant != nil)
+		if req.DirectDeleteOnly && planAction != domain.ActionDelete {
+			res.Reasons[policy.ReasonDiskPressureMovePause]++
+			return nil
+		}
+		if pendingIdx != nil && pendingIdx.Held(rel, planAction, o.IdentityJSON, o.TokenJSON) {
+			res.Reasons[policy.ReasonAwaitingRequestCheck]++
+			return nil
+		}
+		if keepIdx != nil && keepIdx.Kept(rel, planAction, string(req.RuleRef.Digest), id, tok) {
+			res.Reasons[policy.ReasonKeptRecently]++
+			return nil
+		}
+		if req.MaxReadBudgetBytes > 0 && o.SizeBytes*2 > req.MaxReadBudgetBytes {
+			res.Reasons[policy.ReasonReadBudgetTooSmall]++
+			return nil
+		}
+		if req.MaxBytes > 0 && total+o.SizeBytes > req.MaxBytes {
+			res.Reasons[policy.ReasonOverRunByteLimit]++
 			res.Truncated = true
 			return nil
 		}
+		res.Reasons[v.ReasonCode]++
 
 		objectName := domain.NewID("obj")
 		itemID := domain.ItemID(objectName)
@@ -606,4 +664,14 @@ func dirOf(rel string) string {
 		return rel[:i]
 	}
 	return ""
+}
+
+// plannedActionFor mirrors Executor.authorityFor's action selection so pending
+// and keep filtering check the same action the executor will ask about.
+func plannedActionFor(pol cleanup.Policy, scopeID, rel, sourceKind string, hasPurgeGrant bool) string {
+	if sourceKind == domain.SourceScheduledRule && hasPurgeGrant &&
+		pol.Confirmed() && pol.Covers(scopeID) && pol.MayDeleteDirectly(cleanup.CategoryOf(rel)) {
+		return domain.DispositionDelete
+	}
+	return domain.DispositionQuarantine
 }

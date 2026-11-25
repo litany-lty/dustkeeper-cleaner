@@ -133,6 +133,10 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 			"a file exists at the original path again, so that place is in use; the object stays in the observation area")
 	}
 
+	capturedID, err := decodeID(*it.CapturedIdentityJSON)
+	if err != nil {
+		return res, err
+	}
 	capturedTok, err := decodeTok(*it.CapturedTokenJSON)
 	if err != nil {
 		return res, err
@@ -143,8 +147,9 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 
 	// The expiry review asks the irreversible question and nothing else. It uses
 	// the same gates as a first review: an unanswered earlier request must not
-	// be paid for again, and a candidate that has no allowance left is recorded
-	// as "not started" rather than as a provider outage.
+	// be paid for again, a recent purge-keep decision suppresses re-asking during
+	// KeepRetryDays, and a candidate that has no allowance left is recorded as
+	// "not started" rather than as a provider outage.
 	planID := planIDOf(opt.Plan)
 	purgeIdentity, purgeToken := *it.CapturedIdentityJSON, *it.CapturedTokenJSON
 	budgetJSON := dispatchBudgetJSON(domain.ActionPurge, opt.Budget)
@@ -158,9 +163,20 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 				CostStatus: review.CostUnknown, ModelError: "an earlier request for this object is still unresolved"}); err != nil {
 			return res, err
 		}
-		return e.recordKeep(ctx, sc, it, planID, review.Outcome{Reason: dkoutcome.ReasonRequestCheckHold,
+		return e.recordKeep(ctx, sc, it, planID, domain.ActionPurge, review.Outcome{Reason: dkoutcome.ReasonRequestCheckHold,
 			Decision: review.Decision{Verdict: domain.VerdictKeep, CostStatus: review.CostUnknown,
 				ModelError: "an earlier request for this object is still unresolved"}})
+	}
+	if pol, perr := cleanup.Load(ctx, e.Store); perr != nil {
+		return res, perr
+	} else if kept, kerr := e.keptRecently(ctx, sc, it, domain.ActionPurge, capturedID, capturedTok, pol); kerr != nil {
+		return res, kerr
+	} else if kept {
+		res.Code = string(errs.CodeKept)
+		res.Message = "kept by an earlier expiry review; the same quarantined object will be reviewed again after the retry window"
+		res.Control = domain.ControlContinue
+		res.Evidence = domain.EvidenceNotStarted
+		return res, nil
 	}
 	if failure := e.reviewAllowance(); failure != "" {
 		d := review.Decision{Verdict: domain.VerdictKeep, Failure: failure, CostStatus: review.CostNotSent,
@@ -170,7 +186,7 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 			dkoutcome.ReasonNotStartedBudget, d); err != nil {
 			return res, err
 		}
-		return e.recordKeep(ctx, sc, it, planID, review.Outcome{Reason: dkoutcome.ReasonNotStartedBudget, Decision: d})
+		return e.recordKeep(ctx, sc, it, planID, domain.ActionPurge, review.Outcome{Reason: dkoutcome.ReasonNotStartedBudget, Decision: d})
 	}
 
 	reviewID := domain.NewID("rev")
@@ -211,17 +227,13 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		}
 	}
 	if reviewed.Disposition != domain.DispositionDelete {
-		return e.recordKeep(ctx, sc, it, planID, reviewed)
+		return e.recordKeep(ctx, sc, it, planID, domain.ActionPurge, reviewed)
 	}
 	approval := reviewed.Approval
 	if approval == nil {
 		return res, errs.New(errs.CodeReviewRequired, "a review allowed deletion but carries no approval")
 	}
 
-	capturedID, err := decodeID(*it.CapturedIdentityJSON)
-	if err != nil {
-		return res, err
-	}
 	objParent, err := sc.Objects.ParentOf(it.ObjectName)
 	if err != nil {
 		return res, errs.Wrap(errs.CodeAccessDenied, err)
@@ -397,12 +409,26 @@ func (e *Executor) Purge(ctx context.Context, sc *ScopeCtx, it store.Item, opt P
 		return res, errs.Newf(errs.CodeStateWriteFailed,
 			"the object was deleted but its record could not be closed: %v; the operation stays pending for `recover reconcile`", err)
 	}
-	if err := e.Store.CompletePurge(ctx, intent, `{"source":"observed"}`); err != nil {
+	pResultPayload := map[string]any{"source": "observed"}
+	if reviewed.Reason != "" {
+		pResultPayload["reason"] = reviewed.Reason
+	}
+	if reviewed.ReviewID != "" {
+		pResultPayload["review_id"] = reviewed.ReviewID
+	}
+	pResultJSON, err := json.Marshal(pResultPayload)
+	if err != nil {
+		return res, errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
+	if err := e.Store.CompletePurge(ctx, intent, string(pResultJSON)); err != nil {
 		return res, err
 	}
 	if err := e.Store.ReleaseItemKeeperPin(ctx, it.ID); err != nil {
 		return res, err
 	}
+	// Best-effort cleanup of the manifest now that the purge is durably
+	// committed; keep errors from undoing a committed purge.
+	_ = sc.RemoveManifest(it.ObjectName)
 
 	// The handle stays open until the directory is synced; only then is the
 	// space actually released for observers.

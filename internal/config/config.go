@@ -49,8 +49,19 @@ type Runtime struct {
 	MaxAutoQuarantineBytes int64 `json:"max_auto_quarantine_bytes"`
 	MaxAutoPurgeFiles      int   `json:"max_auto_purge_files"`
 	MaxAutoPurgeBytes      int64 `json:"max_auto_purge_bytes"`
-	MinFreeBytes           int64 `json:"min_free_bytes"`
-	MinFreePercent         int   `json:"min_free_percent"`
+	MinFreeBytes           int64  `json:"min_free_bytes"`
+	MinFreePercent         int    `json:"min_free_percent"`
+	ClockMaxGapHours       int    `json:"clock_max_gap_hours,omitempty"`
+	CandidateOrder         string `json:"candidate_order,omitempty"`
+}
+
+// ClockMaxGap returns the maximum wall-clock gap allowed between trusted runs
+// before an explicit clock-ack is required. Zero uses the 48-hour default.
+func (r Runtime) ClockMaxGap() time.Duration {
+	if r.ClockMaxGapHours <= 0 {
+		return 48 * time.Hour
+	}
+	return time.Duration(r.ClockMaxGapHours) * time.Hour
 }
 
 // ProviderChatCompletionsJSON is the only model wire format phase one speaks:
@@ -207,6 +218,8 @@ func (c Config) Validate() error {
 		{"max_auto_purge_bytes", r.MaxAutoPurgeBytes >= 0 && r.MaxAutoPurgeBytes <= tib, "0..1099511627776", itoa64(r.MaxAutoPurgeBytes)},
 		{"min_free_bytes", r.MinFreeBytes >= 0 && r.MinFreeBytes <= tib, "0..1099511627776", itoa64(r.MinFreeBytes)},
 		{"min_free_percent", r.MinFreePercent >= 1 && r.MinFreePercent <= 50, "1..50", itoa(r.MinFreePercent)},
+		{"clock_max_gap_hours", r.ClockMaxGapHours == 0 || (r.ClockMaxGapHours >= 1 && r.ClockMaxGapHours <= 720), "0 (default 48) or 1..720", itoa(r.ClockMaxGapHours)},
+		{"candidate_order", r.CandidateOrder == "" || r.CandidateOrder == "path" || r.CandidateOrder == "size_desc" || r.CandidateOrder == "oldest_first", "path|size_desc|oldest_first", r.CandidateOrder},
 	}
 	for _, ck := range checks {
 		if !ck.ok {

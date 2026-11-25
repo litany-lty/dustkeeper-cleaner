@@ -306,5 +306,108 @@ class ReadableRunLogTest(unittest.TestCase):
             self.assertNotIn(leaked, md)
 
 
+
+class ReadableLogGracefulTimeoutTest(unittest.TestCase):
+    def test_timeout_sends_sigterm_before_sigkill(self):
+        import importlib.util
+        import stat
+        spec = importlib.util.spec_from_file_location("run_readable_log", str(SCRIPT))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "sigterm.seen"
+            stub = Path(tmp) / "stub-dustkeeper"
+            stub.write_text(
+                f"#!{sys.executable}\n"
+                "import signal, sys, time\n"
+                f"marker = {str(marker)!r}\n"
+                "def handler(signum, frame):\n"
+                "    with open(marker, 'w', encoding='utf-8') as f:\n"
+                "        f.write('SIGTERM')\n"
+                "    sys.exit(0)\n"
+                "signal.signal(signal.SIGTERM, handler)\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            os.chmod(stub, stat.S_IRWXU)
+
+            code, envelope, _ = mod.invoke(str(stub), ["run"], timeout=1.0, grace_seconds=2)
+            self.assertEqual(code, 130)
+            self.assertEqual(envelope.get("code"), "CANCELLED")
+            self.assertTrue(marker.is_file(), "invoke did not send SIGTERM before killing child")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "SIGTERM")
+
+    def test_o06_scope_observation_details_rendered_in_markdown(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("run_readable_log", str(SCRIPT))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        envelope = {
+            "status": "ok",
+            "code": "OK",
+            "message": "",
+            "data": {
+                "run_id": "run_o06",
+                "control": "continue",
+                "failures": [],
+                "scopes": [
+                    {
+                        "scope_id": "downloads",
+                        "scanned_files": 42,
+                        "scan_epoch_complete": True,
+                        "quarantined": 0,
+                        "purged": 0,
+                        "quarantine_skipped": "no eligible candidates acted on (2 in keep retry window, 1 exceed per-run byte limit)",
+                        "candidate_counts": {"KEPT_RECENTLY": 2, "OVER_RUN_BYTE_LIMIT": 1},
+                    }
+                ],
+            },
+        }
+        receipt = mod.build_receipt(0, envelope, {}, [], "start", "end", "/", 100, 100, "")
+        self.assertEqual(receipt["schema_version"], 3)
+        md = mod.render(receipt)
+        for want in ("范围观察明细", "downloads", "2 in keep retry window", "1 exceed per-run byte limit"):
+            self.assertIn(want, md)
+
+    def test_kept_by_jev_shortcircuit_renders_jev_decision_without_error_contradiction(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("run_readable_log", str(SCRIPT))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        entry = {
+            "outcome": "保留",
+            "path": "old-export.zip",
+            "size_bytes": 22,
+            "reason": "model_says_keep",
+            "reason_text": "模型明确要求保留",
+            "item_id": "obj_keep",
+            "scope_id": "sandbox",
+            "purge_after": "",
+            "review": mod.review_summary(
+                {
+                    "verdict": "keep",
+                    "reason": "model_says_keep",
+                    "review_explanation": {
+                        "local": {"facts_complete": True, "movable": True, "checks": {}},
+                        "jev": {"choice": "keep", "gate_passed": False, "blockers": ["model_keep"]},
+                        "minimax": {"sent": False, "consulted": False, "missing_evidence": None},
+                    },
+                },
+                "model_says_keep",
+                True,
+                [{"provider": "jev", "outcome": "ok", "phase": "response_body", "elapsed_ms": 357}],
+            ),
+        }
+        entry["review"]["attempts"] = 1
+        entry["review"]["page_cost_status"] = "usage_recorded"
+        receipt = mod.build_receipt(
+            0, {"status": "ok", "code": "OK", "data": {"run_id": "run_j", "control": "continue", "scopes": []}},
+            {"kept": {"total": 1}}, [entry], "start", "end", "/", 100, 100, "",
+        )
+        md = mod.render(receipt)
+        self.assertIn("- JEV `keep`", md)
+        self.assertIn("MiniMax 未被调用", md)
+        self.assertNotIn("已发出请求但未取得结果", md)
+
 if __name__ == "__main__":
     unittest.main()

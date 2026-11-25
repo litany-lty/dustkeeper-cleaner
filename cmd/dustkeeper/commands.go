@@ -6,13 +6,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"dustkeeper/internal/assess"
 	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/clocktrust"
 	"dustkeeper/internal/config"
+	"dustkeeper/internal/diag"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
 	"dustkeeper/internal/execute"
@@ -179,6 +182,32 @@ func cmdDoctor(ctx context.Context, a *app, args []string) (output, error) {
 	add("capabilities_state_dir", caps.Capable(), errs.CodeUnsupportedFS,
 		describeCaps(caps))
 
+	// 3b. Open-file process probe, review configuration preflight, and notification channel check.
+	probeOK, probeDetail := assess.ProbeOpenAvailable()
+	add("process_probe", probeOK, errs.CodeAccessDenied, probeDetail)
+	if a.cfg.Review == nil {
+		add("review_config", true, errs.CodeOK,
+			"not configured (read-only scan works; configure dual review before quarantine or purge)")
+	} else if _, rerr := a.cfg.Review.NewService(); rerr != nil {
+		add("review_config", false, errs.CodeModelUnavailable, messageOf(rerr))
+	} else {
+		add("review_config", true, errs.CodeOK,
+			fmt.Sprintf("validated (%s + %s)", a.cfg.Review.JEVModel, a.cfg.Review.MiniMaxModel))
+	}
+	if runtime.GOOS != "darwin" {
+		if pol, perr := cleanup.Load(ctx, a.store); perr == nil && pol.Notify == cleanup.NotifyMacOS {
+			add("notification_channel", true, errs.CodeOK,
+				"warning: notify=macos_notification requires osascript on macOS; run `dustkeeper cleanup setup --notify none` on Linux before enabling auto-purge")
+		}
+	}
+	if hs, herr := run.ReadHealthFile(a.paths.StateDir); herr != nil {
+		add("last_run_health", true, errs.CodeOK, "warning: health.json unreadable: "+herr.Error())
+	} else if hs != nil && !hs.Healthy {
+		add("last_run_health", true, errs.CodeOK,
+			fmt.Sprintf("warning: %d consecutive unhealthy run(s): %s",
+				hs.ConsecutiveUnhealthyRuns, strings.Join(hs.Reasons, "; ")))
+	}
+
 	// 4. Pause marker and pending work.
 	gate := scope.PauseGate{StateDir: a.paths.StateDir}
 	paused, perr := gate.Paused()
@@ -217,6 +246,7 @@ func cmdDoctor(ctx context.Context, a *app, args []string) (output, error) {
 		clockOK = false
 		clockDetail = "purging is suspended until the clock is acknowledged: " + latchReason
 	}
+	maxGap := a.cfg.Runtime.ClockMaxGap()
 	if lastStr != "" {
 		if last, perr := strconv.ParseInt(lastStr, 10, 64); perr == nil {
 			delta := nowNS - last
@@ -226,12 +256,12 @@ func cmdDoctor(ctx context.Context, a *app, args []string) (output, error) {
 			if delta < -int64(5*time.Minute) {
 				clockOK = false
 				clockDetail = "the wall clock is more than 5 minutes behind the last run"
-			} else if delta > int64(48*time.Hour) {
+			} else if delta > int64(maxGap) {
 				ackStr, _ := a.store.MetaGet(ctx, "clock_ack_ns")
 				ack, _ := strconv.ParseInt(ackStr, 10, 64)
 				if ack <= last {
 					clockOK = false
-					clockDetail = "more than 48 hours passed between runs; purging stays suspended until you acknowledge the clock"
+					clockDetail = fmt.Sprintf("more than %d hours passed between runs; purging stays suspended until you acknowledge the clock", int(maxGap/time.Hour))
 				}
 			}
 		} else {
@@ -240,7 +270,7 @@ func cmdDoctor(ctx context.Context, a *app, args []string) (output, error) {
 		}
 	}
 	// Report the same persistent trust decision the executor will enforce.
-	if verdict, err := clocktrust.Start(a.store, a.clock).Assess(ctx); err != nil {
+	if verdict, err := clocktrust.StartWithMaxGap(a.store, a.clock, maxGap).Assess(ctx); err != nil {
 		clockOK = false
 		clockDetail = "clock trust could not be established: " + err.Error()
 	} else if !verdict.Trusted {
@@ -429,12 +459,13 @@ func cmdStatus(ctx context.Context, a *app, args []string) (output, error) {
 	nowNS := a.clock.Wall().UnixNano()
 
 	type scopeStatus struct {
-		ScopeID     string `json:"scope_id"`
-		Kind        string `json:"kind"`
-		Status      string `json:"status"`
-		Observation int64  `json:"observation_count"`
-		Quarantined int64  `json:"quarantined_count"`
-		Due         int64  `json:"due_for_purge_count"`
+		ScopeID        string `json:"scope_id"`
+		Kind           string `json:"kind"`
+		Status         string `json:"status"`
+		Observation    int64  `json:"observation_count"`
+		ScanInterrupts int64  `json:"scan_interrupts"`
+		Quarantined    int64  `json:"quarantined_count"`
+		Due            int64  `json:"due_for_purge_count"`
 	}
 	var rows []scopeStatus
 	for _, sc := range scopes {
@@ -452,25 +483,43 @@ func cmdStatus(ctx context.Context, a *app, args []string) (output, error) {
 		if err != nil {
 			return output{}, err
 		}
+		interrupts, err := a.store.ScanInterruptsOf(ctx, sc.ID)
+		if err != nil {
+			return output{}, err
+		}
 		rows = append(rows, scopeStatus{
-			ScopeID:     string(sc.ID),
-			Kind:        sc.Kind,
-			Status:      sc.Status,
-			Observation: obs,
-			Quarantined: q,
-			Due:         due,
+			ScopeID:        string(sc.ID),
+			Kind:           sc.Kind,
+			Status:         sc.Status,
+			Observation:    obs,
+			ScanInterrupts: interrupts,
+			Quarantined:    q,
+			Due:            due,
 		})
 	}
 
-	out := ok()
-	out.Data = map[string]any{
-		"paused":      paused,
-		"last_run_ns": lastRun,
-		"pending_ops": len(pending),
-		"stats":       stats,
-		"scopes":      rows,
-		"state_dir":   a.paths.StateDir,
+	unknowns, err := a.store.ListReviewUnknown(ctx, false, 1000)
+	if err != nil {
+		return output{}, err
 	}
+	hs, herr := run.ReadHealthFile(a.paths.StateDir)
+
+	out := ok()
+	data := map[string]any{
+		"paused":             paused,
+		"last_run_ns":        lastRun,
+		"pending_ops":        len(pending),
+		"unresolved_reviews": len(unknowns),
+		"stats":              stats,
+		"scopes":             rows,
+		"state_dir":          a.paths.StateDir,
+	}
+	if herr != nil {
+		data["health_file_error"] = herr.Error()
+	} else if hs != nil {
+		data["last_run_health"] = hs
+	}
+	out.Data = data
 	state := "running"
 	if paused {
 		state = "paused (global marker present)"
@@ -482,11 +531,28 @@ func cmdStatus(ctx context.Context, a *app, args []string) (output, error) {
 		fmt.Sprintf("pending:  %d operation(s) awaiting reconciliation", len(pending)),
 	)
 	for _, r := range rows {
-		out.Human = append(out.Human, fmt.Sprintf("  %-18s %-20s %-8s quarantined=%d due=%d",
-			r.ScopeID, r.Kind, r.Status, r.Quarantined, r.Due))
+		line := fmt.Sprintf("  %-18s %-20s %-8s observed=%d quarantined=%d due=%d",
+			r.ScopeID, r.Kind, r.Status, r.Observation, r.Quarantined, r.Due)
+		if r.ScanInterrupts > 0 {
+			line += fmt.Sprintf(" scan_interrupts=%d", r.ScanInterrupts)
+		}
+		out.Human = append(out.Human, line)
+	}
+	if len(unknowns) > 0 {
+		out.Human = append(out.Human,
+			fmt.Sprintf("reviews:  %d unresolved review request(s) holding candidates", len(unknowns)))
+		out.Next = append(out.Next, "dustkeeper review unknown list")
+	}
+	if herr != nil {
+		out.Human = append(out.Human, "health:   unreadable ("+herr.Error()+")")
+		out.Next = append(out.Next, "dustkeeper doctor")
+	} else if hs != nil && !hs.Healthy {
+		out.Human = append(out.Human, fmt.Sprintf("health:   unhealthy (%d consecutive): %s",
+			hs.ConsecutiveUnhealthyRuns, strings.Join(hs.Reasons, "; ")))
+		out.Next = append(out.Next, "dustkeeper doctor")
 	}
 	if len(pending) > 0 {
-		out.Next = []string{"dustkeeper recover inspect"}
+		out.Next = append(out.Next, "dustkeeper recover inspect")
 	}
 	return out, nil
 }
@@ -656,6 +722,10 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 			return output{}, rerr
 		}
 		endedNS := a.clock.Wall().UnixNano()
+		latestScopes, _ := a.store.ListScopes(ctx)
+		if _, herr := run.UpdateHealthFile(a.paths.StateDir, rep, latestScopes, endedNS); herr != nil {
+			a.log.Log("run", "phase", "run", "run_id", rep.RunID, "health_file_error", herr.Error())
+		}
 		// The run's own record, before the envelope is rendered: run_id, the control
 		// it reached, what it read and moved, and one line per scope explaining any
 		// phase that did not run. A scheduler waking somebody up needs the scope and
@@ -727,6 +797,7 @@ func cmdRun(ctx context.Context, a *app, args []string) (output, error) {
 				"result_page", page.paths.Markdown,
 				"deleted", pageCounts[0], "observed", pageCounts[1], "kept", pageCounts[2])
 		}
+		_ = diag.RotateFileIfOversize(a.paths.StateDir, "run.log", diag.MaxFileBytes, diag.KeepFiles)
 		res := ok()
 		res.Data = rep
 		res.Human = runSummaryLines(rep, pagePaths, pageCounts, pageNote)
@@ -915,7 +986,8 @@ func cmdScan(ctx context.Context, a *app, args []string) (output, error) {
 		}
 		res := ok()
 		res.ScopeID = string(sc.ID)
-		res.Data = map[string]any{"scan": st, "scan_state": scanState}
+		data := map[string]any{"scan": st, "scan_state": scanState}
+		res.Data = data
 		res.Human = []string{
 			fmt.Sprintf("scanned %d directories, %d files (%d bytes)", st.Dirs, st.Files, st.Bytes),
 			fmt.Sprintf("  protected directories skipped: %d, entries skipped: %d, unreadable: %d, vanished: %d",
@@ -931,16 +1003,35 @@ func cmdScan(ctx context.Context, a *app, args []string) (output, error) {
 				res.Human = append(res.Human, "  the queue is still not drained: this scope needs further batches")
 			}
 			res.Code = errs.CodePartial
+			res.Status = string(errs.StatusPartial)
 		default:
 			// Not interrupted, and still not complete: directories the
 			// filesystem refused are queued, not retired.
 			res.Human = append(res.Human,
 				"  the queue drained but some directories could not be read; nothing was retired")
 			res.Code = errs.CodePartial
+			res.Status = string(errs.StatusPartial)
 		}
 		if scanState.FailedDirs > 0 {
 			res.Human = append(res.Human, fmt.Sprintf(
 				"  unreadable directories: %d (kept in the queue; a later batch retries them)", scanState.FailedDirs))
+			if failedDirs, ferr := a.store.FailedDirs(ctx, sc.ID, scanState.Epoch); ferr == nil && len(failedDirs) > 0 {
+				data["failed_dir_paths"] = failedDirs
+				limit := len(failedDirs)
+				if limit > 5 {
+					limit = 5
+				}
+				for _, d := range failedDirs[:limit] {
+					label := d
+					if label == "" {
+						label = "."
+					}
+					res.Human = append(res.Human, "    failed dir: "+label)
+				}
+				if len(failedDirs) > limit {
+					res.Human = append(res.Human, fmt.Sprintf("    (+%d more)", len(failedDirs)-limit))
+				}
+			}
 		}
 		if scanState.Interrupts > 0 {
 			res.Human = append(res.Human, fmt.Sprintf(
@@ -986,7 +1077,7 @@ func (a *app) executor() *execute.Executor {
 		// One guard per process: the baseline is captured when the command
 		// starts, so a clock that jumps during the run is seen as a jump rather
 		// than silently re-baselined between objects.
-		QuarantineTrust: clocktrust.Start(a.store, a.clock).Assert,
+		QuarantineTrust: clocktrust.StartWithMaxGap(a.store, a.clock, a.cfg.Runtime.ClockMaxGap()).Assert,
 	}
 }
 

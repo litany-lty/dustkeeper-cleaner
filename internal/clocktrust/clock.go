@@ -15,6 +15,7 @@ package clocktrust
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -51,15 +52,25 @@ type Verdict struct {
 // The baseline is captured once, at start. Computing "the start" later from
 // wall-minus-mono cancels itself out in the drift formula and measures nothing.
 type Guard struct {
-	Store *store.Store
-	Clock domain.Clock
-	wall0 int64
-	mono0 time.Duration
+	Store  *store.Store
+	Clock  domain.Clock
+	MaxGap time.Duration
+	wall0  int64
+	mono0  time.Duration
 }
 
-// Start captures the run baseline.
+// Start captures the run baseline using the default JumpThreshold.
 func Start(st *store.Store, c domain.Clock) *Guard {
-	return &Guard{Store: st, Clock: c, wall0: c.Wall().UnixNano(), mono0: c.Mono()}
+	return StartWithMaxGap(st, c, JumpThreshold)
+}
+
+// StartWithMaxGap captures the run baseline with a caller-supplied maximum gap
+// between trusted runs. A non-positive maxGap falls back to JumpThreshold.
+func StartWithMaxGap(st *store.Store, c domain.Clock, maxGap time.Duration) *Guard {
+	if maxGap <= 0 {
+		maxGap = JumpThreshold
+	}
+	return &Guard{Store: st, Clock: c, MaxGap: maxGap, wall0: c.Wall().UnixNano(), mono0: c.Mono()}
 }
 
 // Baseline returns the captured wall and monotonic readings.
@@ -99,7 +110,11 @@ func (g *Guard) Assess(ctx context.Context) (Verdict, error) {
 			return Verdict{Trusted: false,
 				Reason: "the wall clock moved backwards since the last trusted run; purging is suspended"}, nil
 		}
-		if nowNS-base > int64(JumpThreshold) {
+		maxGap := g.MaxGap
+		if maxGap <= 0 {
+			maxGap = JumpThreshold
+		}
+		if nowNS-base > int64(maxGap) {
 			ackStr, aerr := g.Store.MetaGet(ctx, MetaAck)
 			if aerr != nil {
 				return Verdict{}, aerr
@@ -109,8 +124,12 @@ func (g *Guard) Assess(ctx context.Context) (Verdict, error) {
 				ack, _ = parseInt(ackStr)
 			}
 			if ack <= base {
+				hours := int(maxGap / time.Hour)
+				if hours <= 0 {
+					hours = int(JumpThreshold / time.Hour)
+				}
 				return Verdict{Trusted: false,
-					Reason: "more than 48 hours passed between trusted runs; acknowledge the clock before purging"}, nil
+					Reason: fmt.Sprintf("more than %d hours passed between trusted runs; acknowledge the clock before purging", hours)}, nil
 			}
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +19,12 @@ import (
 const (
 	LatestMarkdown = "latest.md"
 	LatestJSON     = "latest.json"
+
+	// Bounded retention for per-run result-*.md/.json snapshots written by Write.
+	// Matches the readable-log wrapper ceiling so long-term unattended operation
+	// never accumulates unbounded snapshots inside <state>/reports.
+	maxReportSnapshotRuns  = 30
+	maxReportSnapshotBytes = 20 << 20
 )
 
 // Paths are the files one render produced.
@@ -65,8 +72,84 @@ func Write(dir string, page Page) (Paths, error) {
 		if err := writeAtomic(paths.JSONSnapshot, append(raw, '\n')); err != nil {
 			return paths, err
 		}
+		pruneSnapshots(dir, maxReportSnapshotRuns, maxReportSnapshotBytes, "result-"+page.RunID)
 	}
 	return paths, nil
+}
+
+// pruneSnapshots removes the oldest per-run `result-*.md`/`.json` snapshots once
+// either the run count or total byte ceiling is exceeded. It never touches
+// `latest.*`, hidden temp files, or foreign files in dir, and always retains
+// keepStem (the snapshot just written).
+func pruneSnapshots(dir string, keepRuns int, maxBytes int64, keepStem string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type runGroup struct {
+		stem  string
+		files []string
+		mtime int64
+		bytes int64
+	}
+	byStem := map[string]*runGroup{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "result-") {
+			continue
+		}
+		var stem string
+		switch {
+		case strings.HasSuffix(name, ".md"):
+			stem = strings.TrimSuffix(name, ".md")
+		case strings.HasSuffix(name, ".json"):
+			stem = strings.TrimSuffix(name, ".json")
+		default:
+			continue
+		}
+		if stem == "result-" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		g := byStem[stem]
+		if g == nil {
+			g = &runGroup{stem: stem}
+			byStem[stem] = g
+		}
+		g.files = append(g.files, filepath.Join(dir, name))
+		g.bytes += info.Size()
+		if ns := info.ModTime().UnixNano(); ns > g.mtime {
+			g.mtime = ns
+		}
+	}
+	groups := make([]*runGroup, 0, len(byStem))
+	for _, g := range byStem {
+		groups = append(groups, g)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].mtime != groups[j].mtime {
+			return groups[i].mtime > groups[j].mtime
+		}
+		return groups[i].stem > groups[j].stem
+	})
+	kept := 0
+	var totalBytes int64
+	for _, g := range groups {
+		alwaysKeep := (keepStem != "" && g.stem == keepStem) || kept == 0
+		withinCount := keepRuns <= 0 || kept < keepRuns
+		withinBytes := maxBytes <= 0 || totalBytes+g.bytes <= maxBytes
+		if alwaysKeep || (withinCount && withinBytes) {
+			kept++
+			totalBytes += g.bytes
+			continue
+		}
+		for _, path := range g.files {
+			_ = os.Remove(path)
+		}
+	}
 }
 
 func writeAtomic(path string, data []byte) error {

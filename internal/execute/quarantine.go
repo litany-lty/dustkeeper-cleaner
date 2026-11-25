@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"dustkeeper/internal/assess"
 	"dustkeeper/internal/cleanup"
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
@@ -199,6 +200,9 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 	// actually qualifies for: asking "may this be deleted" about a scope the user
 	// did not confirm would be a question with no authority behind the answer.
 	category := cleanup.CategoryOf(string(it.RawRelative))
+	if category == assess.CatCredential {
+		return skipped(res, "credential or recovery material is protected"), nil
+	}
 	pol, err := cleanup.Load(ctx, e.Store)
 	if err != nil {
 		return res, err
@@ -241,14 +245,14 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 			dkoutcome.ReasonRequestCheckHold, out.Decision); err != nil {
 			return res, err
 		}
-		return e.recordKeep(ctx, sc, it, &p.ID, out)
+		return e.recordKeep(ctx, sc, it, &p.ID, action, out)
 	}
 
 	// A decision that was already made about this exact version of this file is
 	// not asked again before its retry interval ends. Asking is a paid call, and
 	// the answer cannot have changed: the bytes and the rule binding are the
 	// same ones the earlier decision was about.
-	if kept, err := e.keptRecently(ctx, sc, it, preID, preTok, pol); err != nil {
+	if kept, err := e.keptRecently(ctx, sc, it, action, preID, preTok, pol); err != nil {
 		return res, err
 	} else if kept {
 		res.Code = string(errs.CodeKept)
@@ -257,29 +261,6 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 		res.Control = domain.ControlContinue
 		res.Evidence = domain.EvidenceNotStarted
 		return res, nil
-	}
-
-	// The batch allowance is checked before the request is built. A candidate
-	// that cannot be reviewed is not started: it is not sent, it cannot have
-	// been billed, and the remaining items of this plan are left for the next
-	// batch instead of each reporting the same provider outage.
-	if failure := e.reviewAllowance(); failure != "" {
-		d := review.Decision{Verdict: domain.VerdictKeep, Failure: failure, CostStatus: review.CostNotSent,
-			ModelError: "review was not started: this batch has no allowance left"}
-		e.diagNoRequest(it, action, "not_started", failure, budgetJSON)
-		if err := e.recordReviewInfo(ctx, sc, &p.ID, it, action, "review_not_started",
-			dkoutcome.ReasonNotStartedBudget, d); err != nil {
-			return res, err
-		}
-		res.Code = string(errs.CodeBudgetExhausted)
-		res.Message = d.ModelError
-		res.ReviewState = domain.ReviewNotStartedBudget
-		res.Control = domain.ControlStopScope
-		if failure == review.FailureRunBudget {
-			res.Control = domain.ControlStopRun
-			res.Message = "review was not started: the task review allowance is exhausted"
-		}
-		return res, errs.New(errs.CodeBudgetExhausted, res.Message)
 	}
 
 	facts := e.measureFacts(ctx, sc, it, preID, preTok)
@@ -300,6 +281,52 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 	}
 	if facts.Why != "" {
 		res.Message = facts.Why
+	}
+
+	// Local facts already settle that no move or deletion can happen. Calling
+	// paid external models here can never authorise an action; short-circuit
+	// with zero HTTP attempts and record the measured local explanation.
+	if !facts.Complete || !facts.Movable {
+		reason := dkoutcome.ReasonMoveSafetyUnknown
+		if !facts.Complete {
+			reason = dkoutcome.ReasonFactsMissing
+		}
+		d := review.Decision{Verdict: domain.VerdictKeep, CostStatus: review.CostNotSent}
+		localOut := review.Outcome{
+			Disposition: domain.DispositionKeep,
+			Reason:      reason,
+			Decision:    d,
+			Explanation: review.NewExplanation(req, d, reason),
+		}
+		e.diagNoRequest(it, action, "refused", reason, budgetJSON)
+		kept, err := e.keepItem(ctx, sc, p, it, action, localOut)
+		if facts.Why != "" {
+			kept.Message = facts.Why
+		}
+		return kept, err
+	}
+
+	// The batch allowance is checked before the request is prepared. A candidate
+	// that cannot be reviewed is not started: it is not sent, it cannot have
+	// been billed, and the remaining items of this plan are left for the next
+	// batch instead of each reporting the same provider outage.
+	if failure := e.reviewAllowance(); failure != "" {
+		d := review.Decision{Verdict: domain.VerdictKeep, Failure: failure, CostStatus: review.CostNotSent,
+			ModelError: "review was not started: this batch has no allowance left"}
+		e.diagNoRequest(it, action, "not_started", failure, budgetJSON)
+		if err := e.recordReviewInfo(ctx, sc, &p.ID, it, action, "review_not_started",
+			dkoutcome.ReasonNotStartedBudget, d); err != nil {
+			return res, err
+		}
+		res.Code = string(errs.CodeBudgetExhausted)
+		res.Message = d.ModelError
+		res.ReviewState = domain.ReviewNotStartedBudget
+		res.Control = domain.ControlStopScope
+		if failure == review.FailureRunBudget {
+			res.Control = domain.ControlStopRun
+			res.Message = "review was not started: the task review allowance is exhausted"
+		}
+		return res, errs.New(errs.CodeBudgetExhausted, res.Message)
 	}
 
 	// The request is recorded before it is sent. If the record cannot be
@@ -334,7 +361,7 @@ func (e *Executor) process(ctx context.Context, sc *ScopeCtx, p store.Plan, it s
 	}
 	switch outcome.Disposition {
 	case domain.DispositionKeep:
-		kept, err := e.keepItem(ctx, sc, p, it, outcome)
+		kept, err := e.keepItem(ctx, sc, p, it, action, outcome)
 		if kept.Message == "" && facts.Why != "" {
 			// The record says the model kept it; the operator also needs to know
 			// that a fact was missing, because that is the part they can fix.
@@ -712,6 +739,17 @@ func (e *Executor) quarantineOnly(ctx context.Context, sc *ScopeCtx, p store.Pla
 		return res, errs.Newf(errs.CodeStateWriteFailed,
 			"the object is in the vault but its record could not be closed: %v; the operation stays pending for `recover reconcile`", err)
 	}
+	qResultPayload := map[string]any{"source": "observed"}
+	if outcome.Reason != "" {
+		qResultPayload["reason"] = outcome.Reason
+	}
+	if outcome.ReviewID != "" {
+		qResultPayload["review_id"] = outcome.ReviewID
+	}
+	qResultJSON, err := json.Marshal(qResultPayload)
+	if err != nil {
+		return res, errs.Wrap(errs.CodeStateWriteFailed, err)
+	}
 	if err := e.Store.CompleteQuarantine(ctx, intent, store.QuarantineResult{
 		CapturedIdentityJSON: string(capturedIDJSON),
 		CapturedTokenJSON:    string(capturedTokJSON),
@@ -719,7 +757,7 @@ func (e *Executor) quarantineOnly(ctx context.Context, sc *ScopeCtx, p store.Pla
 		PurgeNotBeforeNS:     purgeNotBefore,
 		ContentHash:          string(postEv.Content),
 		MetadataHash:         string(metaHash),
-	}, `{"source":"observed"}`); err != nil {
+	}, string(qResultJSON)); err != nil {
 		return res, err
 	}
 	if budget != nil {

@@ -104,6 +104,9 @@ func planCreate(ctx context.Context, a *app, args []string) (output, error) {
 			},
 		})
 		if perr != nil {
+			if errs.CodeOf(perr) == errs.CodeNoCandidates {
+				return noCandidatesOutput(sc, res, perr), perr
+			}
 			return output{}, perr
 		}
 
@@ -120,11 +123,13 @@ func planCreate(ctx context.Context, a *app, args []string) (output, error) {
 			"logical_bytes": res.Bytes,
 			"truncated":     res.Truncated,
 			"reasons":       res.Reasons,
+			"scanned":       res.Scanned,
 			"items":         previewItems(res.Items),
 		}
 		o.Human = []string{
 			fmt.Sprintf("plan %s frozen: %d object(s), %d bytes", res.Plan.ID, len(res.Items), res.Bytes),
 			fmt.Sprintf("  expires: %s", time.Unix(0, res.Plan.ExpiresAtNS).Format(time.RFC3339)),
+			"  " + formatPlanReasons(res.Scanned, res.Reasons, res.Truncated),
 		}
 		for _, it := range res.Items {
 			o.Human = append(o.Human, fmt.Sprintf("  %s  %q", it.ID, string(it.RawRelative)))
@@ -276,7 +281,7 @@ func planApply(ctx context.Context, a *app, args []string) (output, error) {
 			// The assertion is passed as a function so the executor re-evaluates
 			// it for every object, not once per batch: a clock that jumps
 			// halfway through must stop the batch, not finish it.
-			trust := clocktrust.Start(a.store, a.clock)
+			trust := clocktrust.StartWithMaxGap(a.store, a.clock, a.cfg.Runtime.ClockMaxGap())
 			res, err = exec.ApplyPurgePlan(ctx, sctx, p.ID, domain.Digest(*digest), budget, trust.Assert)
 		default:
 			res, err = exec.ApplyQuarantinePlan(ctx, sctx, p.ID, domain.Digest(*digest), budget)

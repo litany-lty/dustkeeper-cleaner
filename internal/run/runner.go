@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -54,9 +55,10 @@ type ScopeRun struct {
 	// PurgeSkipped and QuarantineSkipped are separate because the two phases no
 	// longer share one gate: disk pressure stops new quarantine but must not
 	// stop a purge that is already due and authorised.
-	PurgeSkipped      string `json:"purge_skipped,omitempty"`
-	QuarantineSkipped string `json:"quarantine_skipped,omitempty"`
-	Scanned           int    `json:"scanned_files"`
+	PurgeSkipped      string         `json:"purge_skipped,omitempty"`
+	QuarantineSkipped string         `json:"quarantine_skipped,omitempty"`
+	CandidateCounts   map[string]int `json:"candidate_counts,omitempty"`
+	Scanned           int            `json:"scanned_files"`
 	ScanComplete      bool   `json:"scan_epoch_complete"`
 	ScanInterrupted   bool   `json:"scan_interrupted"`
 	DeepScanRequired  bool   `json:"deep_scan_required"`
@@ -141,7 +143,7 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	cfg := r.Config.Runtime
 	rep.DiskFreeBefore = r.diskFree()
 
-	guard := clocktrust.Start(r.Store, r.Clock)
+	guard := clocktrust.StartWithMaxGap(r.Store, r.Clock, cfg.ClockMaxGap())
 	verdict, err := guard.Assess(ctx)
 	if err != nil {
 		return rep, err
@@ -217,7 +219,7 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		}
 	}
 
-	for _, sc := range ordered {
+	for i, sc := range ordered {
 		// The guard sits at the top so that the loop below is byte-for-byte the
 		// normal path: one reason to start nothing new, and no second way to
 		// decide that a scope was skipped.
@@ -272,6 +274,20 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		rep.ReviewUnknownHeld += result.UnknownHeld
 		rep.Purged += result.Purged
 		rep.Control = strongerControl(rep.Control, result.Control)
+		if runErr != nil && errs.CodeOf(runErr) == errs.CodeModelUnavailable {
+			for _, rem := range ordered[i+1:] {
+				if rem.Kind == domain.KindReference || rem.Status != domain.ScopeActive {
+					continue
+				}
+				rep.UntouchedScopes++
+				rep.Scopes = append(rep.Scopes, ScopeRun{
+					Scope:   rem.ID,
+					Control: domain.ControlContinue,
+					Skipped: "skipped after earlier model outage in this run",
+				})
+			}
+			break
+		}
 		if rep.Control == domain.ControlStopRun {
 			break
 		}
@@ -309,6 +325,11 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		return rep, err
 	}
 	_ = r.advanceCursor(ordered)
+	latestScopes, lerr := r.Store.ListScopes(ctx)
+	if lerr != nil {
+		latestScopes = ordered
+	}
+	r.maybeNotifyStall(ctx, pol, &rep, latestScopes, r.Clock.Wall().UnixNano())
 	return rep, nil
 }
 
@@ -341,15 +362,20 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, pol cleanup.Polic
 		return sr, err
 	}
 
+	if pending, perr := r.Store.ScopePendingOps(ctx, sc.ID); perr == nil && pending == 0 {
+		sctx.SweepOrphanTmp(r.Clock.Wall(), 24*time.Hour)
+	}
+
 	// One decision, two consequences.
 	//
 	// A suspect clock or thin root evidence stops both new permanent deletion and
 	// new quarantine: an object created under a clock that cannot be proven has a
-	// retention window nobody can defend later. Disk pressure is a different
-	// thing - it stops new quarantine, because quarantining copies bytes onto a
-	// full volume, and it does not stop a purge, because the purge is precisely
-	// what frees the space.
-	pressure, pressureNote := r.diskPressure()
+	// retention window nobody can defend later. Disk pressure is evaluated per
+	// scope volume so one full or offline volume cannot starve other scopes; when
+	// this scope's volume is under pressure, reversible quarantine moves stay
+	// paused while due purges and confirmed direct-delete categories may still
+	// run to free space.
+	pressure, pressureNote := r.diskPressureFor(sc)
 	blocked := ""
 	switch {
 	case !verdict.Trusted:
@@ -398,40 +424,80 @@ func (r *Runner) runScope(ctx context.Context, sc store.Scope, pol cleanup.Polic
 		sr.Message = "no file was moved: " + blocked
 		return sr, nil
 	}
+	directDeleteOnly := false
 	if pressure {
 		sr.QuarantineSkipped = "disk pressure: " + pressureNote
-		sr.Message = "new quarantine paused: " + pressureNote
-		return sr, nil
+		if !pol.Confirmed() || len(pol.DirectDeleteCategories) == 0 || !pol.Covers(string(sc.ID)) {
+			sr.Message = "new quarantine paused: " + pressureNote
+			return sr, nil
+		}
+		directDeleteOnly = true
 	}
 	// The scan may have spent the time slice. Starting a quarantine after it has
 	// would be a new business action past the deadline.
 	if runLedger.TimeUp(r.Clock.Mono()) {
-		sr.QuarantineSkipped = "run time slice spent during the scan"
+		if sr.QuarantineSkipped == "" {
+			sr.QuarantineSkipped = "run time slice spent during the scan"
+		}
 		return sr, nil
 	}
-	// An unfinished scan is a partial picture of the scope, and a rule evaluated
-	// against a partial picture is a rule evaluated against the wrong tree: the
-	// files it has not reached are not "not matching", they are unknown. Due
-	// purges were already handled above and a restore never depends on a scan, so
-	// only new quarantine waits for the next round.
+	// An unfinished scan is a partial picture of the scope. If the pass stopped
+	// mid-tree (budget interruption or non-failed pending directories), wait for
+	// the next round. If every readable directory was scanned and only specific
+	// subdirectories could not be read, exclude those failed subtrees so one
+	// unreadable directory cannot permanently freeze cleanup of healthy subtrees,
+	// while still refusing to retire stale observations until the epoch finishes.
+	var excludedDirs []string
+	incompleteNote := ""
 	if !scanState.Complete {
-		if scanState.FailedDirs > 0 {
-			sr.QuarantineSkipped = fmt.Sprintf(
-				"the scan of this scope is not complete: %d directory(ies) could not be read", scanState.FailedDirs)
-		} else {
-			sr.QuarantineSkipped = "the scan of this scope is not complete yet"
+		if !scanState.Interrupted && scanState.FailedDirs > 0 && scanState.Pending == int64(scanState.FailedDirs) {
+			failedDirs, ferr := r.Store.FailedDirs(ctx, sctx.Scope.ID, scanState.Epoch)
+			if ferr == nil && len(failedDirs) > 0 && !containsRootDir(failedDirs) {
+				excludedDirs = failedDirs
+				incompleteNote = formatFailedDirsNote(failedDirs)
+			}
 		}
-		sr.Message = sr.QuarantineSkipped
-		return sr, nil
+		if len(excludedDirs) == 0 {
+			if scanState.FailedDirs > 0 {
+				sr.QuarantineSkipped = fmt.Sprintf(
+					"the scan of this scope is not complete: %d directory(ies) could not be read", scanState.FailedDirs)
+			} else {
+				sr.QuarantineSkipped = "the scan of this scope is not complete yet"
+			}
+			sr.Message = sr.QuarantineSkipped
+			return sr, nil
+		}
 	}
 
-	q := r.quarantineGrants(ctx, sctx, guardSet, runLedger, qLedger, pLedger, shared, grants)
+	q := r.quarantineGrants(ctx, sctx, guardSet, runLedger, qLedger, pLedger, shared, grants, excludedDirs, directDeleteOnly)
 	sr.Quarantined, sr.QuarantinedBytes = q.Moved, q.MovedBytes
 	sr.NotStarted += q.NotStarted
 	sr.UnknownHeld += q.UnknownHeld
 	sr.Purged += q.Purged
 	sr.PurgedBytes += q.PurgedBytes
 	sr.EarliestPurgeNS = q.EarliestPurgeNS
+	if len(q.candidateCounts) > 0 {
+		sr.CandidateCounts = q.candidateCounts
+	}
+	if directDeleteOnly {
+		if q.Purged > 0 {
+			sr.Message = joinNote(sr.Message, fmt.Sprintf("new quarantine paused (%s); direct deletion freed %d file(s)", pressureNote, q.Purged))
+		} else {
+			sr.Message = joinNote(sr.Message, "new quarantine paused: "+pressureNote)
+		}
+	}
+	if incompleteNote != "" {
+		if q.Moved == 0 && q.Purged == 0 && sr.QuarantineSkipped == "" {
+			sr.QuarantineSkipped = incompleteNote
+		}
+		sr.Message = joinNote(sr.Message, incompleteNote)
+	}
+	if q.Note != "" && sr.Quarantined == 0 && sr.Purged == 0 {
+		if sr.QuarantineSkipped == "" {
+			sr.QuarantineSkipped = q.Note
+		}
+		sr.Message = joinNote(sr.Message, q.Note)
+	}
 	sr.Control = strongerControl(sr.Control, q.Control)
 	return sr, q.Err
 }
@@ -479,27 +545,34 @@ func (r *Runner) purgeDue(ctx context.Context, sc *execute.ScopeCtx, runLedger *
 		pageSize = 200
 	}
 
+	var keepIdx *plan.KeepIndex
+	if pol, perr := cleanup.Load(ctx, r.Store); perr == nil && pol.KeepRetryDays > 0 {
+		sinceNS := nowNS - int64(pol.KeepRetryDays)*int64(24*time.Hour)
+		if idx, kerr := plan.LoadKeepIndex(ctx, r.Store, sc.Scope.ID, sinceNS); kerr == nil {
+			keepIdx = idx
+		}
+	}
+	pendingIdx, _ := plan.LoadPendingIndex(ctx, r.Store, sc.Scope.ID)
+
 	var (
-		authorised []store.Item
-		refused    int
-		skipped    []string
-		totalBytes int64
-		afterDue   int64
-		afterItem  string
+		authorised  []store.Item
+		refused     int
+		unknownHeld int
+		skipped     []string
+		totalBytes  int64
+		afterDue    int64
+		afterItem   string
 	)
 
-	// The run ledger is a ceiling for the whole run; a grant is a ceiling for one
-	// approval. Both apply, and the smaller one wins. Spending ten because the
-	// configuration allows ten, when the user approved one for this grant, is how
-	// "the approved maximum" turned into a number nobody enforced.
-	//
-	// The claim is charged to the approval's own ledger, not to a counter that
-	// lives in this function. The direct deletion path spends the same approval
-	// later in the same run, and two separate counters would each see "one file
-	// left" and each spend it. A claim that does not become an action is given
-	// back below.
 	quotas := map[domain.GrantID]grantQuota{}
 	claimed := map[domain.ItemID]*domain.ActionLedger{}
+	releaseClaimed := func() {
+		for _, it := range authorised {
+			if gl := claimed[it.ID]; gl != nil {
+				gl.Release(itemSize(it))
+			}
+		}
+	}
 
 collect:
 	for len(authorised) < cfg.MaxAutoPurgeFiles {
@@ -508,7 +581,8 @@ collect:
 		}
 		page, err := r.Store.PurgeQueuePage(ctx, sc.Scope.ID, nowNS, afterDue, afterItem, pageSize)
 		if err != nil {
-			return purgeOutcome{Refused: refused, Skipped: skipped, Control: domain.ControlStopRun, Err: err}
+			releaseClaimed()
+			return purgeOutcome{Refused: refused, UnknownHeld: unknownHeld, Skipped: skipped, Control: domain.ControlStopRun, Err: err}
 		}
 		if len(page) == 0 {
 			break
@@ -518,48 +592,52 @@ collect:
 			afterItem = string(it.ID)
 			quota, ok, authorityErr := r.automaticAuthority(ctx, it, quotas)
 			if authorityErr != nil {
-				return purgeOutcome{Refused: refused, Skipped: skipped, Control: ControlOfError(authorityErr), Err: authorityErr}
+				releaseClaimed()
+				return purgeOutcome{Refused: refused, UnknownHeld: unknownHeld, Skipped: skipped, Control: ControlOfError(authorityErr), Err: authorityErr}
 			}
 			if !ok {
 				refused++
 				continue
 			}
-			// The expiry review comes next, and still before any allowance is
-			// counted. An object that must not be cleared - restored, protected, a
-			// place in use again, a vault object that changed - leaves with a
-			// reason and costs the run nothing.
-			//
-			// It runs after the authority check on purpose: the authority is a
-			// database read that can fail in a way the run has to hear about, and
-			// a review that ran first would hide that failure behind a refusal
-			// about the object.
 			if why, rerr := r.Exec.ReviewExpiry(ctx, sc, it); rerr != nil {
-				return purgeOutcome{Refused: refused, Skipped: skipped, Control: ControlOfError(rerr), Err: rerr}
+				releaseClaimed()
+				return purgeOutcome{Refused: refused, UnknownHeld: unknownHeld, Skipped: skipped, Control: ControlOfError(rerr), Err: rerr}
 			} else if why != "" {
 				refused++
 				skipped = append(skipped, string(it.ID)+": "+why)
 				continue
 			}
+			if it.CapturedIdentityJSON != nil && it.CapturedTokenJSON != nil {
+				if pendingIdx != nil && pendingIdx.Held(string(it.RawRelative), domain.ActionPurge,
+					*it.CapturedIdentityJSON, *it.CapturedTokenJSON) {
+					refused++
+					unknownHeld++
+					skipped = append(skipped, string(it.ID)+": awaiting_request_check: unresolved purge request")
+					continue
+				}
+				if keepIdx != nil {
+					var cid domain.FileIdentity
+					var ctok domain.ChangeToken
+					if json.Unmarshal([]byte(*it.CapturedIdentityJSON), &cid) == nil &&
+						json.Unmarshal([]byte(*it.CapturedTokenJSON), &ctok) == nil &&
+						keepIdx.Kept(string(it.RawRelative), domain.ActionPurge, "", cid, ctok) {
+						refused++
+						skipped = append(skipped, string(it.ID)+": kept_recently: earlier expiry review kept this object")
+						continue
+					}
+				}
+			}
 			size := itemSize(it)
-			if totalBytes+size > cfg.MaxAutoPurgeBytes {
+			if totalBytes+size > cfg.MaxAutoPurgeBytes || runLedger.RemainingRead() < size {
 				refused++
 				continue
 			}
-			// The run-wide ledgers are asked first, because the answer "spent"
-			// ends the collection: a claim taken for an object that never joins
-			// the plan would be authority nobody spends and nobody gets back.
 			if !ledger.CanReserve(size) || !shared.CanReserve(size) {
-				// The run's purge allowance, or the ceiling the confirmed policy
-				// put over every action, is spent. Stop looking: neither ledger
-				// can grow again in this run.
 				break collect
 			}
 			if gid := grantIDOf(it); gid != "" {
 				gl := grants.ledger(gid, quota.files, quota.bytes)
 				if !gl.CanReserve(size) {
-					// This approval has spent what it approved. Another object
-					// under the same grant waits for the next run, when a new
-					// plan is approved against the same ceiling.
 					refused++
 					continue
 				}
@@ -575,24 +653,19 @@ collect:
 	}
 
 	if len(authorised) == 0 {
-		return purgeOutcome{Refused: refused, Skipped: skipped, Control: domain.ControlContinue}
+		return purgeOutcome{Refused: refused, UnknownHeld: unknownHeld, Skipped: skipped, Control: domain.ControlContinue}
 	}
 
-	// The reminder before an irreversible act, and the gate it carries.
-	//
-	// R27 is explicit that "the log says so" is not notification, so the only
-	// thing that lets the clearing proceed is a delivery the channel reported as
-	// successful. When it was not, nothing is cleared: the objects stay in the
-	// observation area, which costs the user nothing but a later date, and the
-	// run says why.
 	if note, ok := r.remindBeforeClearing(ctx, authorised); !ok {
-		return purgeOutcome{Refused: refused, Skipped: skipped, Note: note, Control: domain.ControlContinue}
+		releaseClaimed()
+		return purgeOutcome{Refused: refused, UnknownHeld: unknownHeld, Skipped: skipped, Note: note, Control: domain.ControlContinue}
 	}
 
 	p, err := plan.CreatePurgePlan(ctx, r.Store, sc.Scope, authorised,
 		domain.PlanScheduledPurge, nowNS, int64(plan.DefaultTTL))
 	if err != nil {
-		return purgeOutcome{Refused: refused, Skipped: skipped, Control: domain.ControlStopScope, Err: err}
+		releaseClaimed()
+		return purgeOutcome{Refused: refused, UnknownHeld: unknownHeld, Skipped: skipped, Control: domain.ControlStopScope, Err: err}
 	}
 
 	// The purge phase may spend at most what is left in the shared purge ledger,
@@ -622,7 +695,7 @@ collect:
 		bytes += itemSize(it)
 	}
 
-	reviewState := purgeReviewState(res)
+	reviewState := unknownHeld + purgeReviewState(res)
 	if err != nil {
 		return purgeOutcome{Purged: res.Completed, Refused: refused, Skipped: skipped,
 			NotStarted: res.NotStarted, UnknownHeld: reviewState,
@@ -635,7 +708,7 @@ collect:
 			Control: strongerControl(res.Control, ControlOfError(stopErr)), Err: stopErr}
 	}
 	return purgeOutcome{Purged: res.Completed, Bytes: bytes, Refused: refused, Skipped: skipped,
-		Control: res.Control}
+		NotStarted: res.NotStarted, UnknownHeld: reviewState, Control: res.Control}
 }
 
 // tellUser sends the one message the product promises after a scope's work, and
@@ -688,7 +761,7 @@ func (r *Runner) remindBeforeClearing(ctx context.Context, due []store.Item) (st
 	for _, it := range due {
 		bytes += itemSize(it)
 	}
-	body := fmt.Sprintf("%d 个文件已到期，本次将永久删除（%s）。删除前可在详情页查看并恢复。",
+	body := fmt.Sprintf("%d 个文件已到期，本次即将永久删除（%s）。详情见本机结果页。",
 		len(due), humanBytes(bytes))
 	res := r.deliver(ctx, body)
 	if err := notify.Record(ctx, r.Store, r.Clock.Wall().UnixNano(), body, res); err != nil {
@@ -966,6 +1039,14 @@ func ScanScope(ctx context.Context, st *store.Store, clock domain.Clock, batch i
 	if _, err := st.MarkStaleObservations(ctx, sc.Scope.ID, epoch); err != nil {
 		return stats, ScanState{}, err
 	}
+	// Prune observations that have been stale for more than 30 days so the
+	// observations index stays bounded over years of churn without discarding
+	// recently retired paths.
+	if staleBeforeNS := clock.Wall().UnixNano() - int64(30*24*time.Hour); staleBeforeNS > 0 {
+		if _, err := st.PruneStaleObservations(ctx, sc.Scope.ID, staleBeforeNS); err != nil {
+			return stats, ScanState{}, err
+		}
+	}
 	if err := st.ResetScanInterrupts(ctx, sc.Scope.ID); err != nil {
 		return stats, ScanState{}, err
 	}
@@ -987,6 +1068,15 @@ func CurrentEpoch(ctx context.Context, st *store.Store, id domain.ScopeID) (int6
 			if _, err := st.RequeueActive(ctx, id, sc.ScanEpoch); err != nil {
 				return 0, err
 			}
+			// If every readable directory in this epoch already finished and
+			// only failed directories remain, re-queue the done directories so
+			// healthy subtrees keep discovering new files without advancing the
+			// epoch or retiring stale observations from unreadable subtrees.
+			if state.Pending == state.Failed && state.Done > 0 {
+				if _, err := st.ResetDoneDirsForRefresh(ctx, id, sc.ScanEpoch); err != nil {
+					return 0, err
+				}
+			}
 			return sc.ScanEpoch, nil
 		}
 	}
@@ -1007,6 +1097,8 @@ type quarantineOutcome struct {
 	Purged          int
 	PurgedBytes     int64
 	EarliestPurgeNS *int64
+	candidateCounts map[string]int
+	Note            string
 	Control         string
 	Err             error
 }
@@ -1022,9 +1114,10 @@ func (o quarantineOutcome) bytesMoved() int64 { return o.MovedBytes + o.PurgedBy
 // its state, not the plan's intention.
 func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, guard *policy.Guard,
 	runLedger *domain.RunLedger, qLedger, pLedger, shared *domain.ActionLedger,
-	grants *grantAllowance) quarantineOutcome {
+	grants *grantAllowance, excludedDirs []string, directDeleteOnly bool) quarantineOutcome {
 
-	out := quarantineOutcome{Control: domain.ControlContinue}
+	out := quarantineOutcome{Control: domain.ControlContinue, candidateCounts: map[string]int{}}
+	skippedReasons := map[string]int{}
 
 	allRules, err := r.Store.ListRules(ctx, sc.Scope.ID)
 	if err != nil {
@@ -1078,12 +1171,30 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 			return out
 		}
 
-		// The rule's own grant, the run's class ledger and the confirmed policy's
-		// per-run ceiling all apply. Taking only the grant let two rules each
-		// spend the configured maximum; ignoring the ceiling let a run spend more
-		// than the user confirmed.
-		maxFiles := minInt(qLedger.RemainingFiles(), minInt(grantFiles(qg), r.Config.Runtime.MaxAutoQuarantineFiles))
-		maxBytes := minI64(qLedger.RemainingBytes(), minI64(grantBytes(qg), r.Config.Runtime.MaxAutoQuarantineBytes))
+		// Under disk pressure only authorised direct deletions may run; reversible
+		// quarantine moves stay paused so no bytes are retained on a full volume.
+		var maxFiles int
+		var maxBytes int64
+		if directDeleteOnly {
+			if pgErr != nil || pg.ID == "" {
+				continue
+			}
+			if err := plan.CheckAutomaticGrant(pg, sc.Scope, rule, domain.CapAutoPurge); err != nil {
+				out.Control = domain.ControlStopScope
+				out.Err = err
+				return out
+			}
+			pgLedger := grants.ledger(pg.ID, grantFiles(pg), grantBytes(pg))
+			maxFiles = minInt(pLedger.RemainingFiles(), minInt(pgLedger.RemainingFiles(), r.Config.Runtime.MaxAutoPurgeFiles))
+			maxBytes = minI64(pLedger.RemainingBytes(), minI64(pgLedger.RemainingBytes(), r.Config.Runtime.MaxAutoPurgeBytes))
+		} else {
+			// The rule's own grant, the run's class ledger and the confirmed policy's
+			// per-run ceiling all apply. Taking only the grant let two rules each
+			// spend the configured maximum; ignoring the ceiling let a run spend more
+			// than the user confirmed.
+			maxFiles = minInt(qLedger.RemainingFiles(), minInt(grantFiles(qg), r.Config.Runtime.MaxAutoQuarantineFiles))
+			maxBytes = minI64(qLedger.RemainingBytes(), minI64(grantBytes(qg), r.Config.Runtime.MaxAutoQuarantineBytes))
+		}
 		if maxFiles <= 0 || maxBytes <= 0 {
 			continue
 		}
@@ -1094,25 +1205,46 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 		}
 
 		res, err := planner.CreateRulePlan(ctx, plan.RulePlanRequest{
-			Scope:           sc.Scope,
-			Rule:            parsed,
-			RuleRef:         domain.RuleRef{ID: rule.ID, Revision: rule.Revision, Digest: rule.Digest},
-			Kind:            domain.PlanScheduledRule,
-			Guard:           guard,
-			MaxFiles:        maxFiles,
-			MaxBytes:        maxBytes,
-			QuarantineGrant: &qg,
-			PurgeGrant:      pickGrant(pg, pgErr),
-			Config:          r.Config,
-			NowNS:           r.Clock.Wall().UnixNano(),
+			Scope:               sc.Scope,
+			Rule:                parsed,
+			RuleRef:             domain.RuleRef{ID: rule.ID, Revision: rule.Revision, Digest: rule.Digest},
+			Kind:                domain.PlanScheduledRule,
+			Guard:               guard,
+			MaxFiles:            maxFiles,
+			MaxBytes:            maxBytes,
+			QuarantineGrant:     &qg,
+			PurgeGrant:          pickGrant(pg, pgErr),
+			Config:              r.Config,
+			NowNS:               r.Clock.Wall().UnixNano(),
+			SkipKept:            true,
+			SkipPending:         true,
+			MaxReadBudgetBytes:  runLedger.RemainingRead(),
+			ExcludedDirPrefixes: excludedDirs,
+			DirectDeleteOnly:    directDeleteOnly,
 			// Same ancestry as the executor will walk, so a plan never offers an
 			// object the execution then refuses as protected.
 			AncestorsOf: func(dir string) ([]domain.FileIdentity, error) {
 				return execute.AncestorIdentities(sc, []byte(dir))
 			},
 		})
+		for k, c := range res.Reasons {
+			out.candidateCounts[k] += c
+		}
+		out.UnknownHeld += res.Reasons[policy.ReasonAwaitingRequestCheck]
 		if err != nil {
 			if errs.CodeOf(err) == errs.CodeNoCandidates {
+				for _, code := range []string{
+					policy.ReasonKeptRecently,
+					policy.ReasonAwaitingRequestCheck,
+					policy.ReasonReadBudgetTooSmall,
+					policy.ReasonOverRunByteLimit,
+					policy.ReasonTooLarge,
+					policy.ReasonProtected,
+					policy.ReasonTooNew,
+					policy.ReasonFailedDirExcluded,
+				} {
+					skippedReasons[code] += res.Reasons[code]
+				}
 				continue
 			}
 			out.Control = domain.ControlStopScope
@@ -1123,8 +1255,13 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 		// The plan is executed with both allowances attached: an item that turns
 		// out to be a permanent deletion spends the purge ledger and the policy
 		// ceiling, and one that turns out to be a move spends the quarantine
-		// ledger. Neither can borrow the other's.
-		phase := domain.NewPhaseBudget(runLedger, qLedger, maxFiles, maxBytes).WithShared(shared)
+		// ledger. Neither can borrow the other's. Under disk pressure the move
+		// phase receives zero capacity so reversible moves cannot execute.
+		qFiles, qBytes := maxFiles, maxBytes
+		if directDeleteOnly {
+			qFiles, qBytes = 0, 0
+		}
+		phase := domain.NewPhaseBudget(runLedger, qLedger, qFiles, qBytes).WithShared(shared)
 		// A direct deletion is spending this rule's purge approval, and that
 		// approval may already have been partly spent by the expiry clearance a
 		// few lines above. The phase therefore carries the approval's own ledger:
@@ -1186,6 +1323,29 @@ func (r *Runner) quarantineGrants(ctx context.Context, sc *execute.ScopeCtx, gua
 			return out
 		}
 	}
+	if out.Moved == 0 && out.Purged == 0 {
+		var notes []string
+		for _, item := range []struct {
+			code string
+			fmt  string
+		}{
+			{policy.ReasonKeptRecently, "%d in keep retry window"},
+			{policy.ReasonAwaitingRequestCheck, "%d awaiting unresolved request check"},
+			{policy.ReasonReadBudgetTooSmall, "%d exceed 2x run read budget"},
+			{policy.ReasonOverRunByteLimit, "%d exceed per-run byte limit"},
+			{policy.ReasonTooLarge, "%d exceed rule max size"},
+			{policy.ReasonProtected, "%d protected"},
+			{policy.ReasonTooNew, "%d modified too recently"},
+			{policy.ReasonFailedDirExcluded, "%d under unreadable directories"},
+		} {
+			if n := skippedReasons[item.code]; n > 0 {
+				notes = append(notes, fmt.Sprintf(item.fmt, n))
+			}
+		}
+		if len(notes) > 0 {
+			out.Note = "no eligible candidates acted on (" + strings.Join(notes, ", ") + ")"
+		}
+	}
 	return out
 }
 
@@ -1209,12 +1369,37 @@ func BuildGuard(ctx context.Context, st *store.Store, sc *execute.ScopeCtx) (*po
 
 // ClockTrust is kept for callers that only need the verdict, such as `doctor`.
 func ClockTrust(ctx context.Context, st *store.Store, clock domain.Clock) (bool, string) {
-	guard := clocktrust.Start(st, clock)
+	return ClockTrustWithMaxGap(ctx, st, clock, 0)
+}
+
+// ClockTrustWithMaxGap evaluates clock trust with a custom maximum run gap.
+func ClockTrustWithMaxGap(ctx context.Context, st *store.Store, clock domain.Clock, maxGap time.Duration) (bool, string) {
+	guard := clocktrust.StartWithMaxGap(st, clock, maxGap)
 	v, err := guard.Assess(ctx)
 	if err != nil {
 		return false, err.Error()
 	}
 	return v.Trusted, v.Reason
+}
+
+func containsRootDir(dirs []string) bool {
+	for _, d := range dirs {
+		if strings.Trim(d, "/") == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func formatFailedDirsNote(dirs []string) string {
+	shown := dirs
+	suffix := ""
+	if len(shown) > 3 {
+		shown = shown[:3]
+		suffix = fmt.Sprintf(", +%d more", len(dirs)-3)
+	}
+	return fmt.Sprintf("the scan of this scope is not complete: %d directory(ies) could not be read (%s%s)",
+		len(dirs), strings.Join(shown, ", "), suffix)
 }
 
 func (r *Runner) rotate(scopes []store.Scope) []store.Scope {
@@ -1262,6 +1447,17 @@ func diskStatus(path string) (free, total uint64, err error) {
 	return uint64(st.Bavail) * bs, uint64(st.Blocks) * bs, nil
 }
 
+// TestHookDiskStatus, when non-nil, overrides diskStatus for deterministic
+// multi-volume disk-pressure tests.
+var TestHookDiskStatus func(path string) (free, total uint64, err error)
+
+func statDisk(path string) (free, total uint64, err error) {
+	if TestHookDiskStatus != nil {
+		return TestHookDiskStatus(path)
+	}
+	return diskStatus(path)
+}
+
 func (r *Runner) diskFree() uint64 {
 	scopes, err := r.Store.ListScopes(context.Background())
 	if err != nil {
@@ -1269,19 +1465,41 @@ func (r *Runner) diskFree() uint64 {
 	}
 	var best uint64
 	for _, sc := range scopes {
-		if free, _, err := diskStatus(string(sc.RawRoot)); err == nil && free > best {
+		if free, _, err := statDisk(string(sc.RawRoot)); err == nil && free > best {
 			best = free
 		}
 	}
 	return best
 }
 
-// diskPressure reports whether the configured free-space floor has been reached.
-//
-// The thresholds were in the configuration, in the plan digest and in the
-// executor's view struct, and no code read them. A setting that looks present and
-// does nothing is worse than an absent one: it invites an operator to believe the
-// volume is protected.
+// diskPressureFor reports whether the volume holding one scope has reached the
+// configured free-space floor. Evaluating per scope keeps a full or offline
+// volume on one scope from starving unrelated scopes on healthy volumes.
+func (r *Runner) diskPressureFor(sc store.Scope) (bool, string) {
+	cfg := r.Config.Runtime
+	if cfg.MinFreeBytes <= 0 && cfg.MinFreePercent <= 0 {
+		return false, ""
+	}
+	if !domain.MutableKind(sc.Kind) {
+		return false, ""
+	}
+	free, total, err := statDisk(string(sc.RawRoot))
+	if err != nil {
+		return true, "scope " + string(sc.ID) + " could not be inspected: " + err.Error()
+	}
+	if cfg.MinFreeBytes > 0 && free < uint64(cfg.MinFreeBytes) {
+		return true, "free space is below min_free_bytes on the volume holding " + string(sc.ID)
+	}
+	if cfg.MinFreePercent > 0 && total > 0 {
+		if free*100/total < uint64(cfg.MinFreePercent) {
+			return true, "free space is below min_free_percent on the volume holding " + string(sc.ID)
+		}
+	}
+	return false, ""
+}
+
+// diskPressure reports whether any active mutable scope has reached the
+// configured free-space floor, for the run-level summary.
 func (r *Runner) diskPressure() (bool, string) {
 	cfg := r.Config.Runtime
 	if cfg.MinFreeBytes <= 0 && cfg.MinFreePercent <= 0 {
@@ -1292,20 +1510,11 @@ func (r *Runner) diskPressure() (bool, string) {
 		return true, "the volume could not be inspected: " + err.Error()
 	}
 	for _, sc := range scopes {
-		if !domain.MutableKind(sc.Kind) {
+		if sc.Status != domain.ScopeActive {
 			continue
 		}
-		free, total, err := diskStatus(string(sc.RawRoot))
-		if err != nil {
-			return true, "scope " + string(sc.ID) + " could not be inspected: " + err.Error()
-		}
-		if cfg.MinFreeBytes > 0 && free < uint64(cfg.MinFreeBytes) {
-			return true, "free space is below min_free_bytes on the volume holding " + string(sc.ID)
-		}
-		if cfg.MinFreePercent > 0 && total > 0 {
-			if free*100/total < uint64(cfg.MinFreePercent) {
-				return true, "free space is below min_free_percent on the volume holding " + string(sc.ID)
-			}
+		if pressure, note := r.diskPressureFor(sc); pressure {
+			return true, note
 		}
 	}
 	return false, ""

@@ -131,10 +131,26 @@ func kindOf(st *unix.Stat_t) string {
 	}
 }
 
+func volumeIDOfFD(_ int, dev uint64) string {
+	return fmt.Sprintf("dev-%d", dev)
+}
+
 func identityOf(st *unix.Stat_t) domain.FileIdentity {
+	return identityWithVolume(st, "", 0)
+}
+
+func identityOfFD(fd int, st *unix.Stat_t) domain.FileIdentity {
 	dev := devOf(st)
+	return identityWithVolume(st, volumeIDOfFD(fd, dev), dev)
+}
+
+func identityWithVolume(st *unix.Stat_t, volID string, volDev uint64) domain.FileIdentity {
+	dev := devOf(st)
+	if volID == "" || (volDev != 0 && dev != volDev) {
+		volID = fmt.Sprintf("dev-%d", dev)
+	}
 	return domain.FileIdentity{
-		VolumeID: fmt.Sprintf("dev-%d", dev),
+		VolumeID: volID,
 		Device:   dev,
 		Inode:    st.Ino,
 		Kind:     kindOf(st),
@@ -169,6 +185,8 @@ func fileFlags(fd int) (uint64, string) {
 	}
 	return uint64(uint32(flags)), ""
 }
+
+func entryBlockedByFlags(*unix.Stat_t) bool { return false }
 
 // birthTimeNS is the birth time carried by a plain stat, which the Linux stat
 // contract does not provide. birthTimeOfFD uses statx and is what the root

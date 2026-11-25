@@ -68,12 +68,17 @@ func TestPreparedRequestIsSettledWithItsDecisionEvent(t *testing.T) {
 	if err := st.PrepareReviewDispatch(ctx, preparedDispatch()); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := st.OpenDispatchFor(ctx, "item-dispatch", "quarantine", `{"size":10}`, `{"mtime":1}`)
+	pending, err := st.OpenDispatchFor(ctx, "scope-dispatch", "quarantine", `{"size":10}`, `{"mtime":1}`)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending = %v, %v; want one row", pending, err)
 	}
-	if got, err := st.OpenDispatchFor(ctx, "item-dispatch", "quarantine", `{"size":11}`, `{"mtime":1}`); err != nil || len(got) != 0 {
+	if got, err := st.OpenDispatchFor(ctx, "scope-dispatch", "quarantine", `{"size":11}`, `{"mtime":1}`); err != nil || len(got) != 0 {
 		t.Fatalf("a changed file was treated as the same question: %v, %v", got, err)
+	}
+	// A different item_id planned in a later run for the same scope/object evidence
+	// must still see this unresolved dispatch (R01).
+	if got, err := st.OpenDispatchFor(ctx, "other-scope", "quarantine", `{"size":10}`, `{"mtime":1}`); err != nil || len(got) != 0 {
+		t.Fatalf("another scope matched this dispatch: %v, %v", got, err)
 	}
 	if err := st.PrepareReviewDispatch(ctx, preparedDispatch()); err == nil {
 		t.Fatal("a second pending row for one review was accepted")
@@ -137,7 +142,7 @@ func TestALocalRefusalClosesThePreparedRequest(t *testing.T) {
 		!strings.Contains(all[0].Note, "paused") {
 		t.Fatalf("refusal was not recorded: %+v", all)
 	}
-	if pending, _ := st.OpenDispatchFor(ctx, "item-dispatch", "quarantine", `{"size":10}`, `{"mtime":1}`); len(pending) != 0 {
+	if pending, _ := st.OpenDispatchFor(ctx, "scope-dispatch", "quarantine", `{"size":10}`, `{"mtime":1}`); len(pending) != 0 {
 		t.Errorf("a refused request still blocks a future question: %v", pending)
 	}
 }
@@ -161,7 +166,7 @@ func TestSettlementIsOneTransaction(t *testing.T) {
 	if err := st.SettleReviewDispatch(ctx, "rev-1", settled, bad); err == nil {
 		t.Fatal("a duplicate event id did not fail the settlement")
 	}
-	pending, err := st.OpenDispatchFor(ctx, "item-dispatch", "quarantine", `{"size":10}`, `{"mtime":1}`)
+	pending, err := st.OpenDispatchFor(ctx, "scope-dispatch", "quarantine", `{"size":10}`, `{"mtime":1}`)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("a failed settlement closed the request: %v, %v", pending, err)
 	}
@@ -192,7 +197,7 @@ func checkedResolution(id string, at int64) (DispatchResolution, Event) {
 
 func openDispatches(t *testing.T, st *Store) []ReviewDispatch {
 	t.Helper()
-	rows, err := st.OpenDispatchFor(context.Background(), "item-dispatch", "quarantine",
+	rows, err := st.OpenDispatchFor(context.Background(), "scope-dispatch", "quarantine",
 		`{"size":10}`, `{"mtime":1}`)
 	if err != nil {
 		t.Fatal(err)

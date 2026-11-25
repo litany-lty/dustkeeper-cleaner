@@ -102,6 +102,9 @@ func TestOutOfRangeIsRejectedNotClamped(t *testing.T) {
 		{"purge bytes negative", func(c *Config) { c.Runtime.MaxAutoPurgeBytes = -1 }, "max_auto_purge_bytes"},
 		{"min free percent zero", func(c *Config) { c.Runtime.MinFreePercent = 0 }, "min_free_percent"},
 		{"min free percent above fifty", func(c *Config) { c.Runtime.MinFreePercent = 90 }, "min_free_percent"},
+		{"clock max gap negative", func(c *Config) { c.Runtime.ClockMaxGapHours = -1 }, "clock_max_gap_hours"},
+		{"clock max gap above 720", func(c *Config) { c.Runtime.ClockMaxGapHours = 721 }, "clock_max_gap_hours"},
+		{"candidate order unknown", func(c *Config) { c.Runtime.CandidateOrder = "random" }, "candidate_order"},
 		{"wrong config version", func(c *Config) { c.ConfigVersion = 2 }, "config_version"},
 	}
 	for _, tc := range cases {

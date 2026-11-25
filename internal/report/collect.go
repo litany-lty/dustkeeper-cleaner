@@ -62,7 +62,7 @@ type Entry struct {
 	// Review facts, copied from the record. A line that says "kept" without
 	// saying whether anything was asked is the ambiguity this field removes.
 	Failure     string `json:"review_failure,omitempty"`
-	Attempts    int    `json:"http_attempts,omitempty"`
+	Attempts    *int   `json:"http_attempts,omitempty"`
 	CostStatus  string `json:"cost_status,omitempty"`
 	ReviewState string `json:"review_state,omitempty"`
 	// RequestTimings are the measured, payload-free timings of the prepared
@@ -159,6 +159,7 @@ func Collect(ctx context.Context, st *store.Store, w Window) (Page, error) {
 	tallyReviews(&page.Summary, events)
 	timingsByReview := reviewTimings(events)
 	explanationsByReview := reviewExplanations(events)
+	settlementFactsByReview := reviewSettlementFacts(events)
 
 	// One entry per item per section: several events can describe the same object
 	// (a retry, a reconciliation), and a page that lists a file twice reads like
@@ -200,6 +201,18 @@ func Collect(ctx context.Context, st *store.Store, w Window) (Page, error) {
 		if entry.ReviewExplanation == nil {
 			entry.ReviewExplanation = explanationsByReview[entry.ReviewID]
 		}
+		if sf, ok := settlementFactsByReview[entry.ReviewID]; ok {
+			if entry.Attempts == nil && (sf.CostStatus != "" || sf.Attempts > 0 || sf.Verdict == "not_started") {
+				v := sf.Attempts
+				entry.Attempts = &v
+			}
+			if entry.CostStatus == "" && sf.CostStatus != "" {
+				entry.CostStatus = sf.CostStatus
+			}
+			if entry.Failure == "" && sf.Failure != "" {
+				entry.Failure = sf.Failure
+			}
+		}
 		appendEntry(&page, section, entry)
 	}
 
@@ -217,35 +230,10 @@ func Collect(ctx context.Context, st *store.Store, w Window) (Page, error) {
 }
 
 // eventsInWindow reads the audit log in pages and keeps the events whose recorded
-// instant falls inside the window.
-//
-// Paging by sequence rather than by time is deliberate: the store exposes a keyset
-// cursor, and sequence order is the order the operations happened. The instant is
-// filtered afterwards rather than used as the cursor, because the wall clock can
-// jump and a cursor built from it would then skip or repeat rows.
+// eventsInWindow returns every event in sequence order whose occurred_at_ns
+// instant falls inside [startNS, endNS].
 func eventsInWindow(ctx context.Context, st *store.Store, startNS, endNS int64) ([]store.Event, error) {
-	const pageSize = 1000
-	var out []store.Event
-	var after int64
-	for {
-		page, err := st.ListEvents(ctx, pageSize, after)
-		if err != nil {
-			return nil, err
-		}
-		if len(page) == 0 {
-			return out, nil
-		}
-		for _, ev := range page {
-			after = ev.Sequence
-			if ev.OccurredAtNS < startNS || ev.OccurredAtNS > endNS {
-				continue
-			}
-			out = append(out, ev)
-		}
-		if len(page) < pageSize {
-			return out, nil
-		}
-	}
+	return st.EventsInWindow(ctx, startNS, endNS)
 }
 
 type sectionKind int
@@ -297,6 +285,7 @@ func entryOf(section sectionKind, item store.Item, ev store.Event) (Entry, bool)
 			return Entry{}, false
 		}
 		entry.Reason, entry.ReasonText = reasonFromEvent(ev)
+		fillReview(&entry, ev)
 	case sectionObserved:
 		if item.State != domain.StateQuarantined {
 			// Restored, held or already cleared: it is no longer waiting.
@@ -304,6 +293,7 @@ func entryOf(section sectionKind, item store.Item, ev store.Event) (Entry, bool)
 		}
 		entry.PurgeAfterNS = item.PurgeNotBeforeNS
 		entry.Reason, entry.ReasonText = reasonFromEvent(ev)
+		fillReview(&entry, ev)
 	case sectionKept:
 		entry.Reason, entry.ReasonText, entry.ModelFailed = keepReason(ev)
 		entry.ReviewState = reviewStateOf(entry.Reason)
@@ -440,6 +430,25 @@ func explanationOf(ev store.Event) *review.Explanation {
 		return nil
 	}
 	return body.Explanation
+}
+
+func reviewSettlementFacts(events []store.Event) map[string]reviewFacts {
+	out := map[string]reviewFacts{}
+	for _, ev := range events {
+		if ev.Action != "review" || ev.Phase != domain.PhaseInfo || ev.ResultJSON == nil {
+			continue
+		}
+		id := reviewIDOf(ev)
+		if id == "" {
+			continue
+		}
+		var f reviewFacts
+		if json.Unmarshal([]byte(*ev.ResultJSON), &f) != nil {
+			continue
+		}
+		out[id] = f
+	}
+	return out
 }
 
 // tallyReviews counts every review of the window once.
@@ -603,7 +612,7 @@ func fillReview(entry *Entry, ev store.Event) {
 	var payload struct {
 		Review struct {
 			Failure    string `json:"failure"`
-			Attempts   int    `json:"http_attempts"`
+			Attempts   *int   `json:"http_attempts"`
 			CostStatus string `json:"cost_status"`
 		} `json:"review"`
 	}
@@ -611,7 +620,10 @@ func fillReview(entry *Entry, ev store.Event) {
 		return
 	}
 	entry.Failure = payload.Review.Failure
-	entry.Attempts = payload.Review.Attempts
+	if payload.Review.Attempts != nil {
+		v := *payload.Review.Attempts
+		entry.Attempts = &v
+	}
 	entry.CostStatus = payload.Review.CostStatus
 }
 

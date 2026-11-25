@@ -3,8 +3,6 @@ package execute
 import (
 	"context"
 	"path/filepath"
-	"sync"
-	"time"
 
 	"dustkeeper/internal/assess"
 	"dustkeeper/internal/domain"
@@ -27,67 +25,6 @@ import (
 
 // OpenFilesFunc reports which files under one tree a visible process holds open.
 type OpenFilesFunc func(ctx context.Context, root string) (assess.OpenObservation, error)
-
-// OpenFiles is the probe used for a candidate's open-file fact. A nil field
-// means the production probe; a test that has its own deterministic answer sets
-// it instead, which is the same seam the clock and the review function use.
-
-// openFilesTTL is how long one probe answer is reused.
-//
-// The probe is a snapshot of the process table at one instant, not a live
-// subscription, and it costs about a second. A run of fifty candidates used to
-// mean fifty snapshots; one per minute says the same thing about the tree
-// without that cost.
-//
-// The window is a plain limitation and is stated as one: a file that a process
-// opens after the snapshot is not in it. The identity, size and content checks
-// at the moment of the action catch a file that is *changed*, and they do not
-// catch a file that was merely opened for reading - opening does not alter any
-// of the three. So the answer this cache carries is "no visible process held
-// anything in this tree open at the moment of the snapshot", and it should not
-// be read as a guarantee about the minute that follows.
-const openFilesTTL = 60 * time.Second
-
-type openFilesEntry struct {
-	at  time.Time
-	obs assess.OpenObservation
-	err error
-}
-
-var (
-	openFilesMu    sync.Mutex
-	openFilesCache = map[string]openFilesEntry{}
-)
-
-// probeOpen answers "is anything under this tree open", using the injected
-// probe when there is one and a cached snapshot otherwise.
-func (e *Executor) probeOpen(ctx context.Context, sc *ScopeCtx) (assess.OpenObservation, error) {
-	root := sc.Root.Path()
-	if e.OpenFiles != nil {
-		return e.OpenFiles(ctx, root)
-	}
-	openFilesMu.Lock()
-	if entry, ok := openFilesCache[root]; ok && time.Since(entry.at) < openFilesTTL {
-		openFilesMu.Unlock()
-		return entry.obs, entry.err
-	}
-	openFilesMu.Unlock()
-
-	obs := assess.ProbeOpenUnder(ctx, root, nil)
-	var err error
-
-	openFilesMu.Lock()
-	if len(openFilesCache) > 64 {
-		// The cache is keyed by tree and lives as long as the process; a
-		// scheduled installation starts a new one every run, but a long-lived
-		// test binary does not, so it is bounded rather than trusted to stay
-		// small.
-		openFilesCache = map[string]openFilesEntry{}
-	}
-	openFilesCache[root] = openFilesEntry{at: time.Now(), obs: obs, err: err}
-	openFilesMu.Unlock()
-	return obs, err
-}
 
 // candidateFacts is the measured half of the decision for one item.
 type candidateFacts struct {
@@ -169,15 +106,23 @@ func (e *Executor) parentUnchanged(sc *ScopeCtx, it store.Item) (bool, bool) {
 // pathOpen reports whether a visible process holds this exact path open, and
 // whether that could be established at all.
 //
-// A partial listing is not an answer to "this file is not open": the file may be
-// in the part that was truncated. Only a complete listing, or a listing that
-// names the file, decides the question.
+// When a test injects OpenFiles, that tree-scoped seam is consulted as before.
+// In production each candidate is probed directly via assess.ProbeOpenPath so
+// large directory trees never hit `lsof +D`'s tree-walk timeout or 256 KiB cap.
 func (e *Executor) pathOpen(ctx context.Context, sc *ScopeCtx, it store.Item) (open, measured bool) {
-	obs, err := e.probeOpen(ctx, sc)
-	if err != nil {
-		return false, false
-	}
 	key := filepath.Clean(filepath.Join(sc.Root.Path(), string(it.RawRelative)))
+	var (
+		obs assess.OpenObservation
+		err error
+	)
+	if e.OpenFiles != nil {
+		obs, err = e.OpenFiles(ctx, sc.Root.Path())
+		if err != nil {
+			return false, false
+		}
+	} else {
+		obs = assess.ProbeOpenPath(ctx, key, nil)
+	}
 	if obs.Paths[key] {
 		return true, true
 	}

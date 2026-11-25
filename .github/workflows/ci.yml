@@ -64,6 +64,9 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      - name: python scripts test
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
       # test/eval skips without DUSTKEEPER_EVAL_BASE_URL, so no network call and
       # no credential is needed here.
       - name: test

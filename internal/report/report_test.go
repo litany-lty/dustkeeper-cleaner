@@ -375,3 +375,74 @@ func TestCollectCorrelatesTimingsByReviewID(t *testing.T) {
 		t.Fatal("an old event without timings produced a fabricated row")
 	}
 }
+
+func TestO04CollectPreservesReasonsReviewIDsAndZeroAttempts(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ctx := context.Background()
+	scopeID := domain.ScopeID("scope-o04")
+	if err := st.InsertScope(ctx, store.Scope{
+		ID: scopeID, RawRoot: []byte("/tmp/scope-o04"),
+		RootIdentityJSON: `{"persistent":{"inode":1}}`, InstanceID: "inst-o04",
+		Kind: domain.KindManagedDisposable, Generation: 1, ProtectionRevision: 1,
+		Status: domain.ScopeActive, ScanEpoch: 0, CreatedAtNS: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	itDel := domain.ItemID("itm-del")
+	itObs := domain.ItemID("itm-obs")
+	itZero := domain.ItemID("itm-zero")
+	if err := st.InsertPlan(ctx, store.Plan{
+		ID: domain.PlanID("plan-o04"), Kind: domain.PlanScheduledRule, HeaderJSON: `{}`,
+		Digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		Status: domain.PlanReady, CreatedAtNS: 1, ExpiresAtNS: 1 << 60,
+	}, []store.Item{
+		{ID: itDel, Ordinal: 0, ScopeID: scopeID, RawRelative: []byte("a.tmp"), ObjectName: "obj-del", Reason: domain.ReasonLifecycle, SourceKind: domain.SourceScheduledRule, BindingJSON: `{}`, SourceParentIdentityJSON: `{}`, PreIdentityJSON: `{"inode":1}`, PreTokenJSON: `{"size":10}`, BoundRetentionSeconds: 604800, State: domain.StatePurged},
+		{ID: itObs, Ordinal: 1, ScopeID: scopeID, RawRelative: []byte("b.zip"), ObjectName: "obj-obs", Reason: domain.ReasonLifecycle, SourceKind: domain.SourceScheduledRule, BindingJSON: `{}`, SourceParentIdentityJSON: `{}`, PreIdentityJSON: `{"inode":2}`, PreTokenJSON: `{"size":20}`, BoundRetentionSeconds: 604800, State: domain.StateQuarantined},
+		{ID: itZero, Ordinal: 2, ScopeID: scopeID, RawRelative: []byte("c.zip"), ObjectName: "obj-zero", Reason: domain.ReasonLifecycle, SourceKind: domain.SourceScheduledRule, BindingJSON: `{}`, SourceParentIdentityJSON: `{}`, PreIdentityJSON: `{"inode":3}`, PreTokenJSON: `{"size":30}`, BoundRetentionSeconds: 604800, State: domain.StatePlanned},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	delSettle := `{"review_id":"rev-del","verdict":"allow","attempts":2,"cost_status":"usage_recorded"}`
+	delComp := `{"source":"observed","reason":"dual_review_agrees","review_id":"rev-del"}`
+	obsSettle := `{"review_id":"rev-obs","verdict":"allow","attempts":2,"cost_status":"usage_recorded"}`
+	obsComp := `{"source":"observed","reason":"safe_to_observe","review_id":"rev-obs"}`
+	zeroKeep := `{"review_id":"rev-zero","reason":"not_started_budget","review":{"http_attempts":0,"cost_status":"not_sent"}}`
+	for _, ev := range []store.Event{
+		{EventID: "ev-d1", ItemID: &itDel, Action: "review", Phase: domain.PhaseInfo, OccurredAtNS: 10, ContractJSON: `{"review_id":"rev-del"}`, ResultJSON: &delSettle},
+		{EventID: "ev-d2", ItemID: &itDel, Action: domain.ActionDelete, Phase: domain.PhaseComplete, OccurredAtNS: 20, ContractJSON: `{}`, ResultJSON: &delComp},
+		{EventID: "ev-o1", ItemID: &itObs, Action: "review", Phase: domain.PhaseInfo, OccurredAtNS: 30, ContractJSON: `{"review_id":"rev-obs"}`, ResultJSON: &obsSettle},
+		{EventID: "ev-o2", ItemID: &itObs, Action: "quarantine", Phase: domain.PhaseComplete, OccurredAtNS: 40, ContractJSON: `{}`, ResultJSON: &obsComp},
+		{EventID: "ev-z1", ItemID: &itZero, Action: "keep", Phase: domain.PhaseInfo, OccurredAtNS: 50, ContractJSON: `{}`, ResultJSON: &zeroKeep},
+	} {
+		if err := st.AppendEvent(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := Collect(ctx, st, Window{StartNS: 0, EndNS: 100, RunID: "run-o04"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Deleted.Total != 1 || page.Observed.Total != 1 || page.Kept.Total != 1 {
+		t.Fatalf("unexpected section counts: %+v", page)
+	}
+	d := page.Deleted.Entries[0]
+	o := page.Observed.Entries[0]
+	k := page.Kept.Entries[0]
+	if d.ReviewID != "rev-del" || d.Attempts == nil || *d.Attempts != 2 || d.CostStatus != "usage_recorded" {
+		t.Fatalf("deleted entry lost settlement facts: %+v", d)
+	}
+	if o.ReviewID != "rev-obs" || o.Reason != "safe_to_observe" || o.Attempts == nil || *o.Attempts != 2 {
+		t.Fatalf("observed entry lost reason or settlement facts: %+v", o)
+	}
+	if k.Attempts == nil || *k.Attempts != 0 {
+		t.Fatalf("zero-attempt keep omitted http_attempts=0: %+v", k)
+	}
+	raw, _ := json.Marshal(page)
+	if !strings.Contains(string(raw), `"http_attempts":0`) || !strings.Contains(string(raw), `"http_attempts":2`) {
+		t.Fatalf("marshaled page missing explicit http_attempts=0 or 2:\n%s", string(raw))
+	}
+}

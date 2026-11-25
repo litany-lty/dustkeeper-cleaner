@@ -139,3 +139,23 @@ func exitedWith(code int) *os.ProcessState {
 	_ = cmd.Run()
 	return cmd.ProcessState
 }
+
+func TestProbeOpenPathTargetsSingleFile(t *testing.T) {
+	target := t.TempDir() + "/sample.zip"
+	var gotArgs []string
+	obs := ProbeOpenPath(context.Background(), target, func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		gotArgs = append([]string(nil), args...)
+		return []byte("p123\x00n" + target + "\x00"), nil
+	})
+	if obs.Coverage != "visible_processes_only" || !obs.Paths[target] {
+		t.Fatalf("unexpected open observation: %+v", obs)
+	}
+	for _, a := range gotArgs {
+		if a == "+D" {
+			t.Fatalf("ProbeOpenPath must not walk whole directory with +D: %v", gotArgs)
+		}
+	}
+	if ok, detail := ProbeOpenAvailable(); !ok || detail == "" {
+		t.Fatalf("ProbeOpenAvailable() = (%v, %q), want available on test host", ok, detail)
+	}
+}

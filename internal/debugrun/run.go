@@ -90,7 +90,11 @@ func Run(ctx context.Context, opt Options) (Report, error) {
 	defer cancel()
 	process := assess.OpenObservation{Coverage: "not_requested", Paths: map[string]bool{}}
 	if opt.OpenFiles {
-		process = assess.ProbeOpenFiles(ctx, opt.Root, nil)
+		probeRoot := opt.Root
+		if resolved, rerr := filepath.EvalSymlinks(opt.Root); rerr == nil {
+			probeRoot = resolved
+		}
+		process = assess.ProbeOpenUnder(ctx, probeRoot, nil)
 	}
 	scan, err := assess.Scan(ctx, opt.Root, assess.Options{Now: opt.Now, Days: opt.Days, MaxEntries: opt.MaxEntries, ReferencePaths: opt.References, OpenPaths: process.Paths, ProcessCoverage: process.Coverage})
 	for i := range scan.Files {

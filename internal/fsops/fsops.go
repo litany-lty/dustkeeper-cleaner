@@ -145,6 +145,7 @@ type Root struct {
 	path   string
 	dev    uint64
 	ino    uint64
+	volID  string
 	mu     sync.Mutex
 	closed bool
 }
@@ -170,12 +171,14 @@ func OpenRoot(p string) (*Root, error) {
 	if err := unix.SetNonblock(fd, false); err == nil {
 		// directories are never in non-blocking mode; ignore
 	}
+	dev := devOf(&st)
 	return &Root{
-		f:    os.NewFile(uintptr(fd), p),
-		fd:   fd,
-		path: p,
-		dev:  devOf(&st),
-		ino:  uint64(st.Ino),
+		f:     os.NewFile(uintptr(fd), p),
+		fd:    fd,
+		path:  p,
+		dev:   dev,
+		ino:   uint64(st.Ino),
+		volID: volumeIDOfFD(fd, dev),
 	}, nil
 }
 
@@ -206,7 +209,7 @@ func (r *Root) Stat() (domain.FileIdentity, domain.ChangeToken, error) {
 	if err := unix.Fstat(r.fd, &st); err != nil {
 		return domain.FileIdentity{}, domain.ChangeToken{}, fmt.Errorf("fsops: stat root: %w", err)
 	}
-	return identityOf(&st), tokenOf(&st, ""), nil
+	return identityOfFD(r.fd, &st), tokenOf(&st, ""), nil
 }
 
 // Identity builds the two-layer root identity.
@@ -235,9 +238,10 @@ func (r *Root) Identity() (domain.RootIdentity, error) {
 	if g, ok := generationOf(&st); ok {
 		gen = &g
 	}
+	dev := devOf(&st)
 	return domain.RootIdentity{
 		Persistent: domain.PersistentRootIdentity{
-			VolumeID:    fmt.Sprintf("dev-%d", devOf(&st)),
+			VolumeID:    volumeIDOfFD(r.fd, dev),
 			Inode:       st.Ino,
 			BirthTimeNS: birth,
 			Generation:  gen,
@@ -246,7 +250,7 @@ func (r *Root) Identity() (domain.RootIdentity, error) {
 		},
 		Runtime: domain.RuntimeMountIdentity{
 			BootOrRunID: boot,
-			Device:      devOf(&st),
+			Device:      dev,
 			MountID:     mountID,
 		},
 	}, nil
@@ -273,6 +277,8 @@ type Dir struct {
 	f      *os.File
 	fd     int
 	rel    string
+	dev    uint64
+	volID  string
 	mu     sync.Mutex
 	closed bool
 }
@@ -301,7 +307,7 @@ func (d *Dir) Stat() (domain.FileIdentity, domain.ChangeToken, error) {
 	if err := unix.Fstat(d.fd, &st); err != nil {
 		return domain.FileIdentity{}, domain.ChangeToken{}, fmt.Errorf("fsops: stat dir: %w", err)
 	}
-	return identityOf(&st), tokenOf(&st, ""), nil
+	return identityOfFD(d.fd, &st), tokenOf(&st, ""), nil
 }
 
 // Readdir enumerates up to n entries. The caller must treat a directory listing
@@ -325,7 +331,13 @@ func (r *Root) OpenDir(rel []byte) (*Dir, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Dir{f: os.NewFile(uintptr(child), path.Join(r.path, string(rel))), fd: child, rel: string(rel)}, nil
+	return &Dir{
+		f:     os.NewFile(uintptr(child), path.Join(r.path, string(rel))),
+		fd:    child,
+		rel:   string(rel),
+		dev:   r.dev,
+		volID: r.volID,
+	}, nil
 }
 
 // openRoot opens an independent descriptor for enumerating the root.
@@ -356,17 +368,19 @@ func (r *Root) openRoot() (*Dir, error) {
 		return nil, fmt.Errorf("%w: %q is dev %d ino %d, expected dev %d ino %d",
 			ErrRootChanged, r.path, devOf(&st), uint64(st.Ino), r.dev, r.ino)
 	}
-	return &Dir{f: os.NewFile(uintptr(fd), r.path), fd: fd, rel: "."}, nil
+	return &Dir{f: os.NewFile(uintptr(fd), r.path), fd: fd, rel: ".", dev: r.dev, volID: r.volID}, nil
 }
 
 // Parent is a verified parent directory plus one validated entry name.
 type Parent struct {
-	f    *os.File
-	fd   int
-	name string
-	rel  string
-	mu   sync.Mutex
-	done bool
+	f     *os.File
+	fd    int
+	name  string
+	rel   string
+	dev   uint64
+	volID string
+	mu    sync.Mutex
+	done  bool
 }
 
 // DirFD implements DirFD.
@@ -396,7 +410,7 @@ func (p *Parent) Stat() (domain.FileIdentity, domain.ChangeToken, error) {
 	if err := unix.Fstat(p.fd, &st); err != nil {
 		return domain.FileIdentity{}, domain.ChangeToken{}, fmt.Errorf("fsops: stat parent: %w", err)
 	}
-	return identityOf(&st), tokenOf(&st, ""), nil
+	return identityOfFD(p.fd, &st), tokenOf(&st, ""), nil
 }
 
 // OpenParent resolves rel down to its parent directory and returns the last
@@ -423,7 +437,7 @@ func (r *Root) OpenParent(rel []byte) (*Parent, error) {
 			return nil, err
 		}
 	}
-	return &Parent{f: os.NewFile(uintptr(fd), r.path), fd: fd, name: name, rel: string(rel)}, nil
+	return &Parent{f: os.NewFile(uintptr(fd), r.path), fd: fd, name: name, rel: string(rel), dev: r.dev, volID: r.volID}, nil
 }
 
 // File is an open regular file plus its identity at open time.
@@ -445,7 +459,7 @@ func (f *File) Stat() (domain.FileIdentity, domain.ChangeToken, error) {
 	if err := unix.Fstat(f.fd, &st); err != nil {
 		return domain.FileIdentity{}, domain.ChangeToken{}, fmt.Errorf("fsops: stat file: %w", err)
 	}
-	return identityOf(&st), tokenOf(&st, ""), nil
+	return identityOfFD(f.fd, &st), tokenOf(&st, ""), nil
 }
 
 // Read reads from the descriptor.
@@ -498,7 +512,7 @@ func OpenRegularAt(p *Parent, rootDev uint64) (*File, error) {
 	return &File{
 		f:        os.NewFile(uintptr(fd), p.name),
 		fd:       fd,
-		Identity: identityOf(&st),
+		Identity: identityOfFD(fd, &st),
 		Token:    tokenOf(&st, ""),
 	}, nil
 }
@@ -510,7 +524,7 @@ func (p *Parent) StatAtNoFollow() (domain.FileIdentity, domain.ChangeToken, erro
 	if err := unix.Fstatat(p.fd, p.name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return domain.FileIdentity{}, domain.ChangeToken{}, err
 	}
-	return identityOf(&st), tokenOf(&st, ""), nil
+	return identityWithVolume(&st, p.volID, p.dev), tokenOf(&st, ""), nil
 }
 
 // MkdirAll creates each missing component under the root with perm, refusing to
@@ -697,14 +711,21 @@ func Barrier(anchorFD int, marker []byte) error {
 // symlink. The entry name is validated first; a name with a separator can never
 // reach the syscall.
 func (d *Dir) StatEntry(name string) (domain.FileIdentity, domain.ChangeToken, error) {
+	id, tok, _, err := d.StatEntryWithBlocked(name)
+	return id, tok, err
+}
+
+// StatEntryWithBlocked returns the identity, change token, and whether native
+// filesystem flags prevent moving or reading the entry safely.
+func (d *Dir) StatEntryWithBlocked(name string) (domain.FileIdentity, domain.ChangeToken, bool, error) {
 	if err := ValidateName(name); err != nil {
-		return domain.FileIdentity{}, domain.ChangeToken{}, err
+		return domain.FileIdentity{}, domain.ChangeToken{}, false, err
 	}
 	var st unix.Stat_t
 	if err := unix.Fstatat(d.fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return domain.FileIdentity{}, domain.ChangeToken{}, err
+		return domain.FileIdentity{}, domain.ChangeToken{}, false, err
 	}
-	return identityOf(&st), tokenOf(&st, ""), nil
+	return identityWithVolume(&st, d.volID, d.dev), tokenOf(&st, ""), entryBlockedByFlags(&st), nil
 }
 
 // Dev returns the device of the directory, used for the cross-mount check.
@@ -738,7 +759,7 @@ func (r *Root) OpenFileRW(rel []byte) (*File, error) {
 		unix.Close(fd)
 		return nil, fmt.Errorf("%w: %q is %s", ErrNotRegular, p.name, kindOf(&st))
 	}
-	return &File{f: os.NewFile(uintptr(fd), p.name), fd: fd, Identity: identityOf(&st), Token: tokenOf(&st, "")}, nil
+	return &File{f: os.NewFile(uintptr(fd), p.name), fd: fd, Identity: identityOfFD(fd, &st), Token: tokenOf(&st, "")}, nil
 }
 
 // Write writes at the current offset.
@@ -762,5 +783,5 @@ func (d *Dir) ParentOf(name string) (*Parent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fsops: dup dir: %w", err)
 	}
-	return &Parent{f: os.NewFile(uintptr(fd), name), fd: fd, name: name, rel: path.Join(d.rel, name)}, nil
+	return &Parent{f: os.NewFile(uintptr(fd), name), fd: fd, name: name, rel: path.Join(d.rel, name), dev: d.dev, volID: d.volID}, nil
 }

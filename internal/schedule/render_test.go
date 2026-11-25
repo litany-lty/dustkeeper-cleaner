@@ -87,6 +87,9 @@ func TestDarwinTemplateEscapesXML(t *testing.T) {
 	if !strings.Contains(plist, "<string>run</string>") {
 		t.Error("ProgramArguments should be an array with one argument per string")
 	}
+	if !strings.Contains(plist, "<key>Umask</key>\n  <integer>63</integer>") {
+		t.Error("Darwin LaunchAgent plist must set Umask 0077 (63) for private logs")
+	}
 }
 
 func TestValidation(t *testing.T) {

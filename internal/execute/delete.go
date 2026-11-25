@@ -310,7 +310,11 @@ func (e *Executor) deleteDirect(ctx context.Context, sc *ScopeCtx, p store.Plan,
 	}
 	resultJSON := `{"source":"observed","path_removed":true,"captured_then_unlinked":true,"content_hash":` +
 		quoteJSON(string(postEv.Content)) + `,"size_bytes":` + jsonInt(postEv.Token.Size) +
-		`,"reason":` + quoteJSON(outcome.Reason) + `}`
+		`,"reason":` + quoteJSON(outcome.Reason)
+	if outcome.ReviewID != "" {
+		resultJSON += `,"review_id":` + quoteJSON(outcome.ReviewID)
+	}
+	resultJSON += `}`
 	if err := e.Store.CompletePurge(ctx, intent, resultJSON); err != nil {
 		return res, err
 	}

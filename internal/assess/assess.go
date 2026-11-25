@@ -30,6 +30,8 @@ type Facts struct {
 	KnownReference       bool      `json:"known_reference"`
 	TemporaryOrigin      string    `json:"temporary_origin,omitempty"`
 	Protected            bool      `json:"protected"`
+	Immutable            bool      `json:"immutable,omitempty"`
+	CloudDataless        bool      `json:"cloud_dataless,omitempty"`
 	OwnerConfirmedUnused bool      `json:"owner_confirmed_unused,omitempty"`
 }
 type Result struct {
@@ -69,7 +71,15 @@ func assess(f Facts, days int, now time.Time, advisory bool) Result {
 	for _, check := range []struct {
 		hit bool
 		why string
-	}{{!f.Regular, "not_regular"}, {f.NLink != 1, "link_count_not_one"}, {f.Protected, "explicit_protection"}, {f.OpenByProcess, "open_by_visible_process"}, {f.KnownReference, "known_reference"}} {
+	}{
+		{!f.Regular, "not_regular"},
+		{f.NLink != 1, "link_count_not_one"},
+		{f.Protected, "explicit_protection"},
+		{f.Immutable, "immutable_or_append_only"},
+		{f.CloudDataless, "cloud_dataless_placeholder"},
+		{f.OpenByProcess, "open_by_visible_process"},
+		{f.KnownReference, "known_reference"},
+	} {
 		if check.hit {
 			r.Disposition = "keep"
 			r.Reasons = append(r.Reasons, check.why)

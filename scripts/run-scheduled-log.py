@@ -16,6 +16,12 @@ from pathlib import Path
 RESERVE_MILLICNY = 10
 REPORT_SCHEMA = 3
 MAX_JSON = 4 << 20
+FUTURE_SKEW_SECONDS = 60
+ENVIRONMENTAL_ZERO_COST_EXITS = {
+    (3, "INSTANCE_BUSY"),
+    (6, "CLOCK_UNTRUSTED"),
+    (7, "DISK_PRESSURE"),
+}
 
 
 class Refused(Exception):
@@ -80,12 +86,42 @@ def _ledger(path):
     return data
 
 
+def _positive_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise Refused("ledger field %s must be a positive integer" % name)
+    return value
+
+
+def _ledger_limits(ledger):
+    defaults = {
+        "max_candidates": 1,
+        "batch_max_candidates": 1,
+        "batch_max_attempts": 2,
+        "reserve_millicny": RESERVE_MILLICNY,
+    }
+    raw = ledger.get("limits")
+    if raw is None:
+        return defaults
+    if not isinstance(raw, dict):
+        raise Refused("ledger field limits is invalid")
+    out = dict(defaults)
+    for key in defaults:
+        if key in raw:
+            out[key] = _positive_int(raw[key], "limits.%s" % key)
+    return out
+
+
 def _validate_instance(root, ledger):
     config = _read_json(root / "config/config.json")
     review = config.get("review")
     if not isinstance(review, dict):
         raise Refused("dual review is not configured")
-    expected = {"max_candidates": 1, "batch_max_candidates": 1, "batch_max_attempts": 2}
+    limits = _ledger_limits(ledger)
+    expected = {
+        "max_candidates": limits["max_candidates"],
+        "batch_max_candidates": limits["batch_max_candidates"],
+        "batch_max_attempts": limits["batch_max_attempts"],
+    }
     if any(review.get(k) != v for k, v in expected.items()):
         raise Refused("review batch limits do not match scheduled approval")
     models = ledger["models"]
@@ -94,17 +130,38 @@ def _validate_instance(root, ledger):
     credentials = _read_json(Path(str(review.get("credentials_file", ""))))
     if not str(credentials.get("typesafe_api_key", "")).strip():
         raise Refused("JEV credential is missing")
-    if not str(credentials.get("minimax_api_key", "")).startswith("sk-cp-"):
+    key_prefix = ledger.get("minimax_key_prefix", "sk-cp-")
+    if not isinstance(key_prefix, str):
+        raise Refused("ledger field minimax_key_prefix is invalid")
+    minimax_key = str(credentials.get("minimax_api_key", "")).strip()
+    if not minimax_key or (key_prefix and not minimax_key.startswith(key_prefix)):
         raise Refused("MiniMax credential is not the approved subscription-key format")
     binary, wrapper = root / "bin/dustkeeper", root / "run-readable-log.py"
     if not binary.is_file() or not os.access(str(binary), os.X_OK) or not wrapper.is_file():
         raise Refused("installed binary or readable-log wrapper is missing")
-    return binary, wrapper
+    return binary, wrapper, limits
 
 
-def _default_runner(cmd, env, timeout):
-    return subprocess.run(cmd, env=env, timeout=timeout, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, universal_newlines=True, check=False)
+def _default_runner(cmd, env, timeout, grace_seconds=30):
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, universal_newlines=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 def _pause(root, binary, runner):
@@ -139,40 +196,53 @@ def _parse_time(value):
         raise Refused("readable receipt time is invalid")
 
 
-def _receipt(path, before, completed, launched_ns):
+def _receipt(path, before, completed, launched_ns, max_attempts=2):
     current = _read_json(path)
-    review = current.get("summary", {}).get("review", {})
+    summary = current.get("summary")
+    review = summary.get("review", {}) if isinstance(summary, dict) else None
     if current.get("schema_version") != REPORT_SCHEMA or not isinstance(review, dict):
         raise Refused("readable receipt schema is invalid")
-    run_id = str(current.get("run_id", ""))
+    raw_run_id = current.get("run_id")
+    if not isinstance(raw_run_id, str) or not raw_run_id.strip():
+        raise Refused("readable receipt run_id is missing")
+    run_id = raw_run_id
     started, ended = current.get("started_at"), current.get("ended_at")
     started_s, ended_s = _parse_time(started), _parse_time(ended)
-    if not run_id or not ended or run_id == before["run_id"] or ended == before["ended_at"] or path.stat().st_mtime_ns <= before["mtime_ns"]:
+    now_s = time.time()
+    if not ended or run_id == before["run_id"] or ended == before["ended_at"] or path.stat().st_mtime_ns <= before["mtime_ns"]:
         raise Refused("readable receipt is not from this round")
-    if started_s < launched_ns / 1000000000.0 - 1 or ended_s < started_s or ended_s < launched_ns / 1000000000.0 - 1:
+    if (started_s < launched_ns / 1000000000.0 - 1 or ended_s < started_s or
+            ended_s < launched_ns / 1000000000.0 - 1 or
+            started_s > now_s + FUTURE_SKEW_SECONDS or ended_s > now_s + FUTURE_SKEW_SECONDS):
         raise Refused("readable receipt time is outside this round")
     exit_code = current.get("exit")
     attempts = review.get("http_attempts")
-    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0 or attempts > 2:
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0 or attempts > max_attempts:
         raise Refused("HTTP attempt count is missing or exceeds the approved batch")
     bad = ("review_failed", "unknown_held", "cost_unknown", "facts_unknown")
     if any(name not in review or isinstance(review.get(name), bool) or
            not isinstance(review.get(name), int) or review.get(name) != 0 for name in bad):
         raise Refused("review receipt contains an unresolved or unknown result")
-    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code not in (0, 9) or completed.returncode != exit_code:
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or completed.returncode != exit_code:
+        raise Refused("run did not finish with an accepted receipt")
+    code = str(current.get("code", ""))
+    if attempts == 0 and (exit_code, code) in ENVIRONMENTAL_ZERO_COST_EXITS:
+        return current, 0, code
+    if exit_code not in (0, 9):
         raise Refused("run did not finish with an accepted receipt")
     if exit_code == 9:
-        summary = current["summary"]
         not_started = review.get("not_started")
-        if (current.get("code") not in ("BUDGET_EXHAUSTED", "PARTIAL") or
+        scopes = summary.get("scopes")
+        if (code not in ("BUDGET_EXHAUSTED", "PARTIAL") or
                 type(not_started) is not int or not_started < 1 or
-                any(row.get("failure_code", "") not in ("", "BUDGET_EXHAUSTED")
-                    for row in summary.get("scopes", []))):
+                not isinstance(scopes, list) or len(scopes) == 0 or
+                any(not isinstance(row, dict) or row.get("failure_code", "") not in ("", "BUDGET_EXHAUSTED")
+                    for row in scopes)):
             raise Refused("partial run was not solely a bounded review-budget stop")
     reviewed = review.get("reviewed")
     if attempts > 0 and (isinstance(reviewed, bool) or not isinstance(reviewed, int) or reviewed < 1):
         raise Refused("model usage or review settlement is missing")
-    return current, attempts
+    return current, attempts, None
 
 
 def run_once(instance_root, runner=None):
@@ -190,7 +260,8 @@ def run_once(instance_root, runner=None):
         ledger_path = root / "automation-budget.json"
         binary = root / "bin/dustkeeper"
         ledger = _ledger(ledger_path)
-        binary, wrapper = _validate_instance(root, ledger)
+        binary, wrapper, limits = _validate_instance(root, ledger)
+        reserve = limits["reserve_millicny"]
         if (root / "state/pause.request").exists():
             print("REFUSED: instance is already paused")
             return 2
@@ -199,14 +270,14 @@ def run_once(instance_root, runner=None):
             _atomic_json(ledger_path, ledger)
             print("REFUSED: previous round is pending; pause_confirmed=%s" % ledger["pending"]["pause_confirmed"])
             return 3 if ledger["pending"]["pause_confirmed"] else 6
-        if ledger["used_millicny"] + RESERVE_MILLICNY > ledger["limit_millicny"]:
+        if ledger["used_millicny"] + reserve > ledger["limit_millicny"]:
             paused = _pause(root, binary, runner)
             print("REFUSED: automation budget exhausted; pause_confirmed=%s" % paused)
             return 4 if paused else 6
         report = root / "readable-reports/latest-readable.json"
         before = _snapshot(report)
-        ledger["used_millicny"] += RESERVE_MILLICNY
-        ledger["pending"] = {"reserved_millicny": RESERVE_MILLICNY, "started_ns": _now_ns(),
+        ledger["used_millicny"] += reserve
+        ledger["pending"] = {"reserved_millicny": reserve, "started_ns": _now_ns(),
                              "previous_run_id": before["run_id"]}
         _atomic_json(ledger_path, ledger)
         env = dict(os.environ, DUSTKEEPER_CONFIG_DIR=str(root / "config"),
@@ -215,7 +286,10 @@ def run_once(instance_root, runner=None):
                str(root / "readable-reports"), "--disk-path", "/", "--timeout-seconds", "900"]
         try:
             completed = runner(cmd, env, 960)
-            receipt, attempts = _receipt(report, before, completed, ledger["pending"]["started_ns"])
+            receipt, attempts, env_skip = _receipt(
+                report, before, completed, ledger["pending"]["started_ns"],
+                max_attempts=limits["batch_max_attempts"],
+            )
         except Exception as error:
             ledger = _ledger(ledger_path)
             ledger["pending"]["failure"] = type(error).__name__
@@ -225,16 +299,28 @@ def run_once(instance_root, runner=None):
             return 5 if ledger["pending"]["pause_confirmed"] else 6
         ledger = _ledger(ledger_path)
         if attempts == 0:
-            ledger["used_millicny"] -= RESERVE_MILLICNY
+            ledger["used_millicny"] -= reserve
         ledger["rounds"] += 1
         ledger["http_attempts"] += attempts
-        ledger["history"] = (ledger["history"] + [{"run_id": receipt["run_id"],
-            "ended_at": receipt["ended_at"], "exit": receipt["exit"], "http_attempts": attempts,
-            "reserved_millicny": 0 if attempts == 0 else RESERVE_MILLICNY}])[-10:]
+        entry = {
+            "run_id": receipt["run_id"],
+            "ended_at": receipt["ended_at"],
+            "exit": receipt["exit"],
+            "http_attempts": attempts,
+            "reserved_millicny": 0 if attempts == 0 else reserve,
+        }
+        if env_skip is not None:
+            entry["environmental_skip"] = env_skip
+        ledger["history"] = (ledger["history"] + [entry])[-10:]
         ledger["pending"] = None
         _atomic_json(ledger_path, ledger)
+        if env_skip is not None:
+            print(json.dumps({"status": "skipped", "code": env_skip, "run_id": receipt["run_id"],
+                              "exit": receipt["exit"], "http_attempts": 0, "reserved_millicny": 0},
+                             separators=(",", ":")))
+            return int(receipt["exit"])
         print(json.dumps({"status": "ok", "run_id": receipt["run_id"], "exit": receipt["exit"],
-                          "http_attempts": attempts, "reserved_millicny": 0 if attempts == 0 else RESERVE_MILLICNY},
+                          "http_attempts": attempts, "reserved_millicny": 0 if attempts == 0 else reserve},
                          separators=(",", ":")))
         return 0
     except Refused as error:

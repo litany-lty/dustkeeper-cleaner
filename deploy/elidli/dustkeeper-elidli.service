@@ -2,16 +2,22 @@
 Description=Dustkeeper bounded automatic cleanup with readable logs
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=!/var/lib/dustkeeper-elidli/state/pause.request
+# Do not silently mask pauses via ConditionPathExists: letting run-scheduled-log.py
+# observe pause.request emits an explicit journal refusal so operators notice.
 
 [Service]
 Type=oneshot
-User=root
+# Run as a dedicated unprivileged account that owns /var/lib/dustkeeper-elidli
+# and the managed scope directories (migrate ownership before switching live hosts).
+User=dustkeeper
+Group=dustkeeper
 WorkingDirectory=/var/lib/dustkeeper-elidli
 Environment=DUSTKEEPER_CONFIG_DIR=/var/lib/dustkeeper-elidli/config
 Environment=DUSTKEEPER_STATE_DIR=/var/lib/dustkeeper-elidli/state
 ExecStart=/usr/bin/python3 /var/lib/dustkeeper-elidli/run-scheduled-log.py --instance-root /var/lib/dustkeeper-elidli
-TimeoutStartSec=1050
+TimeoutStartSec=1200
+KillSignal=SIGTERM
+TimeoutStopSec=60
 Nice=10
 IOSchedulingClass=idle
 UMask=0077

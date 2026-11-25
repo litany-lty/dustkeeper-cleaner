@@ -620,7 +620,7 @@ func purgeApply(ctx context.Context, a *app, args []string) (output, error) {
 		// is not evidence that the wall clock is coherent. Retention is proven
 		// from the recorded quarantine instant, so the same clock assertion the
 		// background path uses applies here too.
-		trust := clocktrust.Start(a.store, a.clock)
+		trust := clocktrust.StartWithMaxGap(a.store, a.clock, a.cfg.Runtime.ClockMaxGap())
 		res, err := exec.ApplyPurgePlan(ctx, sctx, p.ID, domain.Digest(*digest), budget, trust.Assert)
 		if err != nil {
 			return output{}, err

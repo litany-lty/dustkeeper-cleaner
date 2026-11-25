@@ -530,8 +530,16 @@ func (j *HTTPJudge) reviewJEV(ctx context.Context, facts []byte, action actionDe
 		var v TokenUsage
 		presence, inspectErr := strictjson.Inspect(response.Usage)
 		fields := []strictjson.Field{{Path: "input_tokens", Only: []strictjson.Shape{strictjson.ShapeScalar}}, {Path: "output_tokens", Only: []strictjson.Shape{strictjson.ShapeScalar}}}
-		if inspectErr != nil || strictjson.Require(presence, fields) != nil || strictjson.Allow(presence, fields) != nil {
-			return jevResult{}, errors.New("JEV usage is incomplete or ambiguous")
+		var shapeErr error
+		if inspectErr != nil {
+			shapeErr = inspectErr
+		} else if err := strictjson.Require(presence, fields); err != nil {
+			shapeErr = err
+		} else if err := strictjson.Allow(presence, fields); err != nil {
+			shapeErr = err
+		}
+		if shapeErr != nil {
+			return jevResult{}, errors.New("JEV usage is incomplete or ambiguous (" + structuralKind(shapeErr) + ")")
 		}
 		if err := strictjson.Unmarshal(response.Usage, &v, strictjson.Defaults()); err != nil || v.InputTokens < 0 || v.OutputTokens < 0 {
 			return jevResult{}, errors.New("JEV usage is invalid")
@@ -724,7 +732,7 @@ func (j *HTTPJudge) reviewMiniMax(ctx context.Context, facts []byte, action acti
 		}
 	}
 	if err := strictjson.Allow(presence, fields); err != nil {
-		return minimaxResult{}, errors.New("MiniMax decision JSON is invalid")
+		return minimaxResult{}, errors.New("MiniMax decision JSON is invalid (" + structuralKind(err) + ")")
 	}
 	if !validMiniMaxDecision(decision.Decision, decision.ReasonCode) {
 		return minimaxResult{}, errors.New("MiniMax decision is unknown or inconsistent")
@@ -744,7 +752,14 @@ func (j *HTTPJudge) reviewMiniMax(ctx context.Context, facts []byte, action acti
 			}
 		}
 		var v TokenUsage
-		if err != nil || invalidOptional || strictjson.Require(presence, required) != nil || strictjson.Allow(presence, allowed) != nil || strictjson.Unmarshal(response.Usage, &v, strictjson.Defaults()) != nil || v.InputTokens < 0 || v.OutputTokens < 0 || v.CacheReadInputTokens < 0 || v.CacheCreationInputTokens < 0 {
+		var allowErr error
+		if err == nil {
+			allowErr = strictjson.Allow(presence, allowed)
+		}
+		if err != nil || invalidOptional || strictjson.Require(presence, required) != nil || allowErr != nil || strictjson.Unmarshal(response.Usage, &v, strictjson.Defaults()) != nil || v.InputTokens < 0 || v.OutputTokens < 0 || v.CacheReadInputTokens < 0 || v.CacheCreationInputTokens < 0 {
+			if allowErr != nil {
+				return minimaxResult{}, errors.New("MiniMax usage is invalid (" + structuralKind(allowErr) + ")")
+			}
 			return minimaxResult{}, errors.New("MiniMax usage is invalid")
 		}
 		for _, count := range v.OutputTokensDetails {
@@ -766,14 +781,18 @@ func validMiniMaxMissingEvidence(value string) bool {
 	return false
 }
 
+func structuralKind(cause error) string {
+	var structural *strictjson.Error
+	if errors.As(cause, &structural) && structural.Kind != "" {
+		return string(structural.Kind)
+	}
+	return "INVALID"
+}
+
 // Log only known field presence, numeric provider status, and structural kind.
 // Never include raw response text, thinking, or a provider-supplied message.
 func miniMaxEnvelopeError(raw []byte, cause error) error {
-	kind := "INVALID"
-	var structural *strictjson.Error
-	if errors.As(cause, &structural) {
-		kind = string(structural.Kind)
-	}
+	kind := structuralKind(cause)
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(raw, &fields)
 	known := []string{}

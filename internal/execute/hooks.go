@@ -99,6 +99,10 @@ func runPreRenameHook() {
 // for the branch where there is no vault copy to fall back on.
 var TestHookPreUnlink func()
 
+// TestHookDiskStatus, when non-nil, overrides statfsFD in checkQuarantineSpace
+// for deterministic per-scope volume-pressure tests.
+var TestHookDiskStatus func(path string) (free, total uint64, err error)
+
 func runPreUnlinkHook() {
 	if TestHookPreUnlink != nil {
 		TestHookPreUnlink()

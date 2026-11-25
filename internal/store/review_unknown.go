@@ -93,6 +93,31 @@ func (s *Store) OpenReviewUnknown(ctx context.Context, scopeID, pathB64, action 
 	return out, nil
 }
 
+// OpenReviewUnknownForScope returns every unresolved request for scopeID so
+// callers can pre-load holds before iterating observations on one connection.
+func (s *Store) OpenReviewUnknownForScope(ctx context.Context, scopeID string) ([]ReviewUnknown, error) {
+	rows, err := s.read(ctx, `SELECT item_id, action, scope_id, raw_relative_b64, identity_json,
+		token_json, created_ns, attempts, failure, cost_status, resolved_ns, resolution
+		FROM review_unknown WHERE scope_id=? AND resolved_ns IS NULL
+		ORDER BY created_ns DESC`, scopeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReviewUnknown
+	for rows.Next() {
+		u, err := scanReviewUnknown(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.Wrap(errs.CodeDBError, err)
+	}
+	return out, nil
+}
+
 // ListReviewUnknown returns the open requests, newest first, or every request
 // when includeResolved is set.
 func (s *Store) ListReviewUnknown(ctx context.Context, includeResolved bool, limit int) ([]ReviewUnknown, error) {

@@ -147,6 +147,59 @@ func (s *Store) KeepEventsSince(ctx context.Context, sinceNS int64, limit int) (
 	return out, errs.Wrap(errs.CodeDBError, rows.Err())
 }
 
+// KeepEventsForScopeSince returns every keep event recorded at or after sinceNS
+// that belongs to scopeID (or carries no scope_id in legacy records). Unlike
+// KeepEventsSince it does not apply a 500-row cliff that could evict valid keeps.
+func (s *Store) KeepEventsForScopeSince(ctx context.Context, scopeID string, sinceNS int64) ([]Event, error) {
+	rows, err := s.read(ctx, "SELECT "+eventColumns+
+		" FROM events WHERE action='keep' AND occurred_at_ns >= ? ORDER BY occurred_at_ns DESC, sequence DESC",
+		sinceNS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			return nil, errs.Wrap(errs.CodeDBError, err)
+		}
+		if ev.ContractJSON != "" && scopeID != "" {
+			var c struct {
+				ScopeID string `json:"scope_id"`
+			}
+			if json.Unmarshal([]byte(ev.ContractJSON), &c) == nil && c.ScopeID != "" && c.ScopeID != scopeID {
+				continue
+			}
+		}
+		out = append(out, ev)
+	}
+	return out, errs.Wrap(errs.CodeDBError, rows.Err())
+}
+
+// EventsInWindow returns every event whose occurred_at_ns falls within
+// [startNS, endNS], ordered by sequence. Pushing the window predicate into
+// SQLite avoids streaming and decoding the entire historical event log on every
+// report generation while preserving sequence order even across clock jumps.
+func (s *Store) EventsInWindow(ctx context.Context, startNS, endNS int64) ([]Event, error) {
+	rows, err := s.read(ctx, "SELECT "+eventColumns+
+		" FROM events WHERE occurred_at_ns >= ? AND occurred_at_ns <= ? ORDER BY sequence",
+		startNS, endNS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			return nil, errs.Wrap(errs.CodeDBError, err)
+		}
+		out = append(out, ev)
+	}
+	return out, errs.Wrap(errs.CodeDBError, rows.Err())
+}
+
 // PendingOp is an operation whose intent committed but whose outcome is not
 // recorded. Reconciliation works from this list.
 type PendingOp struct {

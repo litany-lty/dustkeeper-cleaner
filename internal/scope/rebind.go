@@ -228,6 +228,9 @@ func (r *Registrar) rebindPreview(ctx context.Context, id domain.ScopeID) (Rebin
 	p.BootChanged = RootBootChanged(old, current)
 	verdict := CompareRootIdentity(old, current)
 	p.Verdict = verdict
+	sameDeviceUpgrade := LegacyVolumeLabel(old.Persistent.VolumeID) &&
+		domain.HasPersistentVolumeID(current.Persistent.VolumeID) &&
+		old.Runtime.Device == current.Runtime.Device
 	switch {
 	case verdict.Changed != "":
 		f.close()
@@ -242,12 +245,12 @@ func (r *Registrar) rebindPreview(ctx context.Context, id domain.ScopeID) (Rebin
 		f.close()
 		return empty, nil, errs.New(errs.CodePlanStale,
 			"scope identity has no runtime relabel to recover; nothing to rebind")
-	case !p.BootChanged:
+	case !p.BootChanged && !sameDeviceUpgrade:
 		f.close()
 		return empty, nil, errs.Newf(errs.CodeScopeChanged,
 			"the volume label changed inside one boot (%s); that is a real mount replacement, not a relabel",
 			verdict.RuntimeRelabeled)
-	case !LegacyVolumeLabel(old.Persistent.VolumeID) || !LegacyVolumeLabel(current.Persistent.VolumeID):
+	case !LegacyVolumeLabel(old.Persistent.VolumeID):
 		f.close()
 		return empty, nil, errs.New(errs.CodeScopeChanged,
 			"only legacy runtime `dev-*` labels can be rebound; a stable volume id change needs a new registration")
@@ -468,7 +471,7 @@ func objectEvidence(f *rebindFacts, it store.Item, old, current domain.RootIdent
 	}
 	// Structured verification of every identity field we are about to remap.
 	for _, raw := range []string{it.SourceParentIdentityJSON, it.PreIdentityJSON, *it.CapturedIdentityJSON} {
-		if _, err := RemapRuntimeLabel(raw, old.Persistent.VolumeID, current.Persistent.VolumeID); err != nil {
+		if _, err := remapIdentityLabel(raw, old.Persistent.VolumeID, current.Persistent.VolumeID, current.Runtime.Device); err != nil {
 			e.UnresolvedReason = "an identity field cannot be structurally remapped: " + err.Error()
 			return e
 		}
@@ -489,6 +492,14 @@ func equalPtr[T comparable](a, b *T) bool {
 // not match the one proven in the preview, is refused instead of being guessed.
 // This is deliberately not a text replacement over the database.
 func RemapRuntimeLabel(raw, oldLabel, newLabel string) (string, error) {
+	newDev, newOK := LegacyDevice(newLabel)
+	if !newOK {
+		return "", errs.New(errs.CodeScopeChanged, "a rebind needs two legacy runtime volume labels")
+	}
+	return remapIdentityLabel(raw, oldLabel, newLabel, newDev)
+}
+
+func remapIdentityLabel(raw, oldLabel, newLabel string, newDev uint64) (string, error) {
 	if raw == "" {
 		return "", errs.New(errs.CodeStateWriteFailed, "an identity field is empty")
 	}
@@ -497,9 +508,8 @@ func RemapRuntimeLabel(raw, oldLabel, newLabel string) (string, error) {
 		return "", errs.Newf(errs.CodeStateWriteFailed, "identity is unreadable: %v", err)
 	}
 	oldDev, oldOK := LegacyDevice(oldLabel)
-	newDev, newOK := LegacyDevice(newLabel)
-	if !oldOK || !newOK {
-		return "", errs.New(errs.CodeScopeChanged, "a rebind needs two legacy runtime volume labels")
+	if !oldOK || newLabel == "" {
+		return "", errs.New(errs.CodeScopeChanged, "a rebind requires a legacy runtime source volume label")
 	}
 	if id.VolumeID != oldLabel || id.Device != oldDev {
 		return "", errs.Newf(errs.CodeScopeChanged,
@@ -621,6 +631,7 @@ func (r *Registrar) commitRebind(ctx context.Context, p RebindPreview, items []s
 	var empty RebindResult
 	oldLabel := p.OldRootIdentity.Persistent.VolumeID
 	newLabel := p.NewRootIdentity.Persistent.VolumeID
+	newDev := p.NewRootIdentity.Runtime.Device
 	rootJSON, err := json.Marshal(p.NewRootIdentity)
 	if err != nil {
 		return empty, errs.Wrap(errs.CodeStateWriteFailed, err)
@@ -635,17 +646,17 @@ func (r *Registrar) commitRebind(ctx context.Context, p RebindPreview, items []s
 		var w store.ScopeRebindItem
 		w.ItemID = it.ID
 		ev := map[string]any{"item_id": string(it.ID), "state": it.State}
-		if w.SourceParentIdentityJSON, err = RemapRuntimeLabel(it.SourceParentIdentityJSON, oldLabel, newLabel); err != nil {
+		if w.SourceParentIdentityJSON, err = remapIdentityLabel(it.SourceParentIdentityJSON, oldLabel, newLabel, newDev); err != nil {
 			return empty, err
 		}
 		ev["source_parent_identity_json"] = it.SourceParentIdentityJSON
-		if w.PreIdentityJSON, err = RemapRuntimeLabel(it.PreIdentityJSON, oldLabel, newLabel); err != nil {
+		if w.PreIdentityJSON, err = remapIdentityLabel(it.PreIdentityJSON, oldLabel, newLabel, newDev); err != nil {
 			return empty, err
 		}
 		ev["pre_identity_json"] = it.PreIdentityJSON
 		if it.CapturedIdentityJSON != nil {
 			ev["captured_identity_json"] = *it.CapturedIdentityJSON
-			mapped, merr := RemapRuntimeLabel(*it.CapturedIdentityJSON, oldLabel, newLabel)
+			mapped, merr := remapIdentityLabel(*it.CapturedIdentityJSON, oldLabel, newLabel, newDev)
 			if merr != nil {
 				return empty, merr
 			}

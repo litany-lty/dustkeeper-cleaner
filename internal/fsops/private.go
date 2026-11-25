@@ -205,7 +205,7 @@ func (d *Dir) LockFile(name string) (*File, error) {
 		unix.Close(fd)
 		return nil, fmt.Errorf("%w: %q is %s", ErrNotRegular, name, kindOf(&st))
 	}
-	return &File{f: os.NewFile(uintptr(fd), name), fd: fd, Identity: identityOf(&st), Token: tokenOf(&st, "")}, nil
+	return &File{f: os.NewFile(uintptr(fd), name), fd: fd, Identity: identityOfFD(fd, &st), Token: tokenOf(&st, "")}, nil
 }
 
 // DeviceOf returns the device of an open file handle.

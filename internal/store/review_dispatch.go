@@ -259,13 +259,15 @@ const reviewDispatchFrom = ` FROM review_dispatch d
 // pending row that already has a manual resolution is NOT unresolved: the
 // person's conclusion lifts exactly this one request's hold, while every other
 // pending dispatch, every other action, and every review_unknown row keeps its
-// own independent hold. The lookup is by object and action rather than by item
-// id, so a re-planned item cannot be asked twice for the same evidence.
-func (s *Store) OpenDispatchFor(ctx context.Context, itemID, action, identityJSON, tokenJSON string) ([]ReviewDispatch, error) {
+// own independent hold. The lookup is by scope, object evidence and action
+// rather than by item id, so a re-planned item cannot be asked twice for the
+// same evidence.
+func (s *Store) OpenDispatchFor(ctx context.Context, scopeID, action, identityJSON, tokenJSON string) ([]ReviewDispatch, error) {
 	rows, err := s.read(ctx, `SELECT `+reviewDispatchColumns+`, `+reviewDispatchResolutionColumns+
-		reviewDispatchFrom+` WHERE d.item_id=? AND d.action=? AND d.state='pending'
+		reviewDispatchFrom+` WHERE d.scope_id=? AND d.action=? AND d.state='pending'
+		AND d.identity_json=? AND d.token_json=?
 		AND r.dispatch_id IS NULL
-		ORDER BY d.created_ns DESC LIMIT 4`, itemID, action)
+		ORDER BY d.created_ns DESC`, scopeID, action, identityJSON, tokenJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -276,9 +278,34 @@ func (s *Store) OpenDispatchFor(ctx context.Context, itemID, action, identityJSO
 			rows.Close()
 			return nil, err
 		}
-		if d.IdentityJSON == identityJSON && d.TokenJSON == tokenJSON {
-			out = append(out, d)
+		out = append(out, d)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, errs.Wrap(errs.CodeDBError, err)
+	}
+	return out, nil
+}
+
+// OpenDispatchesForScope returns every unresolved pending dispatch in scopeID
+// so planning can pre-load holds before opening a single-connection row iterator.
+func (s *Store) OpenDispatchesForScope(ctx context.Context, scopeID string) ([]ReviewDispatch, error) {
+	rows, err := s.read(ctx, `SELECT `+reviewDispatchColumns+`, `+reviewDispatchResolutionColumns+
+		reviewDispatchFrom+` WHERE d.scope_id=? AND d.state='pending'
+		AND r.dispatch_id IS NULL
+		ORDER BY d.created_ns DESC`, scopeID)
+	if err != nil {
+		return nil, err
+	}
+	var out []ReviewDispatch
+	for rows.Next() {
+		d, err := scanReviewDispatch(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
 		}
+		out = append(out, d)
 	}
 	err = rows.Err()
 	rows.Close()

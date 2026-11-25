@@ -365,7 +365,7 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 				continue
 			}
 
-			id, token, err := dir.StatEntry(name)
+			id, token, blockedFlags, err := dir.StatEntryWithBlocked(name)
 			if err != nil {
 				if errors.Is(err, unix.ENOENT) {
 					// It was in the listing and is gone by the time we asked. The
@@ -394,9 +394,9 @@ func (s *Scanner) scanDir(ctx context.Context, vs scope.VerifiedScope, epoch int
 				}
 				dirBatch = append(dirBatch, []byte(childRel))
 			case "regular":
-				if token.NLink > 1 {
-					// A hard-linked file is not an independent copy and moving it
-					// would change another path's behaviour.
+				if token.NLink > 1 || blockedFlags {
+					// A hard-linked file is not an independent copy, and immutable or
+					// cloud-dataless entries cannot be moved or read safely.
 					stats.SkippedEntries++
 					continue
 				}

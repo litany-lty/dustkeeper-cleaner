@@ -76,10 +76,40 @@ if [ -z "$BIN" ]; then
 fi
 [ -x "$BIN" ] || die "$BIN is not executable"
 
+resolve_path() {
+	target="$1"
+	hops=0
+	while [ -L "$target" ]; do
+		hops=$((hops + 1))
+		[ "$hops" -le 40 ] || die "too many symlink levels while resolving $1"
+		dir="$(cd -P "$(dirname "$target")" && pwd -P)"
+		link="$(readlink "$target")"
+		case "$link" in
+		/*) target="$link" ;;
+		*) target="$dir/$link" ;;
+		esac
+	done
+	printf '%s/%s\n' "$(cd -P "$(dirname "$target")" && pwd -P)" "$(basename "$target")"
+}
+
+strip_leading_zeros() {
+	case "$1" in
+	'' | *[!0-9]*) die "$2 must be a non-negative integer, got: $1" ;;
+	esac
+	val="$1"
+	while [ "${#val}" -gt 1 ] && [ "${val#0}" != "$val" ]; do
+		val="${val#0}"
+	done
+	printf '%s\n' "$val"
+}
+
+HOUR="$(strip_leading_zeros "$HOUR" "--hour")"
+MINUTE="$(strip_leading_zeros "$MINUTE" "--minute")"
+
 # The rendered templates embed the absolute path of the binary, so the binary
 # has to already live where it will keep living. Resolve symlinks first: a unit
 # pointing at a symlink breaks the day the link is repointed.
-BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
+BIN="$(resolve_path "$BIN")"
 "$BIN" version >/dev/null 2>&1 || die "$BIN does not look like a working dustkeeper binary"
 
 note "installing dustkeeper timer"
@@ -135,6 +165,11 @@ darwin)
 	fi
 	run install -m 0644 "$TMP/$LABEL.plist" "$DEST/$LABEL.plist"
 	if [ "$ENABLE" -eq 1 ]; then
+		if [ "$DRY_RUN" -eq 1 ]; then
+			printf '  [dry-run] launchctl bootout gui/%s/%s (if already loaded)\n' "$(id -u)" "$LABEL"
+		else
+			launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+		fi
 		run launchctl bootstrap "gui/$(id -u)" "$DEST/$LABEL.plist"
 		if [ "$DRY_RUN" -eq 0 ]; then
 			note ""

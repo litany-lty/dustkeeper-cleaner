@@ -3,7 +3,6 @@ package scope
 import (
 	"fmt"
 	"strconv"
-	"strings"
 
 	"dustkeeper/internal/domain"
 )
@@ -62,25 +61,37 @@ func CompareRootIdentity(stored, current domain.RootIdentity) IdentityVerdict {
 	}
 	if stored.Persistent.VolumeID != "" && current.Persistent.VolumeID != "" &&
 		stored.Persistent.VolumeID != current.Persistent.VolumeID {
-		if !newBoot || !LegacyVolumeLabel(stored.Persistent.VolumeID) ||
-			!LegacyVolumeLabel(current.Persistent.VolumeID) {
+		legacyToLegacy := newBoot && LegacyVolumeLabel(stored.Persistent.VolumeID) &&
+			LegacyVolumeLabel(current.Persistent.VolumeID)
+		legacyUpgrade := LegacyVolumeLabel(stored.Persistent.VolumeID) &&
+			domain.HasPersistentVolumeID(current.Persistent.VolumeID) &&
+			(newBoot || stored.Runtime.Device == current.Runtime.Device)
+		if !legacyToLegacy && !legacyUpgrade {
 			return changed("the root volume changed from %s to %s",
 				stored.Persistent.VolumeID, current.Persistent.VolumeID)
 		}
-		relabeled = fmt.Sprintf("the runtime volume label changed from %s to %s across a new boot",
-			stored.Persistent.VolumeID, current.Persistent.VolumeID)
+		if legacyUpgrade {
+			relabeled = fmt.Sprintf("the legacy runtime volume label %s upgraded to persistent volume id %s",
+				stored.Persistent.VolumeID, current.Persistent.VolumeID)
+		} else {
+			relabeled = fmt.Sprintf("the runtime volume label changed from %s to %s across a new boot",
+				stored.Persistent.VolumeID, current.Persistent.VolumeID)
+		}
 	}
 	if stored.Runtime.Device != 0 && current.Runtime.Device != 0 &&
 		stored.Runtime.Device != current.Runtime.Device {
 		// Inside one boot a different device *is* a different way of reaching
 		// this path, and CompareMountBinding cannot see it on macOS because
 		// mountIDFor returns nil there. Keep that detection. Across boots the
-		// number is not comparable at all.
+		// number is not comparable at all; when both sides already carry the
+		// same persistent volume UUID, a reboot renumbering st_dev is transparent.
 		if !newBoot {
 			return changed("the root device changed from %d to %d",
 				stored.Runtime.Device, current.Runtime.Device)
 		}
-		if relabeled == "" {
+		samePersistentVolume := domain.HasPersistentVolumeID(stored.Persistent.VolumeID) &&
+			stored.Persistent.VolumeID == current.Persistent.VolumeID
+		if relabeled == "" && !samePersistentVolume {
 			relabeled = fmt.Sprintf("the runtime device number changed from %d to %d across a new boot",
 				stored.Runtime.Device, current.Runtime.Device)
 		}
@@ -129,11 +140,7 @@ func known(name string) bool { return name != "" && name != "unknown" }
 // persistent fact; that is how a future platform that can supply a real volume
 // UUID becomes stricter without changing this comparison again.
 func LegacyVolumeLabel(v string) bool {
-	if !strings.HasPrefix(v, "dev-") || len(v) <= 4 {
-		return false
-	}
-	_, err := strconv.ParseUint(v[4:], 10, 64)
-	return err == nil
+	return domain.IsLegacyVolumeLabel(v)
 }
 
 // LegacyDevice returns the device number encoded by a legacy volume label.

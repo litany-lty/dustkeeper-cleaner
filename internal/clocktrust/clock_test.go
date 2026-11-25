@@ -204,3 +204,33 @@ func TestARunKeepsTheSameBaselineForItsWholeLife(t *testing.T) {
 		t.Fatalf("a coherent thirty second step was treated as suspicious: %+v %v", v, err)
 	}
 }
+
+func TestR08ConfigurableMaxGapAllowsExpectedOfflineWindow(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	start := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	c := newMovableClock(start)
+
+	first := clocktrust.StartWithMaxGap(st, c, 168*time.Hour)
+	if err := first.RecordRun(ctx, clocktrust.Verdict{Trusted: true}); err != nil {
+		t.Fatalf("record baseline: %v", err)
+	}
+
+	// 120 hours (> default 48h, <= configured 168h) stays trusted.
+	c.jump(120 * time.Hour)
+	mid := clocktrust.StartWithMaxGap(st, c, 168*time.Hour)
+	if v, err := mid.Assess(ctx); err != nil || !v.Trusted {
+		t.Fatalf("120h gap should be trusted under 168h max gap: %+v %v", v, err)
+	}
+
+	// 200 hours (> configured 168h) is untrusted and names 168 hours.
+	c.jump(80 * time.Hour)
+	late := clocktrust.StartWithMaxGap(st, c, 168*time.Hour)
+	v, err := late.Assess(ctx)
+	if err != nil {
+		t.Fatalf("assess late: %v", err)
+	}
+	if v.Trusted {
+		t.Fatal("200h gap must not be trusted under 168h max gap")
+	}
+}

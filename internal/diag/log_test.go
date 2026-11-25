@@ -183,3 +183,58 @@ func TestTheLogFileIsNotWorldReadable(t *testing.T) {
 		t.Fatalf("the log is readable by others: %o", perm)
 	}
 }
+
+func TestR15RotateFileIfOversize(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "run.log")
+
+	// Small file stays untouched.
+	if err := os.WriteFile(target, []byte("small\n"), 0o600); err != nil {
+		t.Fatalf("write small: %v", err)
+	}
+	if err := RotateFileIfOversize(dir, "run.log", MaxFileBytes, KeepFiles); err != nil {
+		t.Fatalf("small rotate: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("small run.log missing: %v", err)
+	}
+	if _, err := os.Stat(target + ".1"); !os.IsNotExist(err) {
+		t.Fatalf("small run.log should not rotate into .1")
+	}
+
+	// Oversized file rotates through .1 .. .KeepFiles.
+	big := make([]byte, MaxFileBytes+16)
+	for round := 1; round <= KeepFiles+2; round++ {
+		big[0] = byte('0' + round)
+		if err := os.WriteFile(target, big, 0o600); err != nil {
+			t.Fatalf("write big round %d: %v", round, err)
+		}
+		if err := RotateFileIfOversize(dir, "run.log", MaxFileBytes, KeepFiles); err != nil {
+			t.Fatalf("rotate round %d: %v", round, err)
+		}
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("run.log should have been moved to .1")
+	}
+	for i := 1; i <= KeepFiles; i++ {
+		p := filepath.Join(dir, "run.log."+string(rune('0'+i)))
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("expected rotated backup %s: %v", p, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "run.log.4")); !os.IsNotExist(err) {
+		t.Fatalf("backup beyond KeepFiles should be dropped")
+	}
+
+	// Symlink target is refused without touching the link or its target.
+	symTarget := filepath.Join(dir, "victim")
+	if err := os.WriteFile(symTarget, big, 0o600); err != nil {
+		t.Fatalf("write victim: %v", err)
+	}
+	if err := os.Symlink(symTarget, target); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := RotateFileIfOversize(dir, "run.log", MaxFileBytes, KeepFiles); err == nil {
+		t.Fatal("symlink run.log should be refused")
+	}
+}

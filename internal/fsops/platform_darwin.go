@@ -3,9 +3,11 @@
 package fsops
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -102,16 +104,94 @@ func kindOf(st *unix.Stat_t) string {
 	}
 }
 
+// macOS <sys/attr.h> constants for reading a volume's persistent UUID from an
+// open descriptor via fgetattrlist.
+const (
+	darwinAttrBitMapCount     = 5
+	darwinAttrCmnReturnedAttr = 0x80000000
+	darwinAttrVolInfo         = 0x80000000
+	darwinAttrVolUUID         = 0x00020000
+)
+
+// volumeIDOfFD reads the persistent volume UUID of fd via fgetattrlist
+// (ATTR_VOL_UUID). On APFS and HFS+ this UUID survives reboots even when macOS
+// reassigns stat.st_dev. If the filesystem does not expose ATTR_VOL_UUID, it
+// falls back honestly to the runtime `dev-<st_dev>` label.
+func volumeIDOfFD(fd int, dev uint64) string {
+	if uuid, ok := darwinVolumeUUID(fd); ok {
+		return uuid
+	}
+	return fmt.Sprintf("dev-%d", dev)
+}
+
+func darwinVolumeUUID(fd int) (string, bool) {
+	al := unix.Attrlist{
+		Bitmapcount: darwinAttrBitMapCount,
+		Commonattr:  darwinAttrCmnReturnedAttr,
+		Volattr:     darwinAttrVolInfo | darwinAttrVolUUID,
+	}
+	// Layout returned by fgetattrlist when ATTR_CMN_RETURNED_ATTRS +
+	// ATTR_VOL_UUID are requested:
+	//   [0:4]   uint32 total length
+	//   [4:24]  attribute_set_t (5 x uint32: common, vol, dir, file, fork)
+	//   [24:40] uuid_t (16 bytes, big-endian RFC 4122)
+	var buf [64]byte
+	_, _, errno := unix.Syscall6(
+		unix.SYS_FGETATTRLIST,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(&al)),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+		0,
+		0,
+	)
+	if errno != 0 {
+		return "", false
+	}
+	totalLen := binary.LittleEndian.Uint32(buf[0:4])
+	if totalLen < 40 || int(totalLen) > len(buf) {
+		return "", false
+	}
+	returnedVol := binary.LittleEndian.Uint32(buf[8:12])
+	if returnedVol&darwinAttrVolUUID == 0 {
+		return "", false
+	}
+	u := buf[24:40]
+	allZero := true
+	for _, b := range u {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return "", false
+	}
+	return fmt.Sprintf("%08X-%04X-%04X-%04X-%012X",
+		binary.BigEndian.Uint32(u[0:4]),
+		binary.BigEndian.Uint16(u[4:6]),
+		binary.BigEndian.Uint16(u[6:8]),
+		binary.BigEndian.Uint16(u[8:10]),
+		u[10:16],
+	), true
+}
+
 func identityOf(st *unix.Stat_t) domain.FileIdentity {
+	return identityWithVolume(st, "", 0)
+}
+
+func identityOfFD(fd int, st *unix.Stat_t) domain.FileIdentity {
 	dev := devOf(st)
-	// `dev-<st_dev>` is a RUNTIME label, not a verified stable volume UUID:
-	// APFS device numbers are reassigned across boots. scope.CompareRootIdentity
-	// treats this exact shape as runtime-scoped (still strict within one boot),
-	// and `scope rebind` is the only path that establishes a new generation.
-	// Do not replace this with a claim of persistence, and do not drop the
-	// comparison: a same-boot device change is a real mount replacement.
+	return identityWithVolume(st, volumeIDOfFD(fd, dev), dev)
+}
+
+func identityWithVolume(st *unix.Stat_t, volID string, volDev uint64) domain.FileIdentity {
+	dev := devOf(st)
+	if volID == "" || (volDev != 0 && dev != volDev) {
+		volID = fmt.Sprintf("dev-%d", dev)
+	}
 	id := domain.FileIdentity{
-		VolumeID: fmt.Sprintf("dev-%d", dev),
+		VolumeID: volID,
 		Device:   dev,
 		Inode:    st.Ino,
 		Kind:     kindOf(st),
@@ -205,6 +285,12 @@ func fileFlags(fd int) (uint64, string) {
 		return 0, "flags_unreadable"
 	}
 	return uint64(st.Flags), ""
+}
+
+const darwinDatalessFlag = 0x40000000
+
+func entryBlockedByFlags(st *unix.Stat_t) bool {
+	return st.Flags&(unix.UF_IMMUTABLE|unix.UF_APPEND|unix.SF_IMMUTABLE|unix.SF_APPEND|darwinDatalessFlag) != 0
 }
 
 // syscallName keeps error text readable in reports without leaking numbers.

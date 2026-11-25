@@ -395,3 +395,56 @@ func TestStableVolumeIDIsComparedAcrossBoots(t *testing.T) {
 		t.Fatalf("legacy device decoding failed: %d %v", n, ok)
 	}
 }
+
+func TestR07PersistentVolumeUUIDSurvivesRebootDeviceRenumbering(t *testing.T) {
+	const uuid = "08317A4F-48DB-4A31-86DC-9FCA86B9B58B"
+	stored := baseRoot()
+	stored.Persistent.VolumeID = uuid
+	stored.Runtime.Device = 16777230
+
+	current := stored
+	current.Runtime.BootOrRunID = "boot-b"
+	current.Runtime.Device = 16777234
+
+	v := CompareRootIdentity(stored, current)
+	if v.Changed != "" || v.Weak != "" || v.RuntimeRelabeled != "" {
+		t.Fatalf("reboot device renumbering under matching persistent UUID should be seamless, got %+v", v)
+	}
+
+	// FileIdentity.Equal must also match across st_dev renumbering when both
+	// carry the same persistent UUID, and refuse when UUIDs differ.
+	a := domain.FileIdentity{VolumeID: uuid, Device: 16777230, Inode: 42, Kind: "regular"}
+	b := domain.FileIdentity{VolumeID: uuid, Device: 16777234, Inode: 42, Kind: "regular"}
+	if !a.Equal(b) {
+		t.Fatal("FileIdentity.Equal failed across st_dev renumbering with matching persistent UUID")
+	}
+	c := b
+	c.VolumeID = "AAAAAAAA-48DB-4A31-86DC-9FCA86B9B58B"
+	if a.Equal(c) {
+		t.Fatal("FileIdentity.Equal accepted mismatched persistent UUIDs")
+	}
+
+	// Vault/anchor digests must stay identical across st_dev renumbering for
+	// persistent UUIDs, while remaining device-bound for legacy dev-* labels.
+	if got1, got2 := vaultIdentityOf(uuid, 16777230, 42, "100", "7"), vaultIdentityOf(uuid, 16777234, 42, "100", "7"); got1 != got2 {
+		t.Fatalf("vaultIdentityOf changed across st_dev renumbering for persistent UUID: %s vs %s", got1, got2)
+	}
+	if got1, got2 := AnchorIdentity(a, "tag-1"), AnchorIdentity(b, "tag-1"); got1 != got2 {
+		t.Fatalf("AnchorIdentity changed across st_dev renumbering for persistent UUID: %s vs %s", got1, got2)
+	}
+	if got1, got2 := vaultIdentityOf("dev-10", 10, 42, "100", "7"), vaultIdentityOf("dev-10", 11, 42, "100", "7"); got1 == got2 {
+		t.Fatal("legacy dev-* vaultIdentityOf unexpectedly ignored device")
+	}
+
+	// Upgrading from legacy dev-* to a persistent UUID on the same boot/device
+	// reports RuntimeRelabeled instead of Changed.
+	legacyStored := baseRoot()
+	legacyStored.Persistent.VolumeID = "dev-16777230"
+	legacyStored.Runtime.Device = 16777230
+	upgraded := legacyStored
+	upgraded.Persistent.VolumeID = uuid
+	uv := CompareRootIdentity(legacyStored, upgraded)
+	if uv.Changed != "" || uv.Weak != "" || uv.RuntimeRelabeled == "" {
+		t.Fatalf("same-device legacy->UUID upgrade should be RuntimeRelabeled, got %+v", uv)
+	}
+}

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strings"
 
 	"dustkeeper/internal/domain"
 	"dustkeeper/internal/errs"
@@ -395,6 +397,9 @@ func rulePreview(ctx context.Context, a *app, args []string) (output, error) {
 		},
 	})
 	if err != nil {
+		if errs.CodeOf(err) == errs.CodeNoCandidates {
+			return noCandidatesOutput(sc, res, err), err
+		}
 		return output{}, err
 	}
 
@@ -429,6 +434,7 @@ func rulePreview(ctx context.Context, a *app, args []string) (output, error) {
 		out.Human = append(out.Human, "  truncated: the limit stopped the list; raise --max-files to see more")
 	}
 	out.Human = append(out.Human,
+		"  "+formatPlanReasons(res.Scanned, res.Reasons, res.Truncated),
 		"  this preview touched nothing",
 		"",
 		"review digest (repeat it to activate):",
@@ -459,6 +465,44 @@ func previewItems(items []store.Item) []map[string]any {
 		})
 	}
 	return out
+}
+
+func formatPlanReasons(scanned int, reasons map[string]int, truncated bool) string {
+	keys := make([]string, 0, len(reasons))
+	for k, v := range reasons {
+		if v > 0 {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, reasons[k]))
+	}
+	detail := "none"
+	if len(parts) > 0 {
+		detail = strings.Join(parts, ", ")
+	}
+	suffix := ""
+	if truncated {
+		suffix = " (truncated)"
+	}
+	return fmt.Sprintf("evaluated %d file(s)%s: %s", scanned, suffix, detail)
+}
+
+func noCandidatesOutput(sc store.Scope, res plan.RulePlanResult, perr error) output {
+	o := fail(perr)
+	o.ScopeID = string(sc.ID)
+	o.Data = map[string]any{
+		"scanned":   res.Scanned,
+		"reasons":   res.Reasons,
+		"truncated": res.Truncated,
+	}
+	o.Human = []string{"  " + formatPlanReasons(res.Scanned, res.Reasons, res.Truncated)}
+	if res.Scanned == 0 {
+		o.Next = []string{fmt.Sprintf("dustkeeper scan --scope %s", sc.ID)}
+	}
+	return o
 }
 
 // ruleActivate pins one revision and invalidates the previous revision's

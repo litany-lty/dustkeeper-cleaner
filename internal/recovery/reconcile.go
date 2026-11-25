@@ -391,6 +391,7 @@ func (r *Reconciler) reconcileQuarantine(ctx context.Context, sc *execute.ScopeC
 			return r.recordFailure(ctx, po, out, "ABORT_FAILED", err)
 		}
 		r.releasePin(ctx, it, &out)
+		_ = sc.RemoveManifest(it.ObjectName)
 		out.Outcome = "aborted"
 		out.Detail = "the file was never moved"
 		return out
@@ -917,6 +918,7 @@ func (r *Reconciler) reconcileRestore(ctx context.Context, sc *execute.ScopeCtx,
 			return r.recordFailure(ctx, po, out, "COMPLETE_FAILED", err)
 		}
 		r.releasePin(ctx, it, &out)
+		_ = sc.RemoveManifest(it.ObjectName)
 		out.Outcome = "completed"
 		out.Detail = "the restore had already happened; its record was completed"
 		return out
@@ -1165,6 +1167,7 @@ func (r *Reconciler) reconcilePurge(ctx context.Context, sc *execute.ScopeCtx, p
 		return r.recordFailure(ctx, po, out, "COMPLETE_FAILED", err)
 	}
 	r.releasePin(ctx, it, &out)
+	_ = sc.RemoveManifest(it.ObjectName)
 	out.Outcome = "completed"
 	out.Detail = "the object was already absent; recorded as RECONCILED_ABSENT, not as a verified unlink"
 	return out

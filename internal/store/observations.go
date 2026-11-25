@@ -73,13 +73,27 @@ func scanObs(rows *sql.Rows) (Observation, error) {
 	return o, err
 }
 
-// IterateObservations streams every live observation of a scope.
+// IterateObservations streams every live observation of a scope in path order.
 //
 // fn must be pure: the pool has a single connection, so issuing another query
 // from inside fn would deadlock. Collect decisions and write them afterwards.
 func (s *Store) IterateObservations(ctx context.Context, scope domain.ScopeID, fn func(Observation) error) error {
+	return s.IterateObservationsOrdered(ctx, scope, "path", fn)
+}
+
+// IterateObservationsOrdered streams every live observation of a scope ordered
+// by order ("path", "size_desc", or "oldest_first"). Invalid or empty order
+// falls back to path order.
+func (s *Store) IterateObservationsOrdered(ctx context.Context, scope domain.ScopeID, order string, fn func(Observation) error) error {
+	orderClause := "raw_relative"
+	switch order {
+	case "size_desc":
+		orderClause = "size_bytes DESC, raw_relative ASC"
+	case "oldest_first":
+		orderClause = "mtime_ns ASC, raw_relative ASC"
+	}
 	rows, err := s.read(ctx, "SELECT "+obsColumns+
-		" FROM observations WHERE scope_id=? AND status!='stale' ORDER BY raw_relative", string(scope))
+		" FROM observations WHERE scope_id=? AND status!='stale' ORDER BY "+orderClause, string(scope))
 	if err != nil {
 		return err
 	}
@@ -145,6 +159,25 @@ func (s *Store) MarkStaleObservations(ctx context.Context, scope domain.ScopeID,
 		res, err := tx.ExecContext(ctx, `
 UPDATE observations SET status='stale'
 WHERE scope_id=? AND scan_epoch < ? AND status!='stale'`, string(scope), epoch)
+		if err != nil {
+			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		}
+		n, _ = res.RowsAffected()
+		return nil
+	})
+	return n, err
+}
+
+// PruneStaleObservations deletes already-retired stale observations whose
+// last_seen_ns is older than olderThanNS. Calling this after a completed epoch
+// keeps the observations table bounded during long-term churn while preserving
+// recently retired entries for short-term inspection.
+func (s *Store) PruneStaleObservations(ctx context.Context, scope domain.ScopeID, olderThanNS int64) (int64, error) {
+	var n int64
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+DELETE FROM observations
+WHERE scope_id=? AND status='stale' AND last_seen_ns < ?`, string(scope), olderThanNS)
 		if err != nil {
 			return errs.Wrap(errs.CodeStateWriteFailed, err)
 		}
@@ -395,6 +428,16 @@ func (s *Store) BumpScanInterrupts(ctx context.Context, scope domain.ScopeID) (i
 	return n, err
 }
 
+// ScanInterruptsOf returns the persisted consecutive incomplete-scan count for a scope.
+func (s *Store) ScanInterruptsOf(ctx context.Context, scope domain.ScopeID) (int64, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT scan_interrupts FROM scopes WHERE scope_id=?", string(scope)).Scan(&n); err != nil {
+		return 0, errs.Wrap(errs.CodeDBError, err)
+	}
+	return n, nil
+}
+
 // ResetScanInterrupts clears the counter after an epoch completed.
 func (s *Store) ResetScanInterrupts(ctx context.Context, scope domain.ScopeID) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
@@ -402,6 +445,29 @@ func (s *Store) ResetScanInterrupts(ctx context.Context, scope domain.ScopeID) e
 			"UPDATE scopes SET scan_interrupts=0 WHERE scope_id=?", string(scope))
 		return errs.Wrap(errs.CodeStateWriteFailed, err)
 	})
+}
+
+// ResetDoneDirsForRefresh moves previously completed directories in an open
+// epoch back to pending while leaving failed directories untouched.
+//
+// When a single unreadable subdirectory keeps an epoch open across runs,
+// refreshing done directories lets every readable subtree discover new files
+// while still refusing to retire stale observations until the whole epoch
+// succeeds.
+func (s *Store) ResetDoneDirsForRefresh(ctx context.Context, scope domain.ScopeID, epoch int64) (int64, error) {
+	var n int64
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+UPDATE scan_queue SET status='pending', claim_seq=NULL, claimed_at_ns=NULL
+WHERE scope_id=? AND scan_epoch=? AND status='done'`,
+			string(scope), epoch)
+		if err != nil {
+			return errs.Wrap(errs.CodeStateWriteFailed, err)
+		}
+		n, _ = res.RowsAffected()
+		return nil
+	})
+	return n, err
 }
 
 // RequeueActive returns interrupted directories to pending. Used after a crash

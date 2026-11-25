@@ -139,10 +139,16 @@ const (
 	ReasonExceptName   = "EXCEPT_NAME"
 	ReasonOutsideDir   = "OUTSIDE_DIR_PREFIX"
 	ReasonNameMismatch = "NAME_MISMATCH"
-	ReasonTooSmall     = "SIZE_BELOW_MIN"
-	ReasonTooLarge     = "SIZE_ABOVE_MAX"
-	ReasonMTimeFuture  = "MTIME_IN_FUTURE"
-	ReasonTooNew       = "MODIFIED_TOO_RECENTLY"
+	ReasonTooSmall             = "SIZE_BELOW_MIN"
+	ReasonTooLarge             = "SIZE_ABOVE_MAX"
+	ReasonOverRunByteLimit     = "OVER_RUN_BYTE_LIMIT"
+	ReasonMTimeFuture          = "MTIME_IN_FUTURE"
+	ReasonTooNew               = "MODIFIED_TOO_RECENTLY"
+	ReasonKeptRecently          = "KEPT_RECENTLY"
+	ReasonAwaitingRequestCheck  = "AWAITING_REQUEST_CHECK"
+	ReasonReadBudgetTooSmall    = "READ_BUDGET_TOO_SMALL"
+	ReasonFailedDirExcluded     = "FAILED_DIR_EXCLUDED"
+	ReasonDiskPressureMovePause = "DISK_PRESSURE_QUARANTINE_PAUSED"
 )
 
 // Input is everything the decision depends on. Nothing here is read from disk.

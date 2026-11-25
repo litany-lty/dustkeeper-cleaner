@@ -24,29 +24,49 @@ type UsageObservation struct {
 	Source string    `json:"source"`
 }
 
+func probeCanonicalRoot(root string) (cleanRoot, canonRoot string) {
+	cleanRoot = filepath.Clean(root)
+	canonRoot = cleanRoot
+	if resolved, err := filepath.EvalSymlinks(cleanRoot); err == nil {
+		canonRoot = filepath.Clean(resolved)
+	}
+	return cleanRoot, canonRoot
+}
+
+func underProbeRoot(cleanRoot, canonRoot, p string) bool {
+	for _, base := range []string{cleanRoot, canonRoot} {
+		rel, err := filepath.Rel(base, p)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 func ProbeOpenFiles(ctx context.Context, root string, run CommandRunner) OpenObservation {
 	out := OpenObservation{Paths: map[string]bool{}, Coverage: "unknown"}
 	if run == nil {
 		run = RunBoundedCommand
 	}
+	cleanRoot, canonRoot := probeCanonicalRoot(root)
 	c, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	data, err := run(c, "lsof", "-nP", "-F0n")
+	data, err := run(c, processListingPath(), "-nP", "-F0n")
 	for _, field := range bytes.Split(data, []byte{0}) {
 		field = bytes.TrimLeft(field, "\n")
 		if len(field) < 2 || field[0] != 'n' {
 			continue
 		}
-		p := string(field[1:])
-		rel, relErr := filepath.Rel(root, p)
-		if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			out.Paths[filepath.Clean(p)] = true
+		p := filepath.Clean(string(field[1:]))
+		if underProbeRoot(cleanRoot, canonRoot, p) {
+			out.Paths[p] = true
 		}
 	}
 	out.VisibleMatches = len(out.Paths)
-	if err == nil {
+	switch {
+	case c.Err() == nil && listingCompleted(err):
 		out.Coverage = "visible_processes_only"
-	} else if len(out.Paths) > 0 {
+	case len(out.Paths) > 0:
 		out.Coverage = "partial_visible_processes"
 	}
 	return out
@@ -84,18 +104,22 @@ func ProbeOpenUnder(ctx context.Context, root string, run CommandRunner) OpenObs
 	if run == nil {
 		run = RunBoundedCommand
 	}
+	cleanRoot, canonRoot := probeCanonicalRoot(root)
+	targetArg := root
+	if canonRoot != cleanRoot {
+		targetArg = canonRoot
+	}
 	c, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	data, err := run(c, processListingPath(), "-nP", "-w", "-F0n", "+D", root)
+	data, err := run(c, processListingPath(), "-nP", "-w", "-F0n", "+D", targetArg)
 	for _, field := range bytes.Split(data, []byte{0}) {
 		field = bytes.TrimLeft(field, "\n")
 		if len(field) < 2 || field[0] != 'n' {
 			continue
 		}
-		p := string(field[1:])
-		rel, relErr := filepath.Rel(root, p)
-		if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			out.Paths[filepath.Clean(p)] = true
+		p := filepath.Clean(string(field[1:]))
+		if underProbeRoot(cleanRoot, canonRoot, p) {
+			out.Paths[p] = true
 		}
 	}
 	out.VisibleMatches = len(out.Paths)
@@ -106,6 +130,61 @@ func ProbeOpenUnder(ctx context.Context, root string, run CommandRunner) OpenObs
 		out.Coverage = "partial_visible_processes"
 	}
 	return out
+}
+
+// ProbeOpenPath reports whether a visible process currently holds path open.
+//
+// Unlike ProbeOpenUnder (which walks an entire directory tree with `lsof +D`),
+// this probes one target file at a time: on Linux it inspects `/proc/*/fd`
+// natively by (device, inode) without requiring `lsof`, and on macOS it invokes
+// `lsof -- <path>` so large scopes never hit the tree-walk timeout or 256 KiB cap.
+func ProbeOpenPath(ctx context.Context, path string, run CommandRunner) OpenObservation {
+	clean := filepath.Clean(path)
+	if run == nil {
+		if obs, handled := probeOpenPathNative(ctx, clean); handled {
+			return obs
+		}
+		run = RunBoundedCommand
+	}
+	return probeOpenPathLsof(ctx, clean, run)
+}
+
+func probeOpenPathLsof(ctx context.Context, clean string, run CommandRunner) OpenObservation {
+	out := OpenObservation{Paths: map[string]bool{}, Coverage: "unknown"}
+	c, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	data, err := run(c, processListingPath(), "-nP", "-w", "-F0n", "--", clean)
+	for _, field := range bytes.Split(data, []byte{0}) {
+		field = bytes.TrimLeft(field, "\n")
+		if len(field) < 2 || field[0] != 'n' {
+			continue
+		}
+		p := filepath.Clean(string(field[1:]))
+		if p == clean {
+			out.Paths[clean] = true
+		}
+	}
+	out.VisibleMatches = len(out.Paths)
+	switch {
+	case c.Err() == nil && listingCompleted(err):
+		out.Coverage = "visible_processes_only"
+	case len(out.Paths) > 0:
+		out.Coverage = "partial_visible_processes"
+	}
+	return out
+}
+
+// ProbeOpenAvailable reports whether this host can probe open files for a
+// candidate path, together with the backend that will be used.
+func ProbeOpenAvailable() (bool, string) {
+	if ok, detail := probeOpenNativeAvailable(); ok {
+		return true, detail
+	}
+	bin := processListingPath()
+	if resolved, err := exec.LookPath(bin); err == nil {
+		return true, "lsof (" + resolved + ")"
+	}
+	return false, "neither native /proc scan nor lsof is available; files cannot be proven unused before moving"
 }
 
 // listingCompleted reports whether the listing command ran to the end, which is

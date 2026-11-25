@@ -95,7 +95,7 @@ func run(args []string, out, errout io.Writer) int {
 	now := time.Now()
 	process := assess.OpenObservation{Coverage: "not_requested", Paths: map[string]bool{}}
 	if *open {
-		process = assess.ProbeOpenFiles(ctx, canonical, nil)
+		process = assess.ProbeOpenUnder(ctx, canonical, nil)
 	}
 	rep, err := assess.Scan(ctx, abs, assess.Options{MaxEntries: *max, Days: *days, Now: now, ReferencePaths: referencePaths, OpenPaths: process.Paths, ProcessCoverage: process.Coverage, ProtectedPrefixes: protectPrefixes, ProtectedPatterns: protectPatterns, TemporaryPrefixes: tempPrefixes})
 	if err != nil {

@@ -86,19 +86,32 @@ def load_run_envelope(path):
     return envelope
 
 
-def invoke(executable, args, timeout):
+def invoke(executable, args, timeout, grace_seconds=30):
+    proc = subprocess.Popen(
+        [executable, *args, "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
     try:
-        completed = subprocess.run(
-            [executable, *args, "--json"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            timeout=timeout,
-            check=False,
-        )
+        stdout, stderr_raw = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return 130, {"status": "cancelled", "code": "CANCELLED", "message": "运行超过本次时限，未重试"}, ""
-    stdout = completed.stdout
+        # Request a graceful stop first so Dustkeeper's SIGTERM handler can
+        # finish the current boundary cleanly before resorting to SIGKILL.
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.communicate()
+        return 130, {"status": "cancelled", "code": "CANCELLED", "message": "运行超过本次时限，已发送 SIGTERM 优雅中止且未重试"}, ""
+    returncode = proc.returncode
     if len(stdout.encode("utf-8", errors="replace")) > MAX_OUTPUT_BYTES:
         return 7, {"status": "failed", "code": "OUTPUT_TOO_LARGE", "message": "命令输出超过 8 MiB，未保存原始输出"}, ""
     try:
@@ -111,10 +124,10 @@ def invoke(executable, args, timeout):
             "code": "INVALID_OUTPUT",
             "message": "Dustkeeper 未返回可解析的 JSON；原始输出未写入日志",
         }
-        if completed.returncode == 0:
-            completed = subprocess.CompletedProcess(completed.args, 7, completed.stdout, completed.stderr)
-    stderr = "命令有额外诊断输出；为避免泄露原始响应或凭据，未写入本日志" if completed.stderr.strip() else ""
-    return completed.returncode, envelope, stderr
+        if returncode == 0:
+            returncode = 7
+    stderr = "命令有额外诊断输出；为避免泄露原始响应或凭据，未写入本日志" if stderr_raw.strip() else ""
+    return returncode, envelope, stderr
 
 
 def page_from(executable, timeout):
@@ -152,6 +165,7 @@ def review_for(executable, item_id, reason, timeout, window_start_ns, window_end
     events = envelope.get("data", {}).get("events", [])
     decision = {}
     timings = []
+    settlement = {}
     if isinstance(events, list):
         for event in reversed(events):
             if not isinstance(event, dict):
@@ -161,6 +175,8 @@ def review_for(executable, item_id, reason, timeout, window_start_ns, window_end
                 continue
             phase = event.get("Phase", event.get("phase", ""))
             payload = event_payload(event.get("ResultJSON", event.get("result_json")))
+            if isinstance(payload, dict) and event.get("Action", event.get("action")) == "review":
+                settlement = payload
             candidate = payload.get("decision", payload if phase == "info" else {})
             if isinstance(candidate, dict) and candidate:
                 if not decision:
@@ -173,9 +189,20 @@ def review_for(executable, item_id, reason, timeout, window_start_ns, window_end
             # timings that an earlier event already recorded.
             if not timings and isinstance(payload, dict):
                 timings = payload.get("request_timings") or []
-            if decision and timings:
+            if decision and timings and settlement:
                 break
-    return review_summary(decision, reason, bool(decision), timings)
+    summary = review_summary(decision, reason, bool(decision), timings)
+    if (
+        summary["jev_usage"] is None
+        and summary["minimax_usage"] is None
+        and not summary["minimax_consulted"]
+        and settlement.get("attempts") == 1
+        and settlement.get("cost_status") == "usage_recorded"
+    ):
+        usage = safe_usage(settlement)
+        if usage is not None:
+            summary["jev_usage"] = usage
+    return summary
 
 
 def optional_ms(value):
@@ -233,14 +260,19 @@ def stage_durations(stages):
 
 def review_summary(decision, reason, recorded, timings=None):
     jev = decision.get("jev") if isinstance(decision.get("jev"), dict) else {}
-    jev_choice = jev.get("choice", "")
-    minimax = decision.get("llm_decision", "")
-    consulted = bool(decision.get("llm_consulted", False))
+    expl = normalize_explanation(decision.get("review_explanation")) or {}
+    expl_jev = expl.get("jev") if isinstance(expl.get("jev"), dict) else {}
+    expl_mm = expl.get("minimax") if isinstance(expl.get("minimax"), dict) else {}
+    jev_choice = jev.get("choice", "") or expl_jev.get("choice", "")
+    minimax = decision.get("llm_decision", "") or expl_mm.get("decision", "")
+    consulted = bool(decision.get("llm_consulted", False)) or bool(expl_mm.get("consulted", False))
     if reason == "dual_review_agrees":
         jev_choice = jev_choice or "allow_review"
         minimax = minimax or "allow"
         consulted = True
     rows = timings if isinstance(timings, list) else decision.get("request_timings", [])
+    jev_gate = bool(jev["gate_passed"]) if "gate_passed" in jev else bool(expl_jev.get("gate_passed", False))
+    jev_blockers = safe_codes(jev.get("blockers"), JEV_BLOCKERS) or list(expl_jev.get("blockers") or [])
     return {
         "verdict": str(decision.get("verdict", "")),
         "reason": str(decision.get("reason", "")),
@@ -254,12 +286,12 @@ def review_summary(decision, reason, recorded, timings=None):
         "jev_min_confidence": safe_float(jev.get("min_confidence")),
         "jev_allow_probability": safe_float(jev.get("probabilities", {}).get("allow_review")) if isinstance(jev.get("probabilities"), dict) else None,
         "jev_min_allow_probability": safe_float(jev.get("min_allow_probability")),
-        "jev_gate_passed": bool(jev.get("gate_passed", False)),
-        "jev_blockers": safe_codes(jev.get("blockers"), JEV_BLOCKERS),
+        "jev_gate_passed": jev_gate,
+        "jev_blockers": jev_blockers,
         "minimax_decision": str(minimax),
         "minimax_model": str(decision.get("llm_model", "")),
         "minimax_consulted": consulted,
-        "minimax_reason": safe_code(decision.get("llm_reason"), MINIMAX_REASONS),
+        "minimax_reason": safe_code(decision.get("llm_reason"), MINIMAX_REASONS) or str(expl_mm.get("reason", "")),
         "minimax_explanation": "",
         "missing_evidence": safe_codes(decision.get("missing_evidence"), MISSING_EVIDENCE),
         "explanation": normalize_explanation(decision.get("review_explanation")),
@@ -440,6 +472,18 @@ def collect_entries(executable, page, timeout):
             page_explanation = normalize_explanation(entry.get("review_explanation"))
             if page_explanation is not None:
                 recorded["explanation"] = page_explanation
+                page_jev = page_explanation.get("jev")
+                if not recorded["jev_decision"] and isinstance(page_jev, dict):
+                    recorded["jev_decision"] = str(page_jev.get("choice", ""))
+                    recorded["jev_gate_passed"] = bool(page_jev.get("gate_passed", False))
+                    if not recorded["jev_blockers"]:
+                        recorded["jev_blockers"] = list(page_jev.get("blockers") or [])
+                page_mm = page_explanation.get("minimax")
+                if isinstance(page_mm, dict):
+                    if not recorded["minimax_consulted"] and page_mm.get("consulted"):
+                        recorded["minimax_consulted"] = True
+                    recorded["minimax_decision"] = recorded["minimax_decision"] or str(page_mm.get("decision", ""))
+                    recorded["minimax_reason"] = recorded["minimax_reason"] or str(page_mm.get("reason", ""))
             # The result page (latest.json) also carries the timings. Use them
             # when the event lookup found none, so stages_ms survives the
             # event -> JSON -> readable report path.
@@ -501,12 +545,21 @@ def build_receipt(
             "scope_id": str(scope.get("scope_id", "")),
             "scanned_files": int(scope.get("scanned_files", 0) or 0),
             "scan_complete": bool(scope.get("scan_epoch_complete", False)),
+            "scan_interrupted": bool(scope.get("scan_interrupted", False)),
             "deleted": int(scope.get("purged", 0) or 0),
             "observed": int(scope.get("quarantined", 0) or 0),
+            "due_not_authorised": int(scope.get("due_but_not_authorised", 0) or 0),
             "failure_code": str(scope.get("failure_code", "")),
             "skipped": str(scope.get("skipped", "")),
             "purge_skipped": str(scope.get("purge_skipped", "")),
             "quarantine_skipped": str(scope.get("quarantine_skipped", "")),
+            "expiry_skipped": [str(x) for x in (scope.get("expiry_skipped") or []) if isinstance(x, str)],
+            "message": str(scope.get("message", "")),
+            "candidate_counts": {
+                str(k): int(v)
+                for k, v in (scope.get("candidate_counts") or {}).items()
+                if isinstance(v, int) and not isinstance(v, bool)
+            },
         })
     review_summary = page.get("review_summary", {}) if isinstance(page.get("review_summary"), dict) else {}
     kept_sections = {
@@ -541,7 +594,10 @@ def build_receipt(
             "review": {
                 "reviewed": int(review_summary.get("reviewed", 0) or 0) if review_summary else None,
                 "not_started": int(review_summary.get("review_not_started", 0) or 0) if review_summary else None,
-                "unknown_held": int(review_summary.get("review_unknown_held", 0) or 0) if review_summary else None,
+                "unknown_held": max(
+                    int(review_summary.get("review_unknown_held", 0) or 0),
+                    int(run.get("review_unknown_held_total", 0) or 0),
+                ) if review_summary else None,
                 "review_failed": int(review_summary.get("review_failed_kept", 0) or 0) if review_summary else None,
                 "http_attempts": int(review_summary.get("http_attempts", 0) or 0) if review_summary else None,
                 "cost_unknown": int(review_summary.get("cost_unknown", 0) or 0) if review_summary else None,
@@ -649,6 +705,29 @@ def render(receipt):
             lines.append(f"- 诊断摘要：{receipt['stderr_summary']}")
         for step in receipt["next_steps"]:
             lines.append(f"- 下一步：{md_code(step)}")
+    scopes = summary.get("scopes") or []
+    if scopes:
+        lines.extend(["", "## 范围观察明细", ""])
+        for sc in scopes:
+            scan_status = "完整" if sc.get("scan_complete") else ("中断续扫" if sc.get("scan_interrupted") else "未完成")
+            detail = (
+                f"- {md_code(sc.get('scope_id', ''))}：扫描 {sc.get('scanned_files', 0)} 项（{scan_status}），"
+                f"删除 {sc.get('deleted', 0)} / 待删除 {sc.get('observed', 0)}"
+            )
+            notes = []
+            for label, key in (("隔离阶段", "quarantine_skipped"), ("清空阶段", "purge_skipped"), ("范围跳过", "skipped")):
+                val = sc.get(key, "")
+                if val:
+                    notes.append(f"{label}：{val}")
+            exp = sc.get("expiry_skipped") or []
+            if exp:
+                shown = "；".join(exp[:3])
+                if len(exp) > 3:
+                    shown += f"（另 {len(exp) - 3} 项）"
+                notes.append("到期保留：" + shown)
+            if notes:
+                detail += "；" + "；".join(notes)
+            lines.append(detail)
     lines.extend(["", "## 逐候选判断", ""])
     total = summary.get("total_entries")
     listed = summary.get("listed_entries")
@@ -725,7 +804,13 @@ def render(receipt):
             model = f"（{review['minimax_model']}）" if review["minimax_model"] else ""
             lines.append(f"- MiniMax {md_code(review['minimax_decision'])}{model}")
         elif review["verdict"]:
-            sent = "已发出请求但未取得结果" if attempts else "MiniMax 未被调用"
+            mm_sent = bool(((review.get("explanation") or {}).get("minimax") or {}).get("sent"))
+            failed = (
+                review.get("model_error_recorded")
+                or mm_sent
+                or entry["reason"] in ("review_unknown", "review_unavailable")
+            )
+            sent = "已发出请求但未取得结果" if (attempts and failed) else "MiniMax 未被调用"
             lines.append(f"- 综合结论 {md_code(review['verdict'])}；{sent}")
         else:
             lines.append("- 模型调用：当前制品未记录（可能由本地门禁直接保留）")
