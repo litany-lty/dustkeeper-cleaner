@@ -450,6 +450,10 @@ func lookup(name string, args []string) (func(context.Context, *app, []string) (
 		return cmdReview, args, true
 	case "retention":
 		return cmdRetention, args, true
+	case "inventory":
+		return cmdInventory, args, true
+	case "cache":
+		return cmdCache, args, true
 	}
 	return nil, nil, false
 }
@@ -610,6 +614,8 @@ Commands:
                            finish or explain interrupted operations
   status | events          run state and audit trail
   run                      reconcile, scan, apply granted work
+  inventory --root <dir>   bounded, resumable read-only disk space summary
+  cache preview|prune|...  official package-cache preview and reclamation (uv)
   debug --root <dir>       simulate cleanup; --execute calls models, never deletes
   pause | resume           global safety pause marker
   schedule render          print systemd / launchd templates
